@@ -1,0 +1,1113 @@
+// Интеграционные тесты для 1С MCP-tools (этап 6).
+//
+// Каждый тест:
+//  1. Создаёт временную SQLite-БД с базовой схемой core +
+//     bsl-extension schema_extensions.
+//  2. Заполняет таблицы тестовыми данными (вручную или через
+//     run_index_extras).
+//  3. Вызывает соответствующий IndexTool::execute и проверяет
+//     результат.
+//
+// Тесты в `tests/` потому что нужен полный API code-index-core
+// (Storage, ToolContext) — внутри `bsl-extension` тяжело собрать
+// все эти типы из-за приватных полей и Mutex<Storage>.
+
+use std::sync::Arc;
+
+use bsl_extension::{
+    schema::SCHEMA_EXTENSIONS,
+    tools::{
+        FindDataPathTool, FindPathBslTool, GetDataLinksTool, GetEventSubscriptionsTool,
+        GetFormHandlersTool, GetObjectStructureTool, GetRegisterWritersTool, SearchTermsTool,
+    },
+};
+use code_index_core::extension::{IndexTool, ToolContext};
+use code_index_core::storage::{Storage, StoragePool};
+use rusqlite::params;
+use serde_json::Value;
+use tempfile::TempDir;
+
+const REPO: &str = "default";
+
+fn fresh_storage() -> (TempDir, Arc<StoragePool>) {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+    let storage = Storage::open_file(&db_path).unwrap();
+    storage.apply_schema_extensions(SCHEMA_EXTENSIONS).unwrap();
+    (tmp, StoragePool::single(storage))
+}
+
+/// Запустить tool и вернуть **распакованное** значение `result` из ответа.
+///
+/// С 0.9.0 все extension-tools возвращают `{result, _meta: {dependent_files: [...]}}`
+/// для event-based cache invalidation. Тесты проверяют поле `_meta` отдельно
+/// (must exist и быть массивом), а основной result отдают наружу как раньше —
+/// чтобы сохранить совместимость существующих assert'ов по `res["..."]`.
+async fn run_tool(
+    tool: &dyn IndexTool,
+    storage: &Arc<StoragePool>,
+    args: Value,
+) -> Value {
+    let ctx = ToolContext {
+        repo: REPO,
+        root_path: None,
+        language: Some("bsl"),
+        storage,
+    };
+    let raw = tool.execute(args, ctx).await;
+    assert!(
+        raw["_meta"]["dependent_files"].is_array(),
+        "tool обязан возвращать _meta.dependent_files (массив, возможно пустой). Получили: {raw}"
+    );
+    raw["result"].clone()
+}
+
+// ── get_object_structure ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_object_structure_returns_existing() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![REPO, "Catalog.Контрагенты", "Catalog", "Контрагенты", "Контрагенты"],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Catalog.Контрагенты"}),
+    )
+    .await;
+    assert_eq!(res["meta_type"].as_str(), Some("Catalog"));
+    assert_eq!(res["name"].as_str(), Some("Контрагенты"));
+    assert_eq!(res["synonym"].as_str(), Some("Контрагенты"));
+}
+
+// ── Регистр кириллицы в имени объекта (T-3) ───────────────────────────────
+//
+// Имена объектов 1С кириллические, и регистр в них легко перепутать. SQLite
+// кириллицу не сворачивает, поэтому точное сравнение промахивалось МОЛЧА:
+// связи отвечали «на объект никто не ссылается», регистраторы — «регистраторов
+// нет». Ответ выглядел содержательным выводом об объекте — это опаснее ошибки.
+
+/// Перечень объектов + связи для проверок регистра.
+async fn seed_case_fixture(storage: &Arc<StoragePool>) {
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    for (fqn, mt, nm) in [
+        ("Catalog.Организации", "Catalog", "Организации"),
+        ("Document.РеализацияТоваров", "Document", "РеализацияТоваров"),
+        ("AccumulationRegister.ВыручкаИСебестоимость", "AccumulationRegister", "ВыручкаИСебестоимость"),
+    ] {
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![REPO, fqn, mt, nm, nm],
+        )
+        .unwrap();
+    }
+    bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+    for (from, path, to, kind) in [
+        ("Document.РеализацияТоваров", "Организация", "Catalog.Организации", "attr"),
+        (
+            "Document.РеализацияТоваров",
+            "Движения",
+            "AccumulationRegister.ВыручкаИСебестоимость",
+            "recorder",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO data_links \
+             (repo, from_object, from_path, to_object, link_kind, to_object_key) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![REPO, from, path, to, kind, to.to_lowercase()],
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn object_structure_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Catalog.организации"}),
+    )
+    .await;
+    assert!(
+        res["error"].is_null(),
+        "имя с иным регистром должно резолвиться, а не давать ошибку: {res}"
+    );
+    assert_eq!(res["name"].as_str(), Some("Организации"));
+}
+
+#[tokio::test]
+async fn object_structure_suggests_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    // Объекта нет вовсе, но похожий отличается регистром: подбор идёт по ключу
+    // в нижнем регистре, поэтому список подсказок не должен быть пустым.
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Catalog.организациии"}),
+    )
+    .await;
+    assert!(res["error"].is_string());
+    let dym = res["did_you_mean"].as_array().expect("did_you_mean должен быть массивом");
+    assert!(
+        dym.iter().any(|v| v.as_str() == Some("Catalog.Организации")),
+        "подсказка обязана предложить объект, отличающийся регистром: {res}"
+    );
+}
+
+#[tokio::test]
+async fn data_links_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    let res = run_tool(
+        &GetDataLinksTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "Catalog.организации", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(
+        res["in_total"].as_u64(),
+        Some(1),
+        "иной регистр давал in_total: 0 — «на объект никто не ссылается»: {res}"
+    );
+    // В ответе имя показывается так, как записано в конфигурации.
+    assert_eq!(res["object"].as_str(), Some("Catalog.Организации"));
+}
+
+#[tokio::test]
+async fn data_links_out_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    // Направление «на что ссылается» идёт по источнику ребра, у которого
+    // колонки-ключа нет вовсе — резолв имени на входе закрывает и его.
+    let res = run_tool(
+        &GetDataLinksTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "document.реализациятоваров", "direction": "out"}),
+    )
+    .await;
+    assert_eq!(res["out_total"].as_u64(), Some(2), "{res}");
+}
+
+#[tokio::test]
+async fn register_writers_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    let res = run_tool(
+        &GetRegisterWritersTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "AccumulationRegister.выручкаисебестоимость"}),
+    )
+    .await;
+    let writers = res["writers"].as_array().expect("writers — массив");
+    assert_eq!(
+        writers.len(),
+        1,
+        "иной регистр давал writers: [] — «у регистра нет регистраторов»: {res}"
+    );
+    assert_eq!(writers[0].as_str(), Some("Document.РеализацияТоваров"));
+}
+
+#[tokio::test]
+async fn data_path_reports_depth_exhausted() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    {
+        // Цепочка длиннее заданной глубины: путь есть, но за один шаг не виден.
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO data_links \
+                 (repo, from_object, from_path, to_object, link_kind, to_object_key) \
+                 VALUES (?, 'Catalog.Организации', 'Владелец', 'Catalog.НетСвязи', 'attr', ?)",
+                params![REPO, "catalog.нетсвязи"],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &FindDataPathTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "from": "Document.РеализацияТоваров",
+            "to": "Catalog.НетСвязи",
+            "max_depth": 1
+        }),
+    )
+    .await;
+    assert_eq!(res["found"].as_bool(), Some(false));
+    assert_eq!(
+        res["depth_exhausted"].as_bool(),
+        Some(true),
+        "«пути нет» обязано отличаться от «не хватило шагов»: {res}"
+    );
+    assert!(res["hint"].is_string(), "нужна подсказка со следующим вызовом: {res}");
+
+    // Той же глубины хватает — путь есть и признака обрыва нет.
+    let ok = run_tool(
+        &FindDataPathTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "from": "Document.РеализацияТоваров",
+            "to": "Catalog.НетСвязи",
+            "max_depth": 2
+        }),
+    )
+    .await;
+    assert_eq!(ok["found"].as_bool(), Some(true), "{ok}");
+}
+
+#[tokio::test]
+async fn get_object_structure_reports_missing() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Catalog.НетТакого"}),
+    )
+    .await;
+    assert!(res["error"].is_string());
+}
+
+#[tokio::test]
+async fn get_object_structure_validates_full_name() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO}), // нет full_name
+    )
+    .await;
+    assert!(
+        res["error"].as_str().unwrap_or("").contains("full_name"),
+        "ошибка должна упоминать missing full_name: {:?}",
+        res
+    );
+}
+
+#[tokio::test]
+async fn get_object_structure_batch_full_names() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for (fqn, mt, nm) in [
+            ("Catalog.Контрагенты", "Catalog", "Контрагенты"),
+            (
+                "Document.РеализацияТоваровУслуг",
+                "Document",
+                "РеализацияТоваровУслуг",
+            ),
+        ] {
+            s.conn()
+                .execute(
+                    "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![REPO, fqn, mt, nm, nm],
+                )
+                .unwrap();
+        }
+    }
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "full_names": [
+                "Catalog.Контрагенты",
+                "Document.РеализацияТоваровУслуг",
+                "Catalog.НетТакого"
+            ]
+        }),
+    )
+    .await;
+    let results = res["results"]
+        .as_array()
+        .expect("массовый режим должен вернуть массив results");
+    assert_eq!(results.len(), 3, "три запрошенных объекта — три результата по порядку");
+    assert_eq!(results[0]["meta_type"].as_str(), Some("Catalog"));
+    assert_eq!(results[0]["name"].as_str(), Some("Контрагенты"));
+    assert_eq!(results[1]["meta_type"].as_str(), Some("Document"));
+    // несуществующий объект → свой слот с error + did_you_mean, не валит весь батч
+    assert!(
+        results[2]["error"].is_string(),
+        "несуществующий объект должен дать error в своём слоте: {:?}",
+        results[2]
+    );
+    assert!(results[2]["did_you_mean"].is_array());
+}
+
+#[tokio::test]
+async fn get_object_structure_batch_non_string_element() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![REPO, "Catalog.Контрагенты", "Catalog", "Контрагенты", "Контрагенты"],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "full_names": ["Catalog.Контрагенты", 42, "Catalog.Контрагенты"]
+        }),
+    )
+    .await;
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["meta_type"].as_str(), Some("Catalog"));
+    // нестроковый элемент → {error} строго на своей позиции, соседи не страдают
+    assert!(
+        results[1]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("строкой"),
+        "нестроковый элемент должен дать error на своей позиции: {:?}",
+        results[1]
+    );
+    assert_eq!(results[2]["meta_type"].as_str(), Some("Catalog"));
+}
+
+#[tokio::test]
+async fn get_object_structure_batch_empty_list() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_names": []}),
+    )
+    .await;
+    let results = res["results"].as_array().expect("пустой батч → пустой results");
+    assert!(results.is_empty());
+}
+
+// ── get_form_handlers ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_form_handlers_returns_array() {
+    let (_tmp, storage) = fresh_storage();
+    let handlers_json = serde_json::json!([
+        {"event": "ПриОткрытии", "handler": "ПриОткрытии"},
+        {"event": "ПередЗакрытием", "handler": "ОбработатьЗакрытие"}
+    ])
+    .to_string();
+    {
+        let s = storage.get().await.unwrap();
+        // Боевой формат хранения — папка выгрузки (plural): 'Documents.X'.
+        s.conn()
+            .execute(
+                "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+                 VALUES (?, ?, ?, ?)",
+                params![REPO, "Documents.Реализация", "ФормаДокумента", handlers_json],
+            )
+            .unwrap();
+    }
+    // Запрос в singular-формате ('Document.X') должен найти строку через
+    // нормализацию meta_type_to_folder.
+    let res = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Document.Реализация",
+            "form_name": "ФормаДокумента"
+        }),
+    )
+    .await;
+    let arr = res["handlers"].as_array().expect("handlers — массив");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["event"].as_str(), Some("ПриОткрытии"));
+    assert_eq!(arr[1]["handler"].as_str(), Some("ОбработатьЗакрытие"));
+    assert_eq!(
+        res["owner_full_name"].as_str(),
+        Some("Documents.Реализация"),
+        "в ответе — реально сматченный ключ БД"
+    );
+
+    // Plural-формат принимается как есть.
+    let res2 = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Documents.Реализация",
+            "form_name": "ФормаДокумента"
+        }),
+    )
+    .await;
+    assert_eq!(
+        res2["handlers"].as_array().map(|a| a.len()),
+        Some(2),
+        "plural-формат тоже находит форму"
+    );
+}
+
+#[tokio::test]
+async fn get_form_handlers_unknown_form_lists_available() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for form in &["ФормаДокумента", "ФормаСписка"] {
+            s.conn()
+                .execute(
+                    "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+                     VALUES (?, ?, ?, '[]')",
+                    params![REPO, "Documents.Реализация", form],
+                )
+                .unwrap();
+        }
+    }
+    // Форма не существует → error + available_forms с реальными формами владельца.
+    let res = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Document.Реализация",
+            "form_name": "НетТакойФормы"
+        }),
+    )
+    .await;
+    assert!(res["error"].as_str().unwrap_or("").contains("form not found"));
+    let available: Vec<&str> = res["available_forms"]
+        .as_array()
+        .expect("available_forms — массив")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(available, vec!["ФормаДокумента", "ФормаСписка"]);
+
+    // Владелец не существует → error + hint про формат, без available_forms.
+    let res2 = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Document.НетТакого",
+            "form_name": "ФормаДокумента"
+        }),
+    )
+    .await;
+    assert!(res2["error"].as_str().unwrap_or("").contains("form not found"));
+    assert!(res2["hint"].as_str().unwrap_or("").contains("Document.X"));
+    assert!(res2["available_forms"].is_null());
+}
+
+// ── get_event_subscriptions ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_event_subscriptions_lists_all_when_no_filters() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for (name, ev, m, p) in &[
+            ("Sub1", "ПриЗаписи", "Логирование", "Записать"),
+            ("Sub2", "ПередЗаписью", "Аудит", "Проверить"),
+        ] {
+            s.conn()
+                .execute(
+                    "INSERT INTO event_subscriptions (repo, name, event, handler_module, handler_proc, sources_json) \
+                     VALUES (?, ?, ?, ?, ?, '[]')",
+                    params![REPO, name, ev, m, p],
+                )
+                .unwrap();
+        }
+    }
+    let res = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+    assert_eq!(res["count"].as_u64(), Some(2));
+    assert_eq!(res["subscriptions"].as_array().map(|a| a.len()), Some(2));
+}
+
+#[tokio::test]
+async fn get_event_subscriptions_filters_by_handler_module() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for (name, m) in &[("A", "ModX"), ("B", "ModY"), ("C", "ModX")] {
+            s.conn()
+                .execute(
+                    "INSERT INTO event_subscriptions (repo, name, event, handler_module, handler_proc, sources_json) \
+                     VALUES (?, ?, 'E', ?, 'P', '[]')",
+                    params![REPO, name, m],
+                )
+                .unwrap();
+        }
+    }
+    let res = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "handler_module": "ModX"}),
+    )
+    .await;
+    assert_eq!(res["count"].as_u64(), Some(2), "filter ModX → 2 совпадения");
+}
+
+#[tokio::test]
+async fn get_event_subscriptions_filters_by_source() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for (name, sources) in &[
+            ("SubZakaz", r#"["cfg:DocumentObject.ЗаказКлиента"]"#),
+            ("SubVariant", r#"["cfg:CatalogObject.ВариантыОтчетов"]"#),
+            (
+                "SubMulti",
+                r#"["cfg:CatalogObject.Контрагенты","cfg:DocumentObject.ЗаказКлиента"]"#,
+            ),
+        ] {
+            s.conn()
+                .execute(
+                    "INSERT INTO event_subscriptions (repo, name, event, handler_module, handler_proc, sources_json) \
+                     VALUES (?, ?, 'ПередЗаписью', 'M', 'P', ?)",
+                    params![REPO, name, sources],
+                )
+                .unwrap();
+        }
+    }
+    // Полное имя в singular-формате → матчит DocumentObject-источник.
+    let res = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "source": "Document.ЗаказКлиента"}),
+    )
+    .await;
+    assert_eq!(res["count"].as_u64(), Some(2), "ЗаказКлиента в двух подписках");
+    assert_eq!(res["total"].as_u64(), Some(2));
+
+    // Короткое имя (без типа) — тот же результат, регистр игнорируется.
+    let res2 = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "source": "заказклиента"}),
+    )
+    .await;
+    assert_eq!(res2["count"].as_u64(), Some(2));
+
+    // Несуществующий источник → пусто.
+    let res3 = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "source": "Document.НетТакого"}),
+    )
+    .await;
+    assert_eq!(res3["count"].as_u64(), Some(0));
+}
+
+#[tokio::test]
+async fn get_event_subscriptions_rejects_unknown_param() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "ЗаказКлиента"}),
+    )
+    .await;
+    let err = res["error"].as_str().unwrap_or("");
+    assert!(err.contains("object"), "ошибка называет неизвестный параметр: {}", err);
+    assert!(
+        res["hint"].as_str().unwrap_or("").contains("source"),
+        "hint перечисляет допустимые фильтры"
+    );
+}
+
+// ── find_path_bsl ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn find_path_returns_direct_edge_when_exists() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
+                 VALUES (?, 'A', 'B', 'direct')",
+                params![REPO],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &FindPathBslTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "from": "A", "to": "B", "max_depth": 3}),
+    )
+    .await;
+    assert_eq!(res["found"].as_bool(), Some(true));
+    let path = res["path"].as_array().expect("path — массив");
+    assert_eq!(path.len(), 1);
+    assert_eq!(path[0]["caller"].as_str(), Some("A"));
+    assert_eq!(path[0]["callee"].as_str(), Some("B"));
+}
+
+#[tokio::test]
+async fn find_path_walks_two_hops() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
+                 VALUES (?, 'A', 'B', 'direct'), (?, 'B', 'C', 'direct')",
+                params![REPO, REPO],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &FindPathBslTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "from": "A", "to": "C", "max_depth": 3}),
+    )
+    .await;
+    assert_eq!(res["found"].as_bool(), Some(true), "путь A→B→C должен находиться");
+    let path = res["path"].as_array().unwrap();
+    assert_eq!(path.len(), 2);
+}
+
+#[tokio::test]
+async fn find_path_returns_not_found_when_no_path() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &FindPathBslTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "from": "A", "to": "B"}),
+    )
+    .await;
+    assert_eq!(res["found"].as_bool(), Some(false));
+    assert!(res["path"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn find_path_respects_max_depth() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        // Цепочка A → B → C → D, max_depth=2 → не должен найти D (длина 3).
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) VALUES \
+                 (?, 'A', 'B', 'direct'), (?, 'B', 'C', 'direct'), (?, 'C', 'D', 'direct')",
+                params![REPO, REPO, REPO],
+            )
+            .unwrap();
+    }
+    let res_short = run_tool(
+        &FindPathBslTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "from": "A", "to": "D", "max_depth": 2}),
+    )
+    .await;
+    assert_eq!(res_short["found"].as_bool(), Some(false));
+
+    let res_full = run_tool(
+        &FindPathBslTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "from": "A", "to": "D", "max_depth": 3}),
+    )
+    .await;
+    assert_eq!(res_full["found"].as_bool(), Some(true));
+}
+
+// ── search_terms (этап 5a) ────────────────────────────────────────────────
+
+/// Хелпер: засеять `procedure_enrichment` тремя записями для тестов.
+async fn seed_enrichment(storage: &Arc<StoragePool>) {
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    for (proc_key, terms) in &[
+        ("Расчёт.Старт",         "запуск, инициализация, проведение"),
+        ("Продажи.СоздатьЗаказ", "товары, склад, заказ клиента, скидки"),
+        ("Логирование.Записать", "журнал, аудит, ошибка, отладка"),
+    ] {
+        conn.execute(
+            "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![REPO, proc_key, terms, "openai_compatible:claude-haiku-4.5", 0i64],
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn search_terms_multiword_rewritten_to_or() {
+    // Многословный запрос без операторов — серверный OR-rewrite (фикс по
+    // бенчу 2026-06-10: неявный AND давал 0 на коротких термах). Слова
+    // «склад» и «журнал» лежат в РАЗНЫХ записях — AND дал бы 0, OR находит обе.
+    let (_tmp, storage) = fresh_storage();
+    seed_enrichment(&storage).await;
+
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "склад журнал недостижимое"}),
+    )
+    .await;
+    assert_eq!(res["fts_query"].as_str(), Some("\"склад\" OR \"журнал\" OR \"недостижимое\""));
+    let keys: Vec<&str> = res["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["proc_key"].as_str())
+        .collect();
+    assert_eq!(keys.len(), 2, "OR должен найти обе записи: {keys:?}");
+    assert!(keys.contains(&"Продажи.СоздатьЗаказ"));
+    assert!(keys.contains(&"Логирование.Записать"));
+
+    // Ё в запросе сворачивается: «учёт» ищется как «учет».
+    let res_yo = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "учёт"}),
+    )
+    .await;
+    assert_eq!(res_yo["fts_query"].as_str(), Some("\"учет\""));
+}
+
+#[tokio::test]
+async fn search_terms_finds_by_simple_word() {
+    let (_tmp, storage) = fresh_storage();
+    seed_enrichment(&storage).await;
+
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "склад"}),
+    )
+    .await;
+    let results = res["results"].as_array().expect("results — массив");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["proc_key"].as_str(), Some("Продажи.СоздатьЗаказ"));
+    assert!(results[0]["terms"].as_str().unwrap().contains("склад"));
+    assert!(results[0]["signature"].as_str().is_some());
+    // BM25 ранжирование возвращает отрицательные числа (меньше = лучше).
+    assert!(results[0]["score"].as_f64().is_some());
+}
+
+#[tokio::test]
+async fn search_terms_supports_and_or() {
+    let (_tmp, storage) = fresh_storage();
+    seed_enrichment(&storage).await;
+
+    // OR: «склад OR журнал» должно найти и Продажи, и Логирование.
+    let res_or = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "склад OR журнал"}),
+    )
+    .await;
+    let or_keys: Vec<String> = res_or["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["proc_key"].as_str().map(String::from))
+        .collect();
+    assert_eq!(or_keys.len(), 2);
+    assert!(or_keys.contains(&"Продажи.СоздатьЗаказ".to_string()));
+    assert!(or_keys.contains(&"Логирование.Записать".to_string()));
+
+    // AND: «товары AND склад» — только Продажи.
+    let res_and = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "товары AND склад"}),
+    )
+    .await;
+    let and_results = res_and["results"].as_array().unwrap();
+    assert_eq!(and_results.len(), 1);
+    assert_eq!(and_results[0]["proc_key"].as_str(), Some("Продажи.СоздатьЗаказ"));
+}
+
+#[tokio::test]
+async fn search_terms_returns_empty_for_unknown_word() {
+    let (_tmp, storage) = fresh_storage();
+    seed_enrichment(&storage).await;
+
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "квантовая_телепортация"}),
+    )
+    .await;
+    let results = res["results"].as_array().unwrap();
+    assert!(results.is_empty(), "слово, которого нет в termах, не должно совпадать");
+}
+
+#[tokio::test]
+async fn search_terms_filters_by_repo() {
+    // Запись в другой repo не должна находиться по нашему alias.
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params!["other-repo", "X.Y", "складские, операции", "sig", 0i64],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "складские"}),
+    )
+    .await;
+    let results = res["results"].as_array().unwrap();
+    assert!(results.is_empty(), "запись из другого repo не должна находиться");
+}
+
+#[tokio::test]
+async fn search_terms_empty_query_returns_error() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "   "}),
+    )
+    .await;
+    assert!(res["error"].as_str().is_some(), "пустой query должен возвращать error");
+}
+
+#[tokio::test]
+async fn search_terms_respects_limit() {
+    let (_tmp, storage) = fresh_storage();
+    seed_enrichment(&storage).await;
+    // Все три записи содержат «и» в окончаниях, но точнее найдём по «проведение/заказ/журнал»:
+    // «OR» через всё → 3 записи; ставим limit=2.
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "проведение OR заказ OR журнал", "limit": 2}),
+    )
+    .await;
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+// ── Привязки обработчиков форм (declarative_callers) ──────────────────────
+//
+// Обработчик формы объявлен в модуле, но в коде его никто не вызывает —
+// выполняет его платформа по записи в описании формы. `get_callers` без этого
+// отдавал ноль рёбер, и ответ читался как «процедура нигде не используется».
+
+/// Форма с одним обработчиком: модуль, описание и запись в `metadata_forms`.
+async fn seed_form_with_handler(
+    storage: &Arc<StoragePool>,
+    owner_folder: &str,
+    object: &str,
+    form: &str,
+    handler: &str,
+) {
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    let form_root = format!("base/{}/{}/Forms/{}", owner_folder, object, form);
+    let module_path = format!("{}/Ext/Form/Module.bsl", form_root);
+    let descriptor_path = format!("{}/Ext/Form.xml", form_root);
+    for (path, lang) in [(&module_path, "bsl"), (&descriptor_path, "text")] {
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES (?, ?, ?)",
+            params![path, "hash", lang],
+        )
+        .unwrap();
+    }
+    let file_id: i64 = conn
+        .query_row(
+            "SELECT id FROM files WHERE path = ?",
+            params![&module_path],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO functions (file_id, name, line_start, line_end) VALUES (?, ?, ?, ?)",
+        params![file_id, handler, 10, 20],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+         VALUES (?, ?, ?, ?)",
+        params![
+            REPO,
+            format!("{}.{}", owner_folder, object),
+            form,
+            serde_json::json!([{"event": "ПередЗаписьюНаСервере", "handler": handler}]).to_string()
+        ],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn form_handler_binding_is_reported_as_caller() {
+    let (_tmp, storage) = fresh_storage();
+    seed_form_with_handler(&storage, "Catalogs", "Контрагенты", "ФормаЭлемента", "ПередЗаписью1")
+        .await;
+
+    let s = storage.get().await.unwrap();
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ПередЗаписью1");
+    assert_eq!(found.len(), 1, "привязка обработчика должна находиться: {found:?}");
+    assert_eq!(found[0]["kind"].as_str(), Some("form_binding"));
+    assert_eq!(found[0]["event"].as_str(), Some("ПередЗаписьюНаСервере"));
+    assert_eq!(
+        found[0]["path"].as_str(),
+        Some("base/Catalogs/Контрагенты/Forms/ФормаЭлемента/Ext/Form.xml"),
+        "путь описания нужен для сброса кэша по файлу"
+    );
+    assert!(
+        found[0]["caller"].as_str().unwrap().contains("ФормаЭлемента"),
+        "в caller должна быть видна форма"
+    );
+}
+
+#[tokio::test]
+async fn same_handler_name_in_other_form_is_not_mixed_in() {
+    // Имена вроде «ПриОткрытии» встречаются в сотнях форм. Связь идёт по файлу
+    // модуля, поэтому чужая форма с тем же именем обработчика подмешаться
+    // не должна — иначе выдача полна ложных привязок.
+    let (_tmp, storage) = fresh_storage();
+    seed_form_with_handler(&storage, "Catalogs", "Контрагенты", "ФормаЭлемента", "ПриОткрытии")
+        .await;
+    {
+        // Вторая форма: запись в metadata_forms с тем же обработчиком есть,
+        // а объявления процедуры в её модуле нет.
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+                 VALUES (?, ?, ?, ?)",
+                params![
+                    REPO,
+                    "Documents.Заказ",
+                    "ФормаДокумента",
+                    serde_json::json!([{"event": "ПриОткрытии", "handler": "ПриОткрытии"}])
+                        .to_string()
+                ],
+            )
+            .unwrap();
+    }
+
+    let s = storage.get().await.unwrap();
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ПриОткрытии");
+    assert_eq!(found.len(), 1, "должна найтись ровно одна форма: {found:?}");
+    assert!(
+        found[0]["caller"].as_str().unwrap().contains("Контрагенты"),
+        "найдена не та форма: {found:?}"
+    );
+}
+
+#[tokio::test]
+async fn shared_event_name_yields_one_record_pointing_at_get_form_handlers() {
+    // Имя `ПриОткрытии` носят разные процедуры в разных формах, у каждой своя
+    // привязка. Список из тысяч форм ничего не говорит о нужной процедуре,
+    // поэтому вместо него — одна запись со счётом и готовым следующим вызовом.
+    let (_tmp, storage) = fresh_storage();
+    for n in 0..12 {
+        seed_form_with_handler(
+            &storage,
+            "Catalogs",
+            &format!("Объект{n}"),
+            "ФормаЭлемента",
+            "ПриОткрытии",
+        )
+        .await;
+    }
+    let s = storage.get().await.unwrap();
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ПриОткрытии");
+    assert_eq!(found.len(), 1, "ожидаем одну сводную запись: {found:?}");
+    assert_eq!(found[0]["kind"].as_str(), Some("form_binding_ambiguous"));
+    let hint = found[0]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("get_form_handlers(owner_full_name='Catalogs.Объект0', form_name='ФормаЭлемента')"),
+        "подсказка должна нести образец вызова: {hint}"
+    );
+}
+
+#[tokio::test]
+async fn same_name_in_form_modules_without_binding_is_not_reported() {
+    // Одноимённые процедуры в модулях форм — ещё НЕ привязка: имя может просто
+    // повторяться (в формах объявлена своя функция с именем функции общего
+    // модуля). Утверждать «у каждой своя привязка», не сверившись с описанием
+    // формы, нельзя — это выдача догадки за факт.
+    let (_tmp, storage) = fresh_storage();
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    for n in 0..4 {
+        let module_path =
+            format!("base/Catalogs/Объект{n}/Forms/ФормаЭлемента/Ext/Form/Module.bsl");
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES (?, ?, ?)",
+            params![&module_path, "hash", "bsl"],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = ?", params![&module_path], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO functions (file_id, name, line_start, line_end) VALUES (?, ?, ?, ?)",
+            params![file_id, "ЗначениеРеквизитаОбъекта", 1, 5],
+        )
+        .unwrap();
+        // Форма в индексе есть, но этой процедуры среди её обработчиков нет.
+        conn.execute(
+            "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+             VALUES (?, ?, ?, ?)",
+            params![
+                REPO,
+                format!("Catalogs.Объект{n}"),
+                "ФормаЭлемента",
+                serde_json::json!([{"event": "ПриОткрытии", "handler": "ПриОткрытии"}]).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ЗначениеРеквизитаОбъекта");
+    assert!(found.is_empty(), "привязок нет — и говорить о них нельзя: {found:?}");
+}
+
+#[tokio::test]
+async fn ordinary_procedure_has_no_form_bindings() {
+    // Процедура общего модуля к формам отношения не имеет — привязок нет,
+    // и лишних запросов быть не должно.
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES (?, ?, ?)",
+            params!["base/CommonModules/ОбщегоНазначения/Ext/Module.bsl", "hash", "bsl"],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO functions (file_id, name, line_start, line_end) VALUES (?, ?, ?, ?)",
+            params![file_id, "ЗначениеРеквизита", 1, 5],
+        )
+        .unwrap();
+    }
+    let s = storage.get().await.unwrap();
+    assert!(bsl_extension::form_bindings::form_bindings(&s, "ЗначениеРеквизита").is_empty());
+}

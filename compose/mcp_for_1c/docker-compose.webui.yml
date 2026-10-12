@@ -1,0 +1,26 @@
+# Optional: attach graph + query-builder to the chat Docker network.
+#
+# Usage (after base + override are up):
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.webui.yml up -d mcp-metadata-graph mcp-query-builder
+#
+# WEBUI_NETWORK:
+#   live prod chat often `ai-stack_default`
+#   ai2 chat often `ai2-stack`
+# Never put a second Neo4j into `1c-suite-net` next to prod (double DNS).
+
+services:
+  mcp-metadata-graph:
+    networks:
+      - default
+      - webui
+
+  mcp-query-builder:
+    networks:
+      - default
+      - webui
+
+networks:
+  webui:
+    name: ${WEBUI_NETWORK:-ai-stack_default}
+    external: true

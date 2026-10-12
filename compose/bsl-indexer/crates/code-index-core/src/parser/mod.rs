@@ -1,0 +1,252 @@
+pub mod types;
+/// Извлечение имени вызываемой функции из узла-выражения — общее для языков
+pub mod callee;
+pub mod python;
+pub mod javascript;
+pub mod typescript;
+pub mod java;
+pub mod rust_lang;
+pub mod go;
+pub mod text;
+pub mod bsl;
+pub mod html;
+pub mod php;
+pub mod c;
+pub mod cpp;
+pub mod c_sharp;
+pub mod ruby;
+pub mod swift;
+/// Парсер XML-выгрузок 1С (quick-xml, не tree-sitter)
+/// Не регистрируется в ParserRegistry — вызывается напрямую из indexer
+pub mod xml_1c;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use anyhow::Result;
+use types::ParseResult;
+
+/// Универсальный интерфейс парсера языка программирования
+pub trait LanguageParser: Send + Sync {
+    /// Название языка
+    fn language_name(&self) -> &str;
+
+    /// Расширения файлов, поддерживаемые парсером
+    fn file_extensions(&self) -> &[&str];
+
+    /// Парсинг исходного кода файла
+    fn parse(&self, source: &str, file_path: &str) -> Result<ParseResult>;
+
+    /// Разбор с защитой от заведомо непригодного ввода.
+    ///
+    /// Файл с NUL-байтом в первых килобайтах — не исходник (артефакт сборки,
+    /// защищённый модуль поставщика 1С и т.п.), и tree-sitter на нём деградирует
+    /// нелинейно. Такой файл отдаём пустым результатом, не запуская грамматику.
+    /// Точки индексации зовут именно этот метод — тогда защита работает для всех
+    /// языков, а не только для того, где она однажды понадобилась.
+    fn parse_guarded(&self, source: &str, file_path: &str) -> Result<ParseResult> {
+        if types::looks_binary(source) {
+            return Ok(types::empty_parse_result(source));
+        }
+        self.parse(source, file_path)
+    }
+}
+
+/// Реестр парсеров — хранит активные парсеры, индексированные по расширению файла.
+/// Используем Arc<dyn LanguageParser>, чтобы один парсер мог обслуживать
+/// несколько расширений без дублирования.
+pub struct ParserRegistry {
+    parsers: HashMap<String, Arc<dyn LanguageParser>>,
+}
+
+impl ParserRegistry {
+    /// Создать реестр со всеми доступными парсерами
+    pub fn new_all() -> Self {
+        let mut registry = Self { parsers: HashMap::new() };
+        registry.register(Arc::new(python::PythonParser::new()));
+        registry.register(Arc::new(javascript::JavaScriptParser::new()));
+        registry.register(Arc::new(typescript::TypeScriptParser::new()));
+        registry.register(Arc::new(java::JavaParser::new()));
+        registry.register(Arc::new(rust_lang::RustParser::new()));
+        registry.register(Arc::new(go::GoParser::new()));
+        registry.register(Arc::new(bsl::BslParser::new()));
+        registry.register(Arc::new(php::PhpParser::new()));
+        // C++ регистрируем ПОСЛЕ C — заголовки `.h` достаются C++-парсеру.
+        // Он надмножество: тот же обход с is_cpp=true, плюс классы и namespace.
+        registry.register(Arc::new(c::CParser::new()));
+        registry.register(Arc::new(cpp::CppParser::new()));
+        registry.register(Arc::new(c_sharp::CSharpParser::new()));
+        registry.register(Arc::new(ruby::RubyParser::new()));
+        registry.register(Arc::new(swift::SwiftParser::new()));
+        registry.register(Arc::new(html::HtmlParser::new()));
+        registry
+    }
+
+    /// Создать реестр только с указанными языками.
+    ///
+    /// HTML регистрируется **всегда** дополнительно к указанному `language`
+    /// (HTML встречается в любом репо как шаблоны/ассеты — templates, generated
+    /// docs, sphinx-output, vue/svelte single-file-components и т.п. — но
+    /// никогда не указывается как «основной язык» репо в daemon.toml).
+    pub fn from_languages(languages: &[String]) -> Self {
+        let mut registry = Self { parsers: HashMap::new() };
+        for lang in languages {
+            match lang.as_str() {
+                "python" => registry.register(Arc::new(python::PythonParser::new())),
+                "javascript" => {
+                    // JS-парсер обрабатывает .js и .jsx
+                    registry.register(Arc::new(javascript::JavaScriptParser::new()));
+                }
+                "typescript" => {
+                    // TS-парсер обрабатывает .ts и .tsx
+                    registry.register(Arc::new(typescript::TypeScriptParser::new()));
+                }
+                "java" => registry.register(Arc::new(java::JavaParser::new())),
+                "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
+                "go" => registry.register(Arc::new(go::GoParser::new())),
+                "bsl" => registry.register(Arc::new(bsl::BslParser::new())),
+                "php" => registry.register(Arc::new(php::PhpParser::new())),
+                "c" => registry.register(Arc::new(c::CParser::new())),
+                "cpp" => registry.register(Arc::new(cpp::CppParser::new())),
+                "csharp" => registry.register(Arc::new(c_sharp::CSharpParser::new())),
+                "ruby" => registry.register(Arc::new(ruby::RubyParser::new())),
+                "swift" => registry.register(Arc::new(swift::SwiftParser::new())),
+                "html" => {} // ниже регистрируется безусловно
+                // Опечатка в конфигурации иначе молчит: файлы языка попадут в
+                // категорию кода, но разобраны не будут — ни функций, ни вызовов
+                // при внешне исправном индексе.
+                other => tracing::warn!(
+                    "неизвестный язык '{other}' в списке языков — парсер не зарегистрирован, \
+                     файлы этого языка останутся без функций и вызовов"
+                ),
+            }
+        }
+        // HTML — универсальный ассет; всегда подгружаем (даже если не упомянут).
+        registry.register(Arc::new(html::HtmlParser::new()));
+        registry
+    }
+
+    /// Зарегистрировать парсер: добавить по всем его расширениям
+    fn register(&mut self, parser: Arc<dyn LanguageParser>) {
+        for ext in parser.file_extensions() {
+            self.parsers.insert(ext.to_string(), Arc::clone(&parser));
+        }
+    }
+
+    /// Получить парсер по расширению файла
+    pub fn get_parser(&self, extension: &str) -> Option<&dyn LanguageParser> {
+        self.parsers.get(extension).map(|p| p.as_ref())
+    }
+
+    /// Список всех поддерживаемых расширений
+    pub fn supported_extensions(&self) -> Vec<&str> {
+        self.parsers.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Получить парсер по расширению файла (обратная совместимость).
+/// Предпочтительно использовать ParserRegistry::new_all().
+pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
+    match ext {
+        "py" => Some(Box::new(python::PythonParser::new())),
+        "js" | "jsx" => Some(Box::new(javascript::JavaScriptParser::new())),
+        "ts" | "tsx" => Some(Box::new(typescript::TypeScriptParser::new())),
+        "java" => Some(Box::new(java::JavaParser::new())),
+        "rs" => Some(Box::new(rust_lang::RustParser::new())),
+        "go" => Some(Box::new(go::GoParser::new())),
+        "bsl" | "os" => Some(Box::new(bsl::BslParser::new())),
+        "php" | "php5" | "phtml" => Some(Box::new(php::PhpParser::new())),
+        "c" => Some(Box::new(c::CParser::new())),
+        // `.h` — за C++-парсером: он надмножество C и разбирает оба варианта
+        "h" | "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "hh" => Some(Box::new(cpp::CppParser::new())),
+        "cs" => Some(Box::new(c_sharp::CSharpParser::new())),
+        "rb" => Some(Box::new(ruby::RubyParser::new())),
+        "swift" => Some(Box::new(swift::SwiftParser::new())),
+        "html" | "htm" => Some(Box::new(html::HtmlParser::new())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parser_registry_new_all() {
+        let reg = ParserRegistry::new_all();
+        assert!(reg.get_parser("py").is_some(), "Python парсер должен быть в реестре");
+        assert!(reg.get_parser("js").is_some(), "JavaScript парсер должен быть в реестре");
+        assert!(reg.get_parser("jsx").is_some(), "JSX парсер должен быть в реестре");
+        assert!(reg.get_parser("ts").is_some(), "TypeScript парсер должен быть в реестре");
+        assert!(reg.get_parser("tsx").is_some(), "TSX парсер должен быть в реестре");
+        assert!(reg.get_parser("java").is_some(), "Java парсер должен быть в реестре");
+        assert!(reg.get_parser("rs").is_some(), "Rust парсер должен быть в реестре");
+        assert!(reg.get_parser("unknown").is_none(), "Неизвестное расширение должно давать None");
+    }
+
+    #[test]
+    fn test_parser_registry_from_languages() {
+        let reg = ParserRegistry::from_languages(&["python".to_string()]);
+        assert!(reg.get_parser("py").is_some(), "Python должен быть при явном указании");
+        assert!(reg.get_parser("js").is_none(), "JS не должен быть — не указан");
+        assert!(reg.get_parser("ts").is_none(), "TS не должен быть — не указан");
+        assert!(reg.get_parser("java").is_none(), "Java не должен быть — не указан");
+    }
+
+    #[test]
+    fn test_parser_registry_from_languages_js_ts() {
+        let reg = ParserRegistry::from_languages(&[
+            "javascript".to_string(),
+            "typescript".to_string(),
+        ]);
+        assert!(reg.get_parser("js").is_some());
+        assert!(reg.get_parser("jsx").is_some());
+        assert!(reg.get_parser("ts").is_some());
+        assert!(reg.get_parser("tsx").is_some());
+        assert!(reg.get_parser("py").is_none());
+    }
+
+    #[test]
+    fn test_parser_registry_unknown_language() {
+        // Неизвестный язык не должен вызывать панику
+        let reg = ParserRegistry::from_languages(&["rust".to_string(), "go".to_string(), "cobol".to_string()]);
+        // Rust поддерживается — .rs должен найтись
+        assert!(reg.get_parser("rs").is_some());
+        // Go теперь поддерживается — .go должен найтись
+        assert!(reg.get_parser("go").is_some());
+        // Неизвестный язык — None
+        assert!(reg.get_parser("cob").is_none());
+    }
+
+    /// Реестр строится из `IndexConfig::languages`, а не из `[[paths]] language`
+    /// в daemon.toml. Если язык добавлен в `from_languages`, но забыт в списке
+    /// по умолчанию — файлы попадут в code-категорию, но парситься не будут
+    /// (молча, без ошибки). Тест держит оба списка в согласии.
+    #[test]
+    fn default_languages_cover_all_parsers() {
+        let reg = ParserRegistry::from_languages(&crate::indexer::config::default_languages());
+        for ext in [
+            "py", "js", "ts", "java", "rs", "go", "bsl", "php", "c", "h", "cpp", "hpp", "cs", "rb",
+            "swift", "html",
+        ] {
+            assert!(
+                reg.get_parser(ext).is_some(),
+                ".{} должен парситься при языках по умолчанию",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_parser_for_extension_compat() {
+        // Функция обратной совместимости
+        assert!(get_parser_for_extension("py").is_some());
+        assert!(get_parser_for_extension("js").is_some());
+        assert!(get_parser_for_extension("ts").is_some());
+        assert!(get_parser_for_extension("java").is_some());
+        assert!(get_parser_for_extension("cpp").is_some());
+        assert!(get_parser_for_extension("cs").is_some());
+        assert!(get_parser_for_extension("rb").is_some());
+        assert!(get_parser_for_extension("swift").is_some());
+        assert!(get_parser_for_extension("cob").is_none());
+    }
+}

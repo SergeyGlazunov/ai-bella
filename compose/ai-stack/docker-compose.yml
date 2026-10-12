@@ -1,0 +1,48 @@
+services:
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    container_name: omniroute
+    restart: unless-stopped
+    stop_grace_period: 40s
+    ports:
+      - "${OMNIROUTE_PORT:-20128}:20128"
+    volumes:
+      - omniroute-data:/app/data
+    environment:
+      PORT: "20128"
+      INITIAL_PASSWORD: ${OMNIROUTE_INITIAL_PASSWORD}
+      OMNIROUTE_MEMORY_MB: ${OMNIROUTE_MEMORY_MB:-1024}
+      OMNIROUTE_CHAT_ADMISSION_QUEUE_MS: ${OMNIROUTE_CHAT_ADMISSION_QUEUE_MS:-15000}
+      OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT: ${OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT:-3}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:20128').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: ${CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS:-40}
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://omniroute:20128/v1
+      OPENAI_API_KEY: ${OPENWEBUI_OMNIROUTE_KEY}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_AUTH: "true"
+      # Ordinary users must see OmniRoute models in the picker
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
+      DEFAULT_MODELS: "ds/deepseek-flash"
+    depends_on:
+      - omniroute
+
+volumes:
+  omniroute-data:
+  open-webui-data:

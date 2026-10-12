@@ -1,0 +1,72 @@
+repo:
+  path: /srv/ai/ubd
+  remote: "https://ic-git.dns-shop.ru/it/sXe/ubd-gov/public/ai/configs/ubd_for_ai"
+  branch: main
+  workspace_subdir: src
+
+schedule:
+  window_start: "01:30"
+  window_end: "06:00"
+  timezone: Asia/Vladivostok
+  # Warn if a job runs longer than this many seconds. Not a kill deadline.
+  # null: no duration warning; automatic writes still allowed inside the window.
+  duration_warn_seconds: null
+  # deprecated alias; prefer duration_warn_seconds
+  build_deadline_seconds: null
+  measure_max_seconds: 43200   # optional --measure log cap; does not kill jobs
+
+alert:
+  # Replace with a real on-call channel. The kit example refuses until replaced
+  # (or CONTOUR_ALERT_ALLOW_LOG=1 for local dry-run only).
+  command: ["/opt/ai-sync/alert.sh"]
+
+services:
+  # New-install kit paths (copy compose/ to /srv/ai/compose, see USER.md).
+  # Existing-stand update: keep live dirs under /mnt/c/MCP/...
+  graph_compose_dir: /srv/ai/compose/mcp_for_1c
+  graph_project: mcp_for_1c
+  graph_service: metadata-indexer
+  graph_mcp: mcp-metadata-graph
+  bsl_compose_dir: /srv/ai/compose/bsl-indexer
+  bsl_project: bsl-indexer
+  bsl_container: bsl-indexer
+  bsl_publish_port: 8011
+  bsl_daemon_toml: /srv/ai/compose/bsl-indexer/deploy/docker/daemon.toml
+  webui_network: ai-stack_default
+
+storage:
+  graph_volume: mcp_for_1c_neo4j-data
+  code_index_volume: bsl-indexer_bsl-indexer-home
+
+# Real content probes (R02). {path} = sample relative path. Scripts exit non-zero on miss.
+# Graph probes use neo4j (MCP is stopped during verify). BSL uses get-file-summary on /repos/SRC.
+adapters:
+  idle_probe:
+    - /opt/ai-sync/integrations/idle_bsl.sh
+  code_index:
+    check_bsl:
+      - /opt/ai-sync/integrations/probe_code_index.sh
+      - present
+      - "{path}"
+    check_deletion:
+      - /opt/ai-sync/integrations/probe_code_index.sh
+      - absent
+      - "{path}"
+  graph:
+    check_bsl:
+      - /opt/ai-sync/integrations/probe_graph.sh
+      - present
+      - "{path}"
+    check_xml:
+      - /opt/ai-sync/integrations/probe_graph.sh
+      - present
+      - "{path}"
+    check_deletion:
+      - /opt/ai-sync/integrations/probe_graph.sh
+      - absent
+      - "{path}"
+features:
+  graph: true
+  code_index: true
+  mdd: false
+

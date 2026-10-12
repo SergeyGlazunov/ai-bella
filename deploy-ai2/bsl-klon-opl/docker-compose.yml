@@ -1,0 +1,21 @@
+name: ai2-bsl-klon-opl
+services:
+  bsl-indexer:
+    image: ai2-bsl-indexer:local
+    container_name: ai2-bsl-klon-opl
+    environment:
+      CODE_INDEX_HOME: /data/code-index-home
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "9003"
+    volumes:
+      - /srv/ai2/klon_opl/src:/repos/SRC
+      - bsl-klon-opl-home:/data/code-index-home
+      - /srv/ai2/compose/bsl-indexer/deploy/docker/entrypoint.sh:/usr/local/bin/bsl-indexer-entrypoint.sh:ro
+      - ./daemon.toml:/data/code-index-home/daemon.toml:ro
+    ports:
+      - "8311:9003"
+    restart: unless-stopped
+
+volumes:
+  bsl-klon-opl-home:
+    name: ai2-bsl-klon-opl-home

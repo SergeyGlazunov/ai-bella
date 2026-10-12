@@ -1,0 +1,34 @@
+﻿# Secrets and local runtime (keep on stand; never commit)
+secrets/
+logs/
+workdir/
+*.dev.json
+*-connection.json
+**/.env
+!/**/.env.example
+
+# Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+**/.pytest_cache/
+
+# Editors and local agents
+.cursor/
+.vscode/
+.idea/
+
+# Local runtime artifacts
+*.pid
+*.log
+*.tmp
+*.bak
+*.7z
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

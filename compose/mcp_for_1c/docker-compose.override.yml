@@ -1,0 +1,74 @@
+# Kit override for graph + query-builder (ai2 / new server safe).
+#
+# Default `docker compose up -d` must NOT start platform-help / bsl-checker /
+# v8std / qdrant (port 8003 may be a separate 1c_help_mcp; BSL is bsl-indexer).
+#
+# Do NOT attach to prod `ai-stack_default` here — that broke ai2 DNS and tied
+# new installs to a live chat network. To join WebUI later:
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.webui.yml up -d mcp-metadata-graph mcp-query-builder
+# or: docker network connect <webui-net> <container>
+#
+# Neo4j Browser stays on 127.0.0.1. Graph MCP may listen on all interfaces
+# for portproxy (${MCP_PORT:-8001}).
+
+services:
+  qdrant:
+    profiles: ["unused"]
+  help-indexer:
+    profiles: ["unused"]
+  workspace-watcher:
+    profiles: ["unused"]
+  mcp-bsl-checker:
+    profiles: ["unused"]
+  mcp-platform-help:
+    profiles: ["unused"]
+  v8std-mcp:
+    profiles: ["unused"]
+
+  mcp-query-builder:
+    ports: !override
+      - "0.0.0.0:${QUERY_PORT:-8009}:8009"
+    environment:
+      - MCP_DNS_REBINDING_PROTECTION=0
+      - MCP_ALLOWED_HOSTS=${QUERY_ALLOWED_HOSTS:-mcp-query-builder,mcp-query-builder:8009,127.0.0.1,localhost}
+      - NEO4J_HTTP_TIMEOUT_SEC=${NEO4J_HTTP_TIMEOUT_SEC:-30}
+      - NEO4J_PROBE_TIMEOUT_SEC=${NEO4J_PROBE_TIMEOUT_SEC:-15}
+    restart: unless-stopped
+
+  mcp-metadata-graph:
+    ports: !override
+      - "0.0.0.0:${MCP_PORT:-8001}:8001"
+      - "127.0.0.1:9000:9000"
+    environment:
+      - MCP_DNS_REBINDING_PROTECTION=0
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS}
+      - WATCHER_ENABLED=false
+      - METADATA_WATCH_ENABLED=false
+      - ENABLE_WATCH_TOOLS=0
+      # Default probe is 3s; under GC Neo4j can take 5s+ → false neo4j_unavailable.
+      - NEO4J_HTTP_TIMEOUT_SEC=${NEO4J_HTTP_TIMEOUT_SEC:-30}
+      - NEO4J_PROBE_TIMEOUT_SEC=${NEO4J_PROBE_TIMEOUT_SEC:-15}
+    restart: unless-stopped
+
+  neo4j:
+    ports: !override
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      # Leave RAM for metadata-indexer; uncapped heap caused Exit 137 (OOM).
+      - NEO4J_server_memory_heap_initial__size=1g
+      - NEO4J_server_memory_heap_max__size=2g
+      - NEO4J_server_memory_pagecache_size=1g
+    # Upstream healthcheck uses cypher-shell (full JVM) with a 5s timeout —
+    # Docker marked Neo4j unhealthy for hours while HTTP :7474 was up.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --timeout=5 http://127.0.0.1:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  metadata-indexer:
+    restart: "no"

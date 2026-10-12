@@ -1,0 +1,12 @@
+#!/bin/sh
+# Example alert channel — NOT production-ready (R09).
+# Replace with mail/Telegram/webhook that reaches an on-call human.
+# Local log-only mode: CONTOUR_ALERT_ALLOW_LOG=1
+set -eu
+if [ "${CONTOUR_ALERT_ALLOW_LOG:-}" != "1" ]; then
+  echo "alert.sh.example is a stub; set a real alert.command (or CONTOUR_ALERT_ALLOW_LOG=1 for dry-run)" >&2
+  exit 1
+fi
+umask 077
+mkdir -p /srv/ai/logs
+cat >> /srv/ai/logs/contour-alert.log

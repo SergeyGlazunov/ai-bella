@@ -1,0 +1,2862 @@
+# Changelog (English)
+
+Russian version: [CHANGELOG.md](CHANGELOG.md).
+
+Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+Versioning — [SemVer](https://semver.org/).
+
+## [1.2.2] — 2026-09-15
+
+**`get_call_tree` keeps the response size in check: for a frequently called 1C procedure the default tree is 45.6 KB instead of 74.8 KB, with `max_nodes` 5000 — 45.8 KB instead of 1.8 MB. A shortened response says how many edges are shown and suggests how to get the rest.**
+
+### Added
+
+- **Response size limit for `get_call_tree`.** The default budget is 48 KB, but not above the server `[cap].max_response_bytes`. If the response does not fit, edges are ordered by level and the farthest are dropped, and the `tree` field is not returned: it repeats the edges and takes about a quarter of the response. The response carries `truncated`, `edges_total` (how many edges there were), `edges_shown` (how many are shown) and a hint on how to get what is needed: farther levels — `get_call_tree` from a specific node in `edges`; a chain to a specific function — `find_path`; all callers or callees of one node — `get_callers` or `get_callees` with `limit`; fewer levels — a ready call with `max_depth` one less (only if the response has more than one level). If the traversal also hit `max_nodes`, the hint says the graph has more edges than the shown number.
+- **`tree_omitted` marker.** When all edges fit only without the tree, all edges are returned, the `tree` field is omitted, and the response carries `tree_omitted` and a hint.
+- **The `max_response_bytes` parameter** sets the budget for one call; it is not raised above the server cap `[cap].max_response_bytes_hard`. Neither the tool description nor the hint names budget numbers or suggests raising it: in a draft the hint offered to repeat the call with the cap, the test agent did exactly that, the 186 KB response went to a file, and token usage on the question grew by 37 % (single run).
+
+### How to apply
+
+- Works right after replacing the binary, no reindexing needed.
+
+### Known limitations
+
+- The default budget was chosen without a comparative agent run — 48 KB, as for the other size-limited tools.
+- Within one level edges keep the traversal order: shortening drops the end of the level, not the least important edges.
+- The file path is repeated in every edge and takes 41–44 % of edge bytes on 1C. Moving paths into a separate list was not done: it changes the edge shape for all clients.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 870 passed, 0 failed; with `--features enrichment` — 879 passed, 0 failed; no compiler warnings. 8 new tests: a response within budget is unchanged and returned with the tree; a zero budget shortens nothing; a shortened response fits the budget, keeps the near levels and comes without the tree; at least one edge; without the tree more edges fit than with it; the tree is dropped before edges; the hint suggests narrowing the request and does not name the budget; the default budget is not above the constant.
+- **Locally, a copy of a standard trade configuration (57 thousand files) and a 1C:EDT export of an accounting configuration, compared with 1.2.1 on the same requests:**
+
+  | Request | 1.2.1 | 1.2.2 |
+  |---|---:|---:|
+  | callers of `ЗначениеРеквизитаОбъекта`, default | 74.8 KB, 200 edges | 45.6 KB, 162 edges, no `tree` |
+  | same, 3 levels, `max_nodes` 5000 | 1.8 MB, 5000 edges | 45.8 KB, 162 edges |
+  | same on accounting, 1 level, `max_nodes` 5000 | 1.7 MB, 4914 edges | 45.4 KB, 175 edges |
+  | 1 level, `max_nodes` 150 | 56.6 KB, 150 edges | 42.2 KB, all 150 edges, `tree_omitted` |
+  | `max_response_bytes` 100,000 | 74.8 KB | 74.8 KB, with the tree — byte-identical |
+  | `max_response_bytes` 900,000, `max_nodes` 5000 | 1.8 MB | clamped to 192,000 — 186.4 KB, 691 edges |
+
+  Responses that fit the budget matched 1.2.1 byte for byte: a downward tree on a Rust database (28.9 KB, 200 edges), small two-level 1C trees, an empty tree. The `get_callers`, `get_callees` and `find_path` descriptions did not change.
+- **Live development sessions (June–September 2026):** of 18 `get_call_tree` calls 16 were 0.6–13.6 KB — the limit does not affect them; one call with `max_nodes` 5000 returned 1.24 million characters and was dumped to a file by the client.
+- **Locally:** both services are up on the new build, all 52 watched folders reached ready.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the checksum of the file in both containers matched the built one. The remote accounting database through the local serve: callers of `ЗначениеРеквизитаОбъекта` — 70.6 KB, 200 edges → 45.5 KB, 172 edges with the same hint; a small tree matched 1.2.1 byte for byte.
+
+## [1.2.1] — 2026-09-15
+
+**The "call from a form → the form's object module" rule no longer binds calls from client procedures or calls to a common module through a variable: on a standard accounting configuration false rule links 65 → 5, precision 97.6 % → 99.7 %.**
+
+### Fixed
+
+- **A call from a `&НаКлиенте` procedure is not bound to the object module.** The form object exists only on the server, so a variable in a client procedure holds something else — a client module or its context. The 1.2.0 rule did not tell them apart: on a standard accounting configuration 48 false links came from the client procedures of one container form of the electronic document exchange library. The procedure directive is taken from the module parse.
+- **A call through a `Модуль<Name>` variable is not bound if the common module `<Name>` exists.** This is how standard configurations obtain a common module by name (`Модуль = ОбщегоНазначения.ОбщийМодуль("<Name>")`), and the call belongs to that module, not to the form object. The accounting configuration had 8 such false links.
+
+### How to apply
+
+- Rule links are built when the 1C extension layer is built. For an already indexed database run `bsl-indexer index <path>` without `--force` while the daemon is stopped: the extension layer is rebuilt without reparsing files. Changed forms get the fix on the next incremental update.
+
+### Known limitations
+
+- On a standard accounting configuration, of 2770 rule links 2763 are correct, 5 are false, and 2 more have no final verdict. Two of the five false ones are calls to the object of another report created via `Отчеты["<Name>"].Создать()`.
+- Rule precision in external data processors and reports was not measured: a copy of a standard trade configuration has 159 such links.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 862 passed, 0 failed; with `--features enrichment` — 871 passed, 0 failed; no compiler warnings. 3 new tests: a call from a client procedure is not bound; a call through a common module variable is not bound; the graph after an incremental update matches a full rebuild. With the rule reverted, the new tests fail.
+- **Standard accounting configuration, two exports of the same database (Designer and 1C:EDT).** Before the fix the rule produced 2830 links, identical sets in both exports; manual review: 2763 correct, 65 false. After recreating the databases — 2770 in both: exactly the 60 links selected in advance as false were removed, no correct link was affected. Extension layer build on the 1C:EDT export — 88.6 → 89.6 s (single runs).
+- **Copy of a standard trade configuration (57 thousand files).** 3 links removed, all false: one call to a common module through a variable and two client calls in an external data processor; the rest of the graph matched a full 1.2.0 build by checksum. Incremental update of a form after an edit and after reverting it — 1.7–1.9 s, 55 form links, the graph matches a full rebuild.
+- **Locally:** both services are up on the new build, all 52 watched folders reached ready.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the checksum of the file in the container matched the built one; the extension layer was rebuilt in six databases. In four accounting and payroll databases direct edges dropped by 60–63, bound `КонтекстЭДОКлиент.*` calls — 0 instead of 48–50; form handler, subscription and extension override edges did not change. On five large databases 1.2.0 → 1.2.1 full indexing — from −2.5 to +0.7 %, extension layer build — from −3.2 to +1.6 % (single runs). Through the local serve the remote accounting database answers `bsl_sql` and `get_call_tree`, the call from a form to its data processor module is in place.
+
+## [1.2.0] — 2026-09-15
+
+**`get_callers` in 1C configurations finds calls written with a module name or through an object: `ЗначениеРеквизитаОбъекта` in a standard trade configuration has 4560 callers instead of 11, and `get_callees`, `find_path` and `get_call_tree` show the same calls consistently. Single-repository `serve` mode gets the 1C tools and bindings on a par with federation.**
+
+### Added
+
+- **Qualified calls in `get_callers`.** The 1C parser stores the called name together with its receiver (`CommonModule.Method`, `Catalogs.Object.Method`), while `get_callers` looked for an exact match with the bare name and did not see such calls — so calls to common module and manager module procedures were not found at all. Now the exact spellings derived from where the procedure is declared are added to the callers: `Module.Method` for an exported common module procedure, `Collection.Object.Method` for a manager module in both forms of the collection name (`Справочники` and `Catalogs`). Spellings are built only from real declarations, so a same-named method of an unrelated object does not get into the result; repeats are dropped.
+- **A call from a form module is bound to its object module.** A form can call an object module procedure only through a variable holding the object (`ОбработкаОбъект.Метод()`), and the call graph bound such edges by no rule and then pruned them: `get_callers` and `find_path_bsl` did not see the path from a form to its data processor module. The new rule gives a single-dot call from a form module the address of the exported procedure in the object module of that same form. Supported layouts: Designer (`<Object>/Forms/<Form>/Ext/Form/Module.bsl` → `<Object>/Ext/ObjectModule.bsl`), 1C:EDT (`<Object>/Forms/<Form>/Module.bsl` → `<Object>/ObjectModule.bsl`) and external data processors and reports (`Form.obj.bsl` → `ExternalDataProcessor.obj.bsl` or `ExternalReport.obj.bsl`); common forms, common modules and collections are not affected. A standard trade configuration has 501 such calls; for 91 % the object is confirmed by the variable assignment.
+- **`get_callers` takes graph edges by target address** — a new `idx_pcg_callee_key` index. The index is partial (`WHERE callee_proc_key IS NOT NULL`): a full index was also chosen by the planner for the `callee_proc_key IS NULL` condition of the incremental graph update — on the test stand 108–144 ms per query instead of 0.1 ms, and the graph stage of a 10-object batch grew from 0.82–0.90 to 2.3–2.5 s.
+- **`get_callees`, `find_path` and `get_call_tree` in 1C see the same calls as `get_callers`.** All three compared the whole name: for an `ОбработкаОбъект.Метод` call `get_callees` did not show where it is defined, `find_path` stopped the path at it, and `get_call_tree` found no callers upwards and did not go further downwards. Now, for 1C databases, `get_callees` takes `callee_path` and `callee_line` from the graph binding (no binding — the previous name lookup), `find_path` continues the path with the procedure the graph bound the call to, and `get_call_tree` builds the tree level by level: upwards, qualified calls are added to the callers found by name; downwards, a dotted call continues with the bound procedure. Tree nodes are procedure names, so the `callee` of a tree edge is a procedure name; in `find_path` and `get_callees` the call stays as written. The bindings of all calls of a procedure are read with one query per tool call. Definition files are part of the `get_callees` response dependencies: editing the module with the definition evicts the response from the serve cache. Responses for databases in other languages are unchanged.
+
+### Fixed
+
+- **Single-repository `serve` mode did not attach the language processor to repositories.** In single-repository mode (started with `--path` or without `serve.toml`) repository entries were created without a language, so everything relying on the 1C processor answered incompletely: no qualified calls and no form handler bindings from v0.62.0 (`get_callers` for `ПриСозданииНаСервере` — 19 versus 20 in federation on the same database), and with `--path` the 1C tools were missing from the tool list as well (20 tools instead of 32). Now the language is determined at startup: entries from `[[paths]]` take an explicit `language` or the one detected from the root, entries from `--path` take the detected one, as the `index` command does. Re-reading `daemon.toml` updates the entries' language and processor before the tool list is swapped.
+- **Federation: a `[[paths]]` entry without `language` got the language tools but not the processor.** The language of local entries and the set of active languages are now computed by one function. It did not show in practice: the daemon writes `language` back into `daemon.toml` at startup.
+
+### How to apply
+
+- Calls to common and manager modules, and the single-repository mode fix, work right after the binary is replaced.
+- "Form → object module" edges are built when the 1C extension is built. For changed forms they appear on the next incremental update; for a whole already indexed database run `bsl-indexer index <path>` without `--force` with the daemon stopped: the extension is rebuilt without re-parsing the files.
+- `get_call_tree` upwards from a frequently called 1C procedure now returns thousands of edges. With `max_nodes` 5000 the response on an accounting database is about 1.2 MB and the response size guard does not cut it; the default limit is 200 edges.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 859 passed, 0 failed; with `--features enrichment` — 868 passed, 0 failed; no compiler warnings. 11 new tests: `find_path` continues along a bound call; the tree adds qualified calls upwards and expands a bound call downwards; procedure call bindings from the graph; the target address index is partial; object module candidates for the Designer, 1C:EDT and external data processor layouts; a call from a form is bound to its own object module; the graph after an incremental update matches a full rebuild; qualified calls for a common module, a manager module and a form; the language of a single-repository mode entry; re-reading `daemon.toml` sets the language and processor of a local entry and leaves a remote one untouched.
+- **Test stand — a copy of a standard trade configuration (57 thousand files), compared with 1.1.0 on the same database.** `get_callers`: `ЗначениеРеквизитаОбъекта` 11 → 4560, `СообщитьПользователю` 69 → 8913, `ПриСозданииНаСервере` 20 → 4767, `Записать` 872 → 1064, a data processor module procedure called from its forms 0 → 4; response time 1–77 ms. Full indexing 1:53 → 1:51, graph build 26.2 → 27.1 s; a batch of 100 changed objects 10.5 → 10.6 s, of 10 objects 3.1–3.2 → 2.7–2.8 s. The graph after changing and reverting 100 objects matched a full rebuild (614,131 rows, checksum matched); 100 of 100 new calls from forms were bound to the right procedure.
+- **Test stand, single-repository mode with the daemon running.** The previous build with `--path`: 20 tools, `ЗначениеРеквизитаОбъекта` 11, `ПриСозданииНаСервере` 19. The new one with `--path` and with `--config` without `language` (the language was detected from the root): 32 tools, 4560 and 4767, the path from a form to its data processor module found — exactly as in federation mode of the same build.
+- **Five tools on one call.** A form procedure calls a procedure of its data processor module through a variable. On the trade configuration test stand (single-repository mode and federation), on an accounting export from 1C:EDT and through the federation node, `get_callers`, `find_path_bsl`, `get_callees`, `get_call_tree` and `find_path` show the same call; in 1.1.0 only the first two did. The same on a common module call `ОбщегоНазначения.ЗначениеРеквизитаОбъекта`: `get_callees` points to the definition, the upward tree has 4560 callers, as `get_callers` does (11 in 1.1.0). On a non-1C database (Rust) the `get_callees`, `find_path` and `get_call_tree` responses matched the previous ones byte for byte.
+- **Timings on the trade configuration test stand, 1.1.0 → 1.2.0, together with the amount of work:**
+
+  | Request | 1.1.0 | 1.2.0 | What is behind the numbers |
+  |---|---:|---:|---|
+  | `find_path` with no path found, depth 5 | 270 ms | 610 ms | the walk visits 15,711 nodes instead of 5,423: 1.1.0 did not follow dotted calls, and its «no path» could be false |
+  | `find_path` with a path found | 323 ms | 67 ms | the path is found shorter, through a dotted call |
+  | `get_call_tree` downwards, 200 edges | 68 ms | 21 ms | the same amount |
+  | `get_call_tree` upwards from `ЗначениеРеквизитаОбъекта` | 20 ms | 885 ms | 52 edges versus 5000: 1.1.0 saw 11 of 4560 first-level callers; per edge 0.38 → 0.18 ms |
+  | `get_callees`, 200 rows | 100 ms | 122 ms | +22 ms for the definition of dotted calls |
+
+- **Locally:** both services are up on the new build, all 52 tracked directories reached ready; through the working serve `get_callers`, `get_callees`, `get_call_tree` and `find_path` answer on a form call in the trade configuration and in the 1C:EDT export.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the file checksum in the container matched the built one; remote databases answer through the local serve: the trade configuration 4584 callers of `ЗначениеРеквизитаОбъекта`, accounting 5120, ZUP 5082 callers of `СообщитьПользователю`, the data processor procedure called from forms — 4; `get_callees` points to the definition both in the configuration and in the external data processor, `get_call_tree` upwards has 4 callers, `find_path` finds the path.
+
+## [1.1.0] — 2026-09-14
+
+**A directory is added to and removed from the index with a single edit to `daemon.toml` and `serve.toml` — without restarting the daemon or serve and without manual commands; clients' open MCP sessions are not dropped.**
+
+### Added
+
+- **Federation configuration is re-read on the fly.** `serve` watches `serve.toml` and `daemon.toml` (one watch for both files, 500 ms debounce) and on an edit rebuilds the repository table as a whole: added aliases start being served, removed ones stop, and an entry whose path, address, port or language changed is updated. Previously `serve.toml` was read once at startup: a new alias required restarting serve, and a restart dropped the sessions of every connected client. The table is swapped in one step — sessions opened before the edit see the new set right away, and requests started before the swap finish on the previous one.
+- **Manual `POST /reload`** — the same mechanism on request, responding with `{reloaded, generation, added, removed, changed, restart_required, error}`. The route exists only in federation mode and is protected by the same allowed-address list.
+- **The result of the last re-read in the `health` tool** — the `config_reload` field.
+- **The daemon watches `daemon.toml` itself** (500 ms debounce, read events on Linux are dropped by the same filter serve uses) and applies added and removed directories. The `daemon reload` command remains as a manual fallback.
+- **A removed directory stops being tracked without restarting the daemon.** Previously a re-read only added directories, while the watch task of a removed one kept running and writing to its database until a restart. Now each task has its own stop signal: it finishes cleanly — between files, parse portions and transactions, never cutting a write short; the watchdog does not respawn it; the directory's files and database stay on disk. If the directory is added back, the new task starts only after the previous one has finished.
+
+### How an edit is applied
+
+- **All or nothing.** The new table is fully built before the swap. If either file fails to parse, a new repository's database fails to open, or its directory does not exist, nothing changes: the previous table stays and the reason is in `error`. No directories are created during a re-read.
+- **The pair of files is cross-checked.** A local alias in `serve.toml` without an entry in `daemon.toml` is not applied: while only one file has been edited, the previous table stays. An intermediate state between two saves never publishes a truncated set.
+- **Open databases are reused.** For unchanged local repositories the connection pool is not reopened; a new repository's database is created when needed, the same way as at startup.
+- **Response cache and repeat suppression.** For removed and changed aliases the cache is cleared before and after the swap, so a request crossing the swap cannot put back a stale response; repeat suppression is reset.
+- **The allowed-address list** is updated together with the table: at the moment of the swap the union of the old and new sets applies, then exactly the new one.
+- **Restart only:** a `[me].ip` change is not applied at all (`restart_required: ["[me].ip"]`); a `[pool]` change is reported in `restart_required`, and new databases open with the previously applied pool settings. The tool list, mass mode and response limits from `daemon.toml` are still read at startup. Mode without `serve.toml` is unchanged.
+- **Stopping a daemon task.** Initial indexing in the daemon runs in portions of `batch_size` files so a stop takes effect between them; an unfinished indexing is marked in the database and completed the next time the directory is added. A full 1C extension build cannot be interrupted safely — the stop waits for it to finish (minutes on a large configuration). If the same directory is added back during that time, the daemon refuses to start a second task after 5 s and logs the reason — save the file again or run `daemon reload` later.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 848 passed, 0 failed; with `--features enrichment` — 857 passed, 0 failed; no compiler warnings. 24 new tests: swapping the table and the address list is visible to an already open session; an entry taken before an alias is removed keeps working; re-read — adding a remote and a local alias, an alias without a pair, a parse error and a missing file for each of the two, pool reuse, removal, `[me].ip` and `[pool]` changes, a non-existent root, selective cache clearing, a repeat with no changes, concurrent re-reads; the watcher filter for two files; daemon — its own signal stops a task, removing a directory moves the task to stopping and the watchdog does not respawn it, adding it back waits for the previous task and starts exactly one, a full pass stops before writing, a `daemon.toml` parse error leaves the directory set unchanged, the daemon watcher filter.
+- **Locally, live serve under the supervisor, one MCP session for the whole scenario:** a repository added to both files was applied by the watcher within a second — database created, the same session found a function in the new repository; an alias only in `serve.toml` was rejected with the reason, the table unchanged; after the files were restored the alias was gone, neighbouring repositories answer, and the session stayed alive to the end. A separate scenario using only edits to the two files, with no command at all: the daemon picked up the directory and made it ready within 2 s, serve added the alias; after removal from the files the daemon stopped tracking the directory — an edit to a file in it never reached the database; adding it back picked up a function written in between; deleting the directory from disk caused no errors; the daemon and serve PIDs did not change.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the file checksum in both containers matched the built one. Remote repositories answer through the local serve, including an extension tool. On the node the same scenario as locally: a directory added to `daemon.toml` and `serve.toml` started being served without restarting serve, the same session found a function in it, an alias without a pair was rejected, and after the files were restored the directory was gone; a remote alias appended to `serve.toml` was applied by the watcher within a second; no repeated re-reads within 20 s — read events on Linux do not cause a loop; `POST /reload` from another machine on the network returns 200; the node configuration was restored. The daemon scenario on the node, file edits only: the directory was ready within 3 s, after removal it was no longer tracked or indexed, adding it back picked up the new function, deleting it from disk caused no errors; the start time of both containers did not change; the daemon log shows only real `daemon.toml` applications, with no repeats from read events.
+
+## [1.0.5] — 2026-09-11
+
+**The incremental extension update for 1C:EDT dumps now matches the Designer-format branch: call addresses are resolved right away, and the module registry is filled even on a database from an earlier version.**
+
+### Fixed
+
+- **The exported-procedure registry is maintained for 1C:EDT dumps too.** That branch neither updated it per file nor rebuilt it whole when empty. Two consequences followed. On a database created by an earlier version (no registry) call address resolution ran for nothing — no error, but not a single address resolved. And a procedure that became exported in the same batch of edits never reached the registry, so calls to it stayed unresolved until a full rebuild. Both branches now maintain the registry the same way: a module's rows are refreshed with it, a deleted module's rows are removed, and an empty registry is rebuilt whole before address resolution.
+- **The outdated `metadata_modules` key migration now also runs on the incremental path.** Replacing the uniqueness key with a composite one happened only in full passes. On a database from an earlier version the incremental update kept answering "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" and wrote no module row, while a full pass might never happen at all. The migration moved into a function with its own transaction and is called once per batch in both incremental branches.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --features enrichment` — 833 passed, 0 failed. Two of them are new; on the pre-fix code both fail with exactly the described symptoms — an empty registry and a missing module row.
+- **A live 1C:EDT dump stand under the watcher service, two builds compared.** On the previous one: no address for the call to the new exported procedure, no module row, key not migrated, an `ON CONFLICT` warning in the log. On the new one: address resolved, row written, key migrated, no warnings.
+- **Locally:** both services run the new build, all 51 watched folders reached ready, and queries against a real 1C:EDT dump answer — object profile, 30 modules, data links.
+- **Federation:** the node was rebuilt on this build (the binary inside the container matches the built one by checksum) and remote repositories answer — procedure body and data links.
+
+## [1.0.4] — 2026-09-10
+
+**Editing a file in a 1C:EDT dump no longer breaks the incremental extension update: the call graph and data links now keep up with the base index.**
+
+### Fixed
+
+- **The incremental extension update completes for 1C:EDT dumps.** After editing any `.bsl` in such a dump the update failed with "no such table: tmp_pcg_keys", the folder went into the failed state, and the base index was still updated — so the call graph and data links lagged behind the code until the service was restarted. The cause: call address resolution ran with the batch scope, but the temporary tables of that scope were never created before the call. The Designer-format branch has had that wrapper from the start; the EDT branch did not. Both branches now build the scope from the changed files the same way — created before resolution and dropped after. A full reindex did not help: the very next edit broke the update again. Reported by [@ShcherbakovP](https://github.com/ShcherbakovP) ([#8](https://github.com/Regsorm/code-index-mcp/issues/8)).
+- **The 1C:EDT module registry migrates the outdated table key.** Replacing the uniqueness key with a composite one happened only in the Designer-format branch. A database created by an earlier version and then pointed at an EDT dump kept the old key, and writing a module row answered "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint". The key migration is now a shared function called by both branches.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --features enrichment` — 831 passed, 0 failed. Two of them are new: editing a `.bsl` in an EDT dump completes the incremental update and the call address is resolved; the EDT module registry migrates the outdated table key. On the pre-fix code both fail with exactly the messages described in the report.
+- **Locally:** an EDT dump stand under a live watcher service. On the previous build editing a `.bsl` produced two warnings, a failed folder and an empty call address; on the new one — no warnings, the folder is ready, the address is resolved. Both services run the new build, and all 51 watched folders reached ready.
+- **Federation:** the node was rebuilt on this build (the binary inside the container matches the built one by checksum) and remote repositories answer — procedure body, object structure and data links.
+
+## [1.0.3] — 2026-09-08
+
+**The file size admission rule is now shared by both write paths into the index: the file watcher no longer stores what the directory walk rejects.**
+
+### Fixed
+
+- **The file watcher applies the same size limit as the directory walk.** The text file limit (`max_file_size`, 1 MB by default) lived only in the startup directory walk. The watcher path — the one that applies changes on the fly — never checked it: a file of any size was read in full and written to the database, so text files of hundreds of megabytes ended up in the index. The rule now lives in a shared `size_allowed` function used by both paths, and the watcher checks the size *before* reading the file instead of after — such a file used to be loaded into memory in full just to compute its hash.
+- **A folder holding such a file no longer fails as a whole.** Deleting a text file record requires decompressing the stored content: the contentless full-text index needs the previous text to remove its terms. For a 354 MB file the decompression hit the zstd-bomb guard (256 MB limit); the error propagated up to the full startup check, the worker exited, and after five restarts within a minute the folder was marked failed — every tool for that folder answered with an error. A failed decompression is now a warning in the log and processing continues: orphaned terms in the index do not affect results, because the join with the files table filters them out.
+- **A file skipped by size is no longer treated as gone from disk.** The directory walk did not add such a file to the list of seen paths, so the cleanup stage deleted its record on every run. The path is now recorded before the size check.
+- **The reason a worker stops is written to the log.** It used to go only into the folder state, where the supervisor's restart message overwrote it: the log showed "worker exited on its own" and nothing about what happened. Eight exit points now go through a shared function that logs the reason first and only then stores it.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 820 passed, 0 failed. Three of them are new: the size rule is identical for code, text and 1C dump files; the watcher does not take a text file above the limit; a file skipped by size is not treated as vanished.
+- **Locally:** a working folder that had been failing for three and a half hours because of two 354 MB files came back to ready on the existing database — "deleted 0" in the summary instead of a crash, and its tools answer again.
+- **Federation:** the node was rebuilt on this build (the binary inside the container matches the built one by checksum) and remote repositories answer. A 2.2 MB text file created in a watched folder on the node was processed by the watcher and not written to the database — it is absent from the index.
+
+## [1.0.2] — 2026-09-05
+
+**Windows executables now carry product and version information — visible in the file properties, without running them with a version flag.**
+
+### Added
+
+- **Version information in Windows builds.** Both executables now embed a version resource: product name, file description, company name, copyright notice, original and internal file name. File and product version are taken from the package version at build time. Previously all these fields were empty: the two executables were indistinguishable in the file properties, and the installed version could only be found by running the binary. The resource is embedded only when the build target is Windows — Linux and macOS builds are untouched and unchanged. Contributed by [@Borisskin](https://github.com/Borisskin) ([#7](https://github.com/Regsorm/code-index-mcp/pull/7)).
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 817 passed, 0 failed.
+- **Locally:** file properties of both Windows executables show product name, description, company and version 1.0.2; both services run the new build, and the register-writers query answers as before.
+- **Linux build:** the dynamically linked glibc ELF builds unchanged — resource embedding is skipped by target OS.
+- **Federation:** remote repositories answer through the new build on the node.
+
+## [1.0.1] — 2026-08-28
+
+**A role-rights query no longer runs a spurious second branch, nor carries a hint about an object that was never asked for.**
+
+### Fixed
+
+- **A role name is no longer mistaken for an object name.** The role-rights tool took the object name from a shared helper that deliberately ignores the key name and returns the value of the first non-service parameter. This tool has two meaningful parameters, so a query by role had the role name picked up as an object as well: a pointless database query ran, and the correct answer came with the hint "no role mentions this object" attached. The object name is now read strictly by key name (`object`, `object_name`, `full_name`, `name`), and blank values are dropped. Argument parsing was extracted into separate functions and covered by four tests.
+- **An empty role result now explains itself.** A query for a non-existent role used to return an empty list with no explanation, which reads as "this role has no rights". It now carries a hint saying no role by that name appears in the rights, plus the query that lists the available roles. The object branch had such a hint from the start.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 817 passed, 0 failed.
+- **Live check:** a query for a non-existent role answers with no object field and no foreign hint; queries by object and by an existing role answer as before.
+
+## [1.0.0] — 2026-08-28
+
+**First stable release. A named tool for role rights, call-chain search that no longer hangs on a dense graph, and callee lists that already carry the definition site.**
+
+> Context. The tool set was checked by a run where the same question was given to two agents: one with the server, one with plain file search. The run exposed three places where the agent spent dozens of turns instead of a single call — those are fixed below. From this release on, tool names and response shapes are considered settled: breaking changes will require a major version bump.
+
+### Added
+
+- **One-command install on Windows.** `install.ps1` downloads the requested release, unpacks it, records the folder in an environment variable, writes a starter settings file and prints a ready block for the client's settings. An optional switch registers autostart at logon — through the user's startup folder, with no administrator rights and no visible windows; the scheduled-task variant stays behind its own switch and never overwrites an existing task without permission. Install folder, source folder, build flavor, version and both ports are parameters.
+- **`get_role_rights` — role rights in one call.** "Which roles have rights on this object" and "what is this role allowed to do" are answered from the rights table. Previously the question took raw SQL or a walk over the roles directory reading rights files piece by piece. Rewording the raw-SQL description did not help — a separate named tool did: on the control question the cost dropped from 1.45M tokens over 33 turns to 255–307K over 7–8 turns.
+
+### Fixed
+
+- **1C call-chain search no longer hangs.** The traversal was rewritten from a recursive database query to a breadth-first walk with a visited set, a node ceiling and a time budget. The control question took 494 seconds; it now takes 112 milliseconds. The starting point may be given as a bare procedure name instead of a full key, and the response now reports whether the walk was cut short by time or by node count — so "no path" and "did not finish looking" are distinguishable.
+- **The hint on a missing path no longer misleads.** "No such calling procedure" was inferred from the number of resolved starting keys, and an exact key always yields exactly one — so every call with a full key claimed the procedure was not found even though the walk had honestly covered thousands of nodes. The signal is now the absence of outgoing edges.
+- **Callee lists carry the definition site.** For unambiguous names the response includes the declaration path and line, resolved with the module from a qualified call. Previously the agent looked up each name with a separate query: on the control question 1.32M tokens over 42 turns versus 619–684K over 14–18.
+
+### Changed
+
+- **Tool descriptions rewritten from the user's question.** Call tree, data links, file listing and raw SQL now say "reach for this on such-and-such question" and explicitly forbid assembling the answer by hand. On the call tree that meant 1.68M tokens over 70 turns versus 350K over 8; on data links 1.90M over 22 turns versus 680–813K over 11.
+- **The project's front page is now in Russian**, installation moved to the top, and community files were added: contributing guide, security policy, code of conduct.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 813 passed, 0 failed.
+- **Local deploy and live check:** both services running on the new build; role rights, callee lists and chain search verified against a trade configuration of 57,072 files. Both hint branches now differ correctly: with an existing start and no path the walk covers 3,795 nodes and reports "no path"; with a non-existent start it stops at one node and reports that the procedure was not found.
+- **Federation node:** image rebuilt from the local build, both containers healthy; role rights, callee lists and chain search verified through remote repositories.
+
+## [0.69.0] — 2026-08-27
+
+**A call edge now stores the callee's name, not a slice of source text. Calls inside chains and through qualified paths became findable — previously they never were.**
+
+> Context. Call-graph lookups (`get_callers`, `get_callees`, `find_path`, `get_call_tree`) match the name by exact equality. The parsers, however, stored the text of the whole callee node: for a chain like `json.dumps(x).encode()` or a path like `Self::f(&y).context(..)` that text carried arguments and line breaks along with it. Such an edge exists in the graph but no query can find it by name. In the project's own repository only 22 % of edges held a bare name: 7,040 of 15,311 carried expression text, and more carried a `::` path. On languages with free chaining the question "who calls this function" answered zero while the calls were right there in the code.
+
+### Fixed
+
+- **The name is taken from the parse node instead of by trimming text.** A shared helper walks from the callee expression down to the name: `Self::f(x)` → `f`, `obj.method()` → `method`, `pkg.Func()` → `Func`. When there is no name at all — the call target is the result of an expression (`handlers[0]()`, `(*callback)()`) — no edge is written, rather than storing a source string nothing can look up. The change touches the parsers of eleven languages.
+- **The tree walk now descends into the receiver of a chain.** Previously only the arguments of a call node were walked, so a nested call inside a chain never reached the graph: `json.dumps(x).encode()` produced one edge instead of two. While the whole expression text sat in the name, the loss was invisible. All children of a call node are walked now, and a chain yields one edge per link.
+- **For 1C the qualifier is kept, but is no longer assembled from an expression.** The `Module.Method` gluing stays — the extension's resolver relies on it. One thing changed: only a chain of names goes into the qualifier, while an expression receiver (`F(1).Method()`, `Array[0].Method()`) yields the bare method name instead of a slice of source.
+
+### Upgrade note
+
+The stored form of the name changed, so already-built databases keep the old records: parsing skips files whose modification time has not changed. To get the fix, run a forced full parse of the folder (`index --force`) with the services stopped. Timing: 110 s for 57,072 files on the workstation, 146 s for 58,563 files on the federation node.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 813 passed, 0 failed, no compiler warnings. Four new ones cover: a chain and a qualified path in Rust, the `json.dumps(x).encode()` chain in Python, a package selector in Go, an expression receiver in 1C.
+- **The project's own repository (Rust), full parse:** edges 15,311 → 22,073 (chain links lost by the walk came back), of which those carrying expression text in the name 7,040 → **0**. "Who calls the content-compression function" used to answer zero; now three callers — exactly as many as a text search finds.
+- **A typical trade configuration (1C), full parse:** 2,039,735 edges, expression text 32,014 → **0**; glued `Module.Method` — 1,146,204, so the qualifiers are intact.
+- **Local deployment and a live check:** both services run the new build, two databases were rebuilt by it, `get_callers`/`get_callees` answers verified on both languages.
+- **Federation node:** the image was rebuilt from the local build, both containers healthy, a remote repository's database rebuilt on the node, queries through federation return the same numbers.
+
+## [0.68.0] — 2026-08-26
+
+**A full parse now runs in chunks: peak memory is set by a setting, not by the size of the folder. A load interrupted mid-way resumes where it stopped instead of starting over.**
+
+> Context. Initial indexing used to read the whole folder at once: the content of every file, its parse trees and the compressed copies all lived in memory together. On a 7 GB folder that came to over twenty gigabytes, and in a container capped at eight the process was killed at the stage "parsing N files across threads". The choice of where the database lives did not help: it decides where the database sits, not how much reading and parsing costs. Reported in issue #6.
+
+### Added
+
+- **Chunked parsing and the `chunk_budget_bytes` setting.** Files are read, parsed, compressed and written to the database in chunks of a given source weight (512 MB by default); the memory of a chunk is released before the next one starts. The setting is available both in the per-folder settings file and globally under `[indexer]` in the daemon settings. Zero turns chunking off — the whole tree is read at once, as before. Chunking applies where the whole tree goes into parsing: initial indexing, a forced full parse, and resuming an interrupted load.
+- **A marker for an unfinished load.** Before the indexes are dropped the database records that the load is unfinished, and the marker is cleared once they are rebuilt. If the process is killed mid-way, the chunks already written stay in the database and the next run reads only the missing files and builds the indexes. Previously an interruption threw all the work away: the next run started from scratch.
+- **An unfinished database no longer spends time on indexes that are about to be dropped.** When a database carrying that marker is opened, building the indexes and the full-text triggers is skipped: the next pass drops them anyway to read the remaining files, and on a non-empty database building them costs minutes.
+
+### Changed
+
+- **The memory estimate multiplier is lowered from 3.0 to 2.0.** It was tuned against the old pipeline, where reading and parsing every file counted towards usage in full. New measurements of initial indexing with the database in RAM: a site of 191,417 files (1.4 GB of sources) — 2.4 GB of memory (×1.7); a typical trade configuration (3.7 GB, 60,294 files) — 4.4 GB (×1.2); a typical accounting one (5.3 GB, 92,300 files) — 8.8 GB (×1.6). The same folders used to give ×3.2, ×1.7 and ×2.5. More folders now pass the calculation into RAM, which means they index faster.
+- **The extension raw-data collector flushes after every chunk.** It used to accumulate object references and procedure comments for the whole tree at once — gigabytes of their own on a large configuration, which chunking would not have contained. Clearing the layer is now a separate step before the first chunk, so each following chunk does not wipe the previous ones.
+- **File content is moved into parsing instead of being copied.** A clone used to stand at the entrance to parsing, so every byte read lived in memory twice.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 807 passed, 0 failed. Four new ones cover: splitting into chunks by budget (including a file heavier than the budget and a zero budget); identical results from chunked and whole parsing; resuming an interrupted load with index rebuild and marker clearing; no duplicates for a file changed between the interruption and the next run.
+- **Initial indexing from scratch, database on disk** (a 1C configuration, 57,072 files): peak 4.40 GB before the change and 1.42 GB after, core time 49.4 → 52.2 s. Chunk boundaries cost a few percent: the single-threaded database write does not overlap with parsing the next chunk.
+- **A forced full parse of the same repository, database on disk:** 4.46 GB with chunking off, 1.50 GB at a 512 MB budget, 0.67 GB at 128 MB. Usage is driven by the setting.
+- **Database in RAM, three folders of different make-up:** the site 4.45 → 2.40 GB, the trade configuration 6.17 → 4.41 GB, the accounting one 13.34 → 8.76 GB.
+- **Local deployment and a live check:** both services run the new build, the test repository database was rebuilt by it and reads normally (57,072 files, 261,548 functions, content search answers).
+- **Federation node:** the image was rebuilt from the local build, both containers are healthy, the start-up check ran across every database on the node, and queries to remote repositories answer.
+
+## [0.67.0] — 2026-08-23
+
+**A file held by another process at read time no longer stays in the index at its previous version. The event is deferred and retried on a schedule, and the names of unapplied files moved out of debug logging into the ordinary log.**
+
+> Context. A configuration export does not write its files instantly. The watcher catches the change and reaches for the file while the export still holds it open exclusively — the read fails with "file is used by another process". Such an event used to be dropped silently, leaving the file in the index at its previous version until its next edit. For the configuration composition file that means the object inventory diverges from disk indefinitely: the next edit may be weeks away. The log meanwhile said "processed INCOMPLETELY, 1 failure" without a single name — finding out which file lagged behind required reproducing the case with debug logging on.
+
+### Added
+
+- **A deferred-retry queue per watched folder.** An event that failed because the file was busy is no longer dropped but queued in that folder's worker thread: the file path, the event itself, the number of attempts made and the time of the next one. The queue lives in the thread's memory and is separate for every folder. The pauses grow: 2 → 5 → 15 → 30 → 60 seconds, six attempts counting the first — about two minutes in total, enough for an ordinary export.
+- **A due retry forms a batch on its own.** When the folder is quiet, the watch loop checks the queue and takes the files whose time has come. Without this a retry would wait for some other file in the same folder to be edited, and once the export is finished there will be no such edit.
+- **Running out of attempts is visible in the log.** A persistently unreadable file is named together with the number of attempts made and a note that the stale version in the index will be refreshed on the file's next change or on a daemon restart. The queue entry is released at that point — there are no endless retries.
+
+### Changed
+
+- **Applying an event now has three outcomes instead of two.** Previously "succeeded / failed"; a transient cause is now told apart. A parse failure, a database write failure or a delete failure is pointless to retry — the result would be the same, and such events are dropped as before. Only a failed read from disk is treated separately: what got in the way was the circumstances, not the file's content.
+- **Names of unapplied files are logged at the ordinary level, not the debug one.** Up to five names with a reason each go into the summary; if there are more, a counter of the rest is appended. The full list is still not printed: on a broken export there are thousands of them and they would drown the log.
+- **The batch summary names busy files separately.** The old wording "these files stayed in the index at their previous version" read as a loss without that qualifier, even though a retry has already been scheduled.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-features` — 812 passed, 0 failed, zero build warnings. Five new ones cover: a due retry joining a batch on its own; a file that arrived through its own event not being duplicated by a second copy from the queue; a successful attempt removing the file from the queue; attempts being bounded so the queue does not grow; busy files being named separately in the summary text.
+- **Stand on an isolated daemon (Windows), two scenarios.** The file is held exclusively the same way an export holds it. First scenario — hold and release: the busy state was recognised, the retry started on its own, the new content reached the index (verified by content hash). Second — hold longer than all the pauses: six attempts on schedule (2, 5, 15, 30, 60 s), a refusal naming the file, retries stopped, and the next edit of the same file was picked up by the ordinary path.
+- **Live check on the working daemon.** A temporary file in a watched folder of a typical trade configuration: the busy state was named in the log at the ordinary level, the retry fired, the index caught up with disk.
+- **Live check on the federation node (Linux).** Windows-style locks do not exist there, so unreadability is produced by revoking permissions — for the code this is the same "could not read" outcome. The retry was checked while the permissions were still revoked: there are no filesystem events during that time, so only the queue timer could have produced the attempt. All four checks passed.
+
+## [0.66.0] — 2026-08-23
+
+**Content search over code and text accepts a `pattern` key — a literal substring, with exactly the meaning it already has in body search. These two tools had no such key before, and a call using it wasted a turn on a hint.**
+
+> Context. Inside one tool family the same name meant different things: in body search `pattern` is a literal substring, in the file listing it is a path mask, and in code and text content search the key did not exist at all. A model that had just used a neighbouring tool carried the familiar name over, got the hint "specify regex", and asked again correctly on the next turn. Every such call burned a turn — a recurring pattern, not a one-off slip.
+
+### Added
+
+- **`grep_code` and `grep_text` accept `pattern`.** The value is treated as a literal, case-insensitive substring — the same meaning the key already has in body search. The string is escaped before searching, so parentheses, dots and asterisks inside a method name no longer break the call: the very same text passed as a regular expression is rejected by the parser on the unbalanced parenthesis. The existing keys are untouched: `regex` wins over everything, `query` remains its synonym, and an empty value counts as absent instead of masking a filled key.
+- **The hint for a call with no keys now names both options.** The previous one offered a regular expression only, although a literal substring is usually what is wanted.
+
+### Changed
+
+- **Keys are reduced to a single expression before forwarding to a remote node.** Previously the request was forwarded verbatim and the unknown key was silently dropped by the parser on the other side — the new option would have required both sides to be upgraded at once. The receiving side now gets a ready expression in a key it has always understood, and a node on the previous build answers correctly. Verified against a remote repository before the node was updated.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 798 passed, 0 failed, zero build warnings. Five new ones cover key precedence, an empty value counting as absent, escaping together with a check of the resulting expression against real text, and both parameter sets accepting the key.
+- **Live check on the federation node (Linux):** requests sent straight to the receiving side, bypassing the local serving process. A substring with an unbalanced parenthesis — three matches; the same text as an expression — "invalid regex"; the same substring in upper case — the same matches (Cyrillic, case-insensitive); text search with a substring — a match; a call with no keys — the new hint.
+
+## [0.65.0] — 2026-08-22
+
+**Eight small audit findings closed in a single release. None of them changes index content — no reindex required.**
+
+> Context. In the audit registry these were all marked "cosmetic": debt, readability, wasted work — no effect on the correctness of results. Individually none justified a release; together they form a coherent set: two cases where an empty result was indistinguishable from an error, two small recognition failures, two wasted costs in hot code, and two inconsistencies.
+
+### Fixed
+
+- **A quote character in a full-text query no longer breaks query parsing.** The query was wrapped in quotes when special characters were present, but an inner quote was not doubled as the full-text engine requires. Searching for a single quote returned the parser error "unterminated string" instead of an empty result. The inner quote is now doubled, and the quote character itself is treated as special alongside minus, plus and asterisk: the answer is an empty list with a hint.
+- **A typo in a repository's language list is no longer silent.** An unknown language name was dropped without a word in the log: files were classified as code but never parsed — no functions, no calls, with an apparently healthy index. Every unknown name now produces a warning stating the consequence.
+- **Extension directives with a space after the hash are recognized.** Blanking of removed blocks compared the start of the line against patterns without a space, while the neighbouring source normalization already handles exactly that spelling (hundreds of occurrences in real code). A block left un-blanked can cut a string literal in half, and then string masking slips: query text below starts being treated as code.
+- **Module method collection now reports whether parsing succeeded.** An empty list was indistinguishable from a module with no methods, though there are three causes of emptiness: a binary vendor module, a language failure, and the parsing deadline. A parsed flag is returned next to the list — the same one fact collection already provided.
+- **Both module parsing paths got the same preprocessing.** Declaration collection blanked extension directive blocks while method collection worked on the raw text — on an extension module where a removed block cuts a string literal, the two paths disagreed. Preprocessing is now shared; offsets do not shift because blanking preserves byte length.
+
+### Changed
+
+- **The index command accepts a path in both forms.** Its path was positional while stats, clean and query used a named `--path`; mixing them up is easy, and the error message did not hint at the right form. Both `index <path>` and `index --path <path>` now work; with neither form given it falls back to the current directory, like the neighbouring commands.
+- **Mass-mode description trimming is anchored to an explicit constant.** The description tail was cut by a substring spelled out inline: had anyone reworded the description, the schema parameter would still have been removed while the promise of batching stayed in the text, and the model would call an unavailable mode. The marker now lives in one place, and a new test keeps descriptions and marker together.
+- **Redundant string copies removed from the hot traversal loop.** Four language parsers cloned the function name at EVERY child node of its body, although the name outlives the traversal and a reference is enough — the remaining languages already pass a reference in the same spot. Behaviour is unchanged: the call graph matched for all four languages on verification.
+
+### Published contents
+
+- **The ignore-rules file and the helper scripts directory are no longer published.** Both are tied to the developer's working environment and to the layout of particular machines, and are of no use to an outside reader. Neither the code nor the tool output is affected; when cloning the repository you will need your own ignore rules — at least for the build directory.
+
+
+
+**Content search is 3–4× faster exactly where it used to be slow: when matches are few or absent. Output did not change by a single byte. Separately, substring search over procedure bodies is fixed: a Cyrillic substring in a different case is no longer lost.**
+
+> Context. Code and text search took 1.1–1.6 s on a rare pattern: the match limit was never reached, so the whole repository had to be scanned. Profiling showed the time was not spent on searching at all — it did not depend on pattern complexity (1273 / 1306 / 1271 ms for three patterns of very different cost) — but on fetching content and decompressing it on a single thread while sixteen cores sat idle. The worst case was exactly the one that returns nothing: a second spent for an empty answer.
+
+### Changed
+
+- **Content is scanned on all cores.** Files are processed in batches; the batch grows from 64 to 4096. A small first batch keeps early exit cheap for a frequent pattern, while large batches remove the idle time at the shared barrier: with a small batch every core waits for the largest file in it. Only decompression and the whole-file reject run in parallel; per-line extraction with context stays sequential and runs only for files that actually reach the answer. Result order, the match and response-size caps, the truncation flag and the unreadable-files counter are unchanged.
+- **Content is compressed with a known source size.** The previous call did not tell the encoder the source size, so the frame header carried the level's full decompression window — 2 MB. The decoder allocates a window buffer of that size per file, and across sixteen threads the working set stops fitting in the CPU cache: total CPU work inflated fifteen-fold versus single-threaded. The window now shrinks to the file size — median over text files 2048 KB → 9 KB. Storage size is unchanged.
+
+### Measurements on a copy of a typical trade configuration (57,072 files)
+
+Minimum of five runs, serve cache flushed before each.
+
+| Scenario                    | before, ms | after, ms |      |
+|-----------------------------|-----------:|----------:|------|
+| code search, no matches     |     1641.9 |     478.1 | ×3.4 |
+| code search, rare pattern   |     1558.0 |     471.9 | ×3.3 |
+| text search, no matches     |     1190.6 |     278.6 | ×4.3 |
+| text search, rare pattern   |     1151.0 |     284.4 | ×4.1 |
+| text search, frequent one   |     1142.0 |     275.5 | ×4.1 |
+
+Breakdown of the second before the fix (40,675 code files, 725 MB decompressed): decompression 866 ms, encoding validation 713 ms, line-ending normalization 90 ms, the pattern itself 38 ms.
+
+Other scenarios are at parity: frequent pattern, search with context, search over a path subset, a 200-match limit. Output is byte-identical across all twelve scenarios. Index size is unchanged: 3845.5 MB before, 3845.9 MB after.
+
+### Fixed
+
+- **Substring search over procedure bodies is no longer case-sensitive.** The whole-body reject used the database's substring comparison, which folds case for Latin letters only. A body containing `ЗначениеЗаполнено` failed the reject for the substring `значениезаполнено` and never reached the per-line pass — even though that pass folds case in full, Cyrillic included. The reject was stricter than the pass and threw away exactly what the pass would have found: the tool silently answered "0 matches" and suggested other tools. Same class as the earlier reject-versus-pass mismatches on line anchors and line endings. A substring is now checked by the same condition as a ready pattern: special characters escaped, case ignored.
+- **Percent and underscore in a substring are now ordinary characters.** The reject treated them as wildcards while the per-line pass did not, so `Значение%Заполнено` meant "anything in between" at the first stage and literal text at the second. Both stages now read a substring the same way: literally.
+
+Measured on a copy of a typical accounting configuration (88,284 files, 532,595 procedures, 552 MB of bodies), minimum of three runs:
+
+| Scenario                                  | before, ms        | after, ms      |
+|-------------------------------------------|------------------:|---------------:|
+| substring, Cyrillic in a different case   | 2285 (0 matches)  | 23 (matches)   |
+| fruitless full scan by substring          | 2285              | 3230           |
+| full scan by a ready pattern              | 2971              | 2962           |
+
+The second row is the price: folding Cyrillic case costs more than comparing Latin only. The ready-pattern path is unchanged, and output across the other eleven scenarios is byte-identical.
+
+### Getting this on an existing index
+
+The first change applies immediately after the upgrade. The second one affects newly written content, so faster text search appears after a forced rebuild: `bsl-indexer index <path> --force`. New indexes get it right away.
+
+### Tried and rejected
+
+Every item was rejected by measurement, not by opinion: link-time optimization and a single codegen unit (1188.5 → 1196.0 ms — within noise); mimalloc as the allocator (does not link with the local toolchain); cached prepared statements in the 1C extension and three leading-wildcard `LIKE` scans (they affect tools that answer in 0.5–4 ms against a 15 ms measurement floor); the rusqlite profiling hook (diagnosis did not need it); planner statistics refresh (already done); treating content as bytes (3% once behavior is preserved).
+
+## [0.63.0] — 2026-08-21
+
+**Object templates are now present in the object registry. Previously they were absent entirely: the file on disk was readable, yet a search by name answered "nothing found" — which read as an incomplete index.**
+
+> Context. A user reported that a model searched for an object's templates by name substring, found one, and doubted the index was fresh — even though the form description read fine from disk. A check on a copy of a typical trade configuration confirmed it: only COMMON templates made it into the registry (the common templates folder, 237 of them), while 1,709 templates belonging to objects made it nowhere — neither as their own row nor as a section on the owning object.
+
+### Added
+
+- **A template passport in the registry** — a row such as `Catalog.Counterparties.Template.PrintCard`: name, synonym, owning object and template kind (spreadsheet document, data composition schema, etc.). The template is now found by name substring like any other object and can be requested directly by its full name.
+- **An honest flag about the content** and a named reason when it is missing. The content file is located by fact rather than by a guessed name: a spreadsheet document and a data composition schema keep it in `Template.xml`, a text document in `Template.txt`, binary data and add-ins in their own formats. The passport carries `content_indexed`, the size and the reason: no file in the dump, binary content, or the file exceeds the text file size limit (the `max_file_size` setting, 1 MB by default). Previously "no content" and "no object" looked identical — an empty answer.
+- **Point updates in the watcher.** Editing a template description refreshes its passport, deleting the file removes the row, and deleting the owning object takes its templates with it — no full reindex required.
+
+### Measurements on a copy of a typical trade configuration (57,072 files)
+
+| Metric | Value |
+|---|---:|
+| Object templates registered | 1,709 |
+| Of those, with indexed content | 1,528 |
+| Without content: binary | 110 |
+| Without content: over the size limit | 67 |
+| Without content: no file in the dump | 4 |
+| Phase duration | 2.8 s |
+| Full forced reindex, end to end | 120 s |
+
+Limit boundary measured: the largest template with indexed content is 992,946 bytes, the smallest without content is 1,149,823 bytes, and the largest template in the configuration is 8.9 MB.
+
+### How to get this on an already built database
+
+The extension layer is not rebuilt when the data has not changed, so on an existing database templates appear only after a one-off forced rebuild: `bsl-indexer index <path> --force`. Fresh databases get them right away.
+
+## [0.62.0] — 2026-08-21
+
+**A form event handler no longer looks uncalled. "Who calls this" used to answer "0 edges" for such a procedure — now the binding itself comes back: the form, the event, the form element and the description file.**
+
+> Context. A handler procedure is declared in the form module, but the platform runs it per an entry in the form description (`<Event name="BeforeWriteAtServer">BeforeWriteAtServer1</Event>`). It has no call in the code and cannot have one, so the call graph answered an honest zero — which read as "this procedure is used nowhere". A user reported that on such an answer a model doubted the index was fresh, went off to parse the form description with a separate tool and found the bindings by hand. The index was complete all along: the data lives in a different table, and the wrong tool had been asked.
+
+### Added
+
+- **Form handler bindings in the "who calls" answer** (`kind: form_binding`). A record carries the owning form, the event, the form element (when the handler belongs to an element rather than the form itself) and the path to the description file. That path goes into the dependent files list, so editing the description invalidates the cached answer precisely.
+- **An extension point on the language processor** — "callers that are absent from the code call graph". The core still knows nothing about 1C forms: the declarative branch lives entirely in the 1C extension and is empty for every other language.
+- **A hint in the search tools** (symbol search, code search, procedure body search, function search). One or two matches for a name is the typical picture for a handler: only the declaration was found. In that case the answer says the name has a binding outside the code and names the next step. The check runs only on a bare identifier with no regex metacharacters and only on a small result set — a mass search does no extra work.
+
+### Two branches, because a procedure is addressed by name
+
+The question is asked by procedure name, not by its file. Handler names usually match the event name, so a single name covers many distinct procedures: in a typical trade configuration `OnOpen` is declared 2,246 times, with 2,132 forms carrying such a binding.
+
+- **The name belongs to one procedure** — the binding is returned in full. This is the case the whole change was made for: it is never truncated.
+- **The name belongs to several procedures** — instead of a list of thousands of forms, a single record arrives: the name is ambiguous, plus a ready sample call for the handlers of a specific form.
+
+### What will not show up in the answer
+
+The link is resolved through the form module file, not through the handler name: names like `OnOpen` occur in hundreds of forms, and matching by name would pull in bindings of unrelated forms. Every candidate is additionally verified against the description of ITS OWN form — a same-named procedure inside a form module is not yet a binding. Verified on a live database: the common module function `ObjectAttributeValue` had four same-named procedures in form modules, none of them assigned as a handler — and the answer says nothing about bindings.
+
+## [0.61.0] — 2026-08-21
+
+**Indexing with the database on disk writes noticeably less and finishes faster. The multiplier that estimates memory usage moved into the folder settings — on a weak machine you can now raise it to make sure the work goes to disk.**
+
+> Context. Release 0.60.0 taught the program to choose between RAM and disk by calculation. It turned out the disk path itself had never been optimised: it was treated as the fallback. Yet on a machine with modest memory it is the main one — the calculation almost always picks disk. A measurement on a copy of a typical trade configuration (60,294 files, 3.66 GB of sources) showed 26 GB written to the drive in a single pass.
+
+### Fixed
+
+- **The one-shot index command no longer flushes a database that already lives on disk.** The flush is meant for a database built in RAM; for a disk-backed one it turned into copying that file onto itself — 21.8 s and 8 GB of writes wasted on every run. The daemon already made this distinction, so the change brings the one-shot command in line with it: **daemon users are unaffected by this item**.
+
+### Changed
+
+- **Secondary indexes of the call graph are dropped before the load and rebuilt after.** Previously every insert updated indexes that were rebuilt anyway.
+- **Resolution and filtering of edges now happen in a temporary table, and only the surviving set reaches the database.** Previously every discovered edge was written and half were deleted afterwards: 1.17 M rows written against 550 K kept — 51 % of the writes thrown away.
+- **Inserts follow the order of the uniqueness keys** — database pages are touched sequentially instead of at random.
+- **The one-shot index command prints a per-stage breakdown**, the way the daemon does.
+
+### Added
+
+- **The `memory_estimate_factor` setting** — the multiplier that turns source weight into expected memory usage. The value 3 used to be hard-coded. The full calculation:
+
+  ```text
+  expected usage = source weight × memory_estimate_factor
+  allowed usage  = free memory × memory_max_percent / 100
+
+  expected usage ≤ allowed usage → the database is built in RAM
+  otherwise                      → the database goes straight to disk
+  ```
+
+  The default 3.0 is **the middle of the observed spread, not headroom on top of it**. Measured actual usage across folders: 3.8 GB of sources — 8.6 GB of memory (×2.3), 6.7 GB — 19.0 GB (×2.8), 5.3 GB — 18.6 GB (×3.5), 1.8 GB — 8.0 GB (×4.4). The spread depends on the language, code density and folder contents, and cannot be predicted up front.
+
+  Short on memory — set 4 or above: disk more often, slower, but with no risk of running out. Plenty of memory and willing to check the log — 2.0–2.5: more folders go to RAM and indexing is faster. Zero, negative and non-numeric values are treated as a typo: the default is used, and the applied multiplier appears in the log next to the estimate.
+
+### Measurements
+
+Copy of a typical trade configuration, 60,294 files, database **on disk**, measured with the **one-shot index command**:
+
+| | before | after |
+|---|---:|---:|
+| total time | 199–215 s | 138 s |
+| extension layer | 102–108 s | 68 s |
+| call graph | 69 s | 32 s |
+| flush to disk | 19–22 s | 0 |
+| written to the drive | 25.5–26.2 GB | 13.2 GB |
+| peak write-ahead log size | 4.36 GB | 1.07 GB |
+
+**What a daemon user should expect from this table.** The "flush to disk" row never applied to them — roughly 20 s and about 8 GB of the difference shown belong to the one-shot command alone. Their gain comes from the call graph and the secondary indexes: measured across six configurations on a network node (374,525 files, databases in RAM), the extension layer is 3–12 % faster, the core and the flush unchanged. Writes are cheap in RAM, so the gain there is smaller — all of it lands exactly where the change is.
+
+### Correctness check
+
+The new database was compared against a reference built by the previous release across every table — row counts and a checksum of the contents. 34 tables out of 38 matched exactly, including the call graph (595,516 rows), file links, calls and functions. The four differences — timestamps and the block order of the full-text index — reproduce between two runs of the very same previous build, so they are not a property of this change.
+
+## [0.60.0] — 2026-08-20
+
+**Indexing now decides for itself whether to build the database in RAM or on disk — from the folder's weight and the machine's free memory, not from an accidental signal. After working in RAM, the memory is returned to the system. The bulk-processing threshold moved into the daemon settings. The log no longer passes off a first-time index as a change check.**
+
+> Context. The storage mode was chosen by comparing the database FILE SIZE against a share of free memory. For a new database that size is zero, and zero is below any threshold — so for an empty folder the decision was predetermined and checked nothing. Chance then took over: at startup the serving process creates empty database files for every local folder, and if it got there before the daemon, the folder counted as "already existing" and went to disk. Whether it got there first depended on service startup order: on a workstation the server starts earlier, on a network node later. The same folder behaved differently on two machines, and the log said nothing about it.
+
+### Added
+
+- **Folder weighing before the mode is chosen.** Before opening the database the daemon walks the folder and sums the weight of the files that will be indexed, using the same directory exclusions as indexing itself. Only file metadata is read, contents are not opened: 1–3 seconds for 60,000 files against an index run of several minutes.
+- **Memory returned to the system after working in RAM.** Having closed the in-memory database and reopened it on disk, the daemon asks the allocator to hand the freed memory back, and logs "before / after". Measured on a network node, six folders in a row: 21.4 GB → 491 MB, 10.1 GB → 932 MB, 8.7 GB → 1.1 GB, 22.5 GB → 1.5 GB. Without this the freed memory stayed in the process heap, the next folder saw it as occupied and went to disk although the machine could have handled it. On systems without such a facility (Windows, macOS) the log says so explicitly instead of silently doing nothing.
+- **Bulk-processing threshold in the daemon settings.** `bulk_batch_threshold` globally under `[indexer]` and per folder — with the same priority order as the file size limit: per-folder → global → default 8000. Previously the threshold could only be set in the project settings file inside the indexed folder, which in practice exists nowhere.
+
+### Fixed
+
+- **A first-time index was presented as a change check.** The "database already exists" signal was taken from the presence of a file, and an empty file is created in advance by the serving process. The log read: "database already exists", "startup change check begun: comparing file times and sizes against the database" — followed immediately by "database is empty, so every file will be processed", "57072 changed out of 57072". Now there is a single signal — whether the database holds any records — and the storage mode follows the same one. The same folder behaves identically regardless of which service started first.
+- **Mode choice no longer depends on service startup order.** Previously a new folder almost always went to disk on a workstation (the serving process managed to create the placeholder) and to RAM on a network node (it did not). That divergence is gone.
+
+### Changed
+
+- **Share of free memory allowed for the database raised from 25% to 50%.** At the old quarter, a folder of 4 GB of sources went to RAM only with at least 48 GB free — that is, practically never. This is a share of FREE memory at the moment the folder starts, not of the machine's total.
+
+### How the mode is chosen — the full calculation
+
+1. Sum the weight of the folder's files that will be indexed.
+2. Expected memory usage = **weight × 3**. The multiplier comes from measurement: a folder of 3.98 GB produced 9.8 GB of occupied memory (2.5); three leaves headroom.
+3. Read the machine's FREE memory **at that moment**; `memory_max_percent` of it may be used (50% by default).
+4. If it fits, the database is built in RAM and then flushed to disk. If not, straight to disk.
+
+Free memory is re-read for every folder, which makes the rule guard itself: if the previous folder did not return its memory, the next one sees less free and goes to disk. Folders are indexed one at a time, so the calculation only considers the current one.
+
+The decision is logged with the numbers:
+
+```
+new database — storage mode: in RAM (setting "auto"; sources 6.7 GB, working in RAM would
+cost about 20.1 GB, 54.8 GB free, allowed to use 50% — weighing took 1531 ms)
+```
+
+Manual control remains: `storage_mode` in the settings file inside the folder — `"memory"` (always RAM, no calculation), `"disk"` (always disk), `"auto"` (the calculation above, the default). `memory_max_percent` lives there too, if half of free memory is not the right share.
+
+### The daemon log — what to enable before sending it in
+
+Both long-running processes keep a log; the files live in the state directory (`CODE_INDEX_HOME`), not next to the executable:
+
+| File | Written by |
+|------|------------|
+| `daemon.log` | the indexing daemon |
+| `serve.log` | the serving process |
+
+Rotation by size: 10 MB per file, three previous copies kept alongside.
+
+Verbosity — `[daemon] log_level` in `daemon.toml`; the `RUST_LOG` environment variable overrides it, raising verbosity for one run without editing settings.
+
+| Level | What it gives |
+|-------|---------------|
+| `warn` | warnings and errors only |
+| `info` (default) | machine and folder profile, start and end of every stage with counts, per-stage breakdown, storage mode decision, memory return, daemon state once a minute |
+| `debug` | additionally: module name on each line, call-graph resolution step by step, unresolved references in subsystem contents, per-file details |
+| `trace` | all of the above plus third-party library internals |
+
+For diagnosing a stalled or slow index, `info` is enough: it shows both where it stopped and how long there has been no movement. `debug` is for when `info` does not reveal the cause — for example, why an expected edge is missing from the call graph.
+
+### Compatibility
+
+- The database schema did not change. However, **a from-scratch reindex is recommended**: remove the `.code-index` directory in the folder and restart the daemon. Reason — databases built by earlier releases may have gone through the path with a wrongly chosen storage mode and an incomplete flush to disk; a full rebuild guarantees a consistent state and also produces a fresh log with numbers for every folder. Measured on a network node: six folders, 374,000 files — 20 minutes.
+- The new `[indexer] bulk_batch_threshold` setting is optional; without it the previous default of 8000 applies.
+- The default for `memory_max_percent` changed: 25% → 50%. Anyone who set it explicitly in the project settings file is unaffected.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace` — 770 passed, 0 failed. New ones cover: an empty database file from the serving process does not count as an indexed folder; the mode follows the estimate rather than the file size; an explicit memory setting overrides the calculation; the bulk threshold is read from daemon settings with the correct priority.
+- **Workstation, a typical trade configuration (57,072 files):** folder weight 3.7 GB, expected 11.0 GB, 38.7 GB free → RAM; 2 min 41 s against 3 min 20–46 s on disk. Memory return: "the system cannot do this" (Windows), exactly as stated.
+- **Network node, six folders (374,000 files), 62 GB of RAM:** all six decisions made by calculation, all six databases built in RAM, memory returned after each (2.0 GB left over across all six). Free memory held at 53–55 GB throughout, no restarts, the process was not killed for memory. The same trade folder: 2 min 38 s in RAM against 3 min 28 s on disk.
+
+## [0.59.0] — 2026-08-20
+
+**Stalled indexing now leaves a trace you can send in. The daemon and the serving process keep a rotating log file; every heavy stage announces its start rather than only its result; once a minute a heartbeat records time without movement, memory usage and storage mode.**
+
+> Context. There was nothing to say about a stalled index: all output went to the error stream, and on Windows the daemon detaches from the console — so the output vanished entirely. The log file path existed in the code but nobody opened it; the verbosity setting was parsed from the configuration file and applied nowhere. Live diagnostics did exist (folder status, progress, error), but they answer "what now", not "what happened five minutes ago", and cannot be sent as a single file.
+
+### Added
+
+- **A log file for both long-running processes.** The daemon writes `daemon.log`, the serving process writes `serve.log` in the state directory; output also goes to the error stream (collected by the container engine in a container). Rotation by size: 10 MB per file, three previous ones kept. The file is opened by the already-detached process — otherwise the writes belonged to the parent, which exits immediately. If the directory is read-only (that is how the serving process is mounted on the node), a warning is emitted and work continues through the error stream; startup is not aborted.
+- **A start marker for every heavy stage.** Tree scan, parsing, database write, index creation, removal of vanished files, content backfill, full extras rebuild — previously each reported only on completion. If a stage stalled, the log fell silent after the previous stage's report; now the name of the stage you stalled on stays in the file.
+- **A heartbeat once a minute.** A summary line (uptime, process memory, folder counts by state) plus one line per unready folder: state, progress, seconds without movement. A growing "unchanged for" next to an unchanging stage is the signature of a hang. Ready folders are not listed by name; at most ten unready ones plus a count of the rest — on fifty repositories anything else was a wall of text every minute.
+- **Process memory and storage mode in the log.** In the initial indexing summary, in every change-batch summary and in every heartbeat. The mode is named plainly: "in memory", "on disk" or "in memory with flush to disk" — both memory usage and crash behaviour follow from it.
+
+### Fixed
+
+- **The verbosity setting did nothing.** `[daemon] log_level` was parsed from the configuration file, documented in its comments — and applied nowhere. It now applies; `RUST_LOG` still overrides it, which keeps one-off deep dives easy. Third-party libraries are held at warning level: otherwise `debug` drowns in their own stream of messages.
+- **The one-off index command did not truncate the WAL.** The daemon does this after every initial pass; the command did not — a multi-gigabyte journal could be left next to a database that looked nearly empty. Reported from an external stand: a 168 KB database with a 2.9 GB journal, indistinguishable from a failed run even though the data was intact, and every subsequent reader pays for replaying the journal. Truncation now runs over a separate connection to the file (the working database may live in memory, and its journal has nothing to do with the file), and the outcome is logged.
+- **Language tools were missing when the language was not set explicitly.** The `language` field of a path entry is filled in by the daemon at startup; anyone running only the serving process never got it — and the eleven 1C tools were silently absent from the list whatever the configuration said. The language is now detected the same way the daemon does it, by markers in the repository root.
+- **A race while collecting active languages.** The initial collection ran as a background task alongside client service: a client that asked for the tool list in its very first request got the list without the language tools. Measured on the stand: 20 tools with no pause, 31 with a three-second pause. The collection moved to a synchronous step before the transport starts; the configuration watcher remains for later edits.
+- **Working files of neighbouring processes woke the daemon for nothing.** The file watcher filtered events only by excluded directories and name patterns; it never looked at the file category. An application log, a queue database and its journal in a neighbouring directory change every couple of seconds — and on every such event the daemon opened a transaction, updated extras, truncated the WAL and wrote three lines. Zero work done: such files never enter the index. Measured on the working installation: **3,051 batches out of 3,093 were empty and 77% of the log lines were their trace**, pushing everything useful out through rotation. An event is now dropped when the file demonstrably is not indexed. Directories and extensionless paths pass as before: a directory event expands its contents, and a deleted directory can no longer be told from a file.
+- **The extra text extensions setting was never read.** `extra_text_extensions` is declared in project settings and offered by the `init` hint — people set it and believed they had widened the index, while no indexing stage looked at it. An extension from the setting now makes a file textual when it would otherwise be skipped as binary. It cannot override a language: a mistakenly listed `py` must not drop code parsing from the index.
+
+### Changed
+
+- All output from the daemon, per-folder workers and the indexer moved from direct printing to the error stream onto log levels — every line now carries a timestamp and a level. Per-file failures (unreadable, unparsable, not written) moved to `debug`: a broken export produces thousands of them, and at the normal level they drowned everything else. The per-batch summary line covers them collectively.
+
+### Compatibility
+
+- No schema change, no reindex needed.
+- No new settings. New files appear in the state directory: `daemon.log`, `serve.log` and their rotated copies, 10 MB each at most.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace` — 758 passed, 0 failed. New ones cover rotation (file shifting, removal of extra files, continued writing, appending to an existing file), filter directive assembly, process memory measurement, heartbeat formatting (summary, ten-folder cap, human-readable durations), extra text extensions (case, leading dot, inability to override a language) and language detection without an explicit setting.
+- **Full indexing on a separate stand** (copy of a small configuration, 543 files, empty database): the log shows "in memory" mode, all six stages with timings, a full extras rebuild in 359 ms, and a summary with 22 MB of memory.
+- **Partial reindex on the same stand:** editing three files — a three-event batch, incremental extras update in 26 ms, batch summary in 44 ms, "on disk" mode, 23 MB.
+- **Verbosity:** with `log_level = "error"` the log is empty; with `RUST_LOG=info` over the same configuration file, 23 lines. The setting genuinely applies and the environment variable overrides it.
+- **Working installation:** both logs are written, 429 KB from the daemon in a minute; across fifty folders the storage mode and the growth of process memory during the pass are visible.
+- **Federation node:** the daemon writes its log; the serving process has the directory mounted read-only — the fallback path worked (warning plus error-stream output), container healthy. Remote repositories answer through federation as before.
+- **The three reported fixes, verified live:** the one-off index command logs "WAL truncated in 11 ms" and leaves only the database file behind; a stdio client gets 31 of 31 tools with no pause and no explicit language (previously 20); files with extensions from `extra_text_extensions` land in the text index together with their content.
+
+## [0.58.0] — 2026-08-20
+
+**Settings that did not apply no longer look applied. A corrupted configuration file now stops startup instead of silently falling back to defaults; index cleanup no longer treats an unreachable file as deleted; the enrichment model signature is written only when it truly describes the whole database.**
+
+> Context. The two remaining unreviewed areas — the command line with the enrichment layer, and grammar parsing. Findings of the same class as the day before: a result that looks complete without being one. Here the silence is worse than usual — it concerns the state of the system itself, not the responses.
+
+### Fixed
+
+- **A corrupted configuration file silently fell back to defaults when a path was given explicitly.** Eight settings — the allowed-tool list, mass mode, repeat-output suppression and four response-size guard parameters — were pulled by eight separate functions, each re-reading the file and each swallowing the read error. The error surfaced only through repo-list assembly, which reads the configuration solely when no path is passed on the command line. Verified live: with a path on the command line the server came up with the full tool set instead of the single configured one, and said nothing about it. The configuration is now read once, and a parse error stops startup — same as in the no-path branch.
+- **Index cleanup treated an unreachable file as deleted.** A plain «does the path exist» check answers «no» to any error — including «access denied», «file in use», «volume gone» — and records of live files were dropped in bulk. The file watcher already guards against this with a dedicated helper; the same error classification now applies here, and unchecked files are reported explicitly, with cause and count.
+- **The enrichment model signature was written after any run.** The signature means «the whole database is enriched by this model», yet it was stamped even after a trial run over a hundred procedures and after a run where nearly every request failed. One such run was enough to erase the mismatch marker, so the next check reported «matches» over a mix of two models. The signature is now written only when the run is not capped by procedure count, had no failures, and — on a mismatch with the stored one — only with a full re-enrichment. Otherwise the log states why it was not updated.
+
+### Changed
+
+- The eight near-identical setting extractors are gone: the configuration is read once and passed on parsed. This also removes the chance of taking some settings from one version of the file and some from another (the daemon writes the detected repository language back into the same file).
+
+### Compatibility
+
+- Starting with `--path` and a knowingly invalid configuration file now fails with an error instead of continuing on defaults. This is the only externally visible change: the previous behaviour masked an operator mistake.
+- The database schema is unchanged; no reindex required.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace --features enrichment` — 752 passed, 0 failed. Three new ones cover the signature-writing conditions: a capped run, a run with failures, and a mismatch without full re-enrichment (plus the update when it is used).
+- **Live check on a separate instance:** with a corrupted configuration file startup stops with a clear message; cleanup over an access-denied directory reports «0 records removed» and «1 file could not be checked», the record stays, the file on disk is intact.
+- **Serving smoke** on a typical trade configuration and **federated smoke** on three remote node databases — unchanged after the fix (same numbers: 1,174, 1,577 and 1,607 incoming links).
+
+## [0.57.0] — 2026-08-19
+
+**An empty answer no longer passes for a substantive conclusion. A wrong-case Cyrillic name no longer yields a silent zero: the object name is resolved to the spelling stored in the configuration at the entry of every object-keyed tool. A walk that stopped at its limit now says «I did not finish» instead of «there is no link».**
+
+> Context. Review findings of one class: incompleteness that looks like absence. 1C object names are Cyrillic, their case is easy to get wrong, and SQLite does not fold Cyrillic — exact comparison missed silently. One and the same mistyped name on one database returned: impact map — everything (561 structural references, 2,443 code usages); data links — «nothing references this object»; register recorders — «this register has no recorders at all». Worse than a plain error: the answer reads as a conclusion about the object, and the model reasons on top of it.
+
+### Fixed
+
+- **Cyrillic case in object names.** The mechanism already existed in the project — a lowercase key column the impact map searches by. Now the object catalogue has such a key too, and the name is resolved once at the entry: from there the walk proceeds over canonical values taken from the database itself. Fixed for data links (both directions), register recorders, object structure and object profile. The «what does it reference» direction became case-insensitive as well — entry-level resolution needs no key column on the edge source.
+- **The did-you-mean list was empty exactly where it was needed.** Candidates were matched by pattern, also case-sensitive: a name differing ONLY in case produced zero suggestions, even though the object differs by one letter. Matching now goes through the key.
+- **The omitted-sections hint steered away from a shipped capability.** Its text claimed the full set of enum values is «not available as a dump» and sent the reader to search the code — untrue once per-section paging shipped. The hint now names the omitted sections and carries a ready-to-copy call for the first of them; a set of 816 values is fetched in two turns.
+- **Call-graph path search silently answered «no path» when the walk was cut short.** The breadth-first walk stops at a unique-node cap, and from outside that looked like absence of a path. The neighbouring call-tree tool solved the same problem correctly — an asymmetry inside one file.
+- **Data-links path search did not distinguish «no path» from «not enough hops».**
+- **Compressed-content search silently dropped unreadable files.** A corrupted or non-UTF-8 file was skipped with no counter, making a partial result indistinguishable from an honest «nothing found».
+- **Term search silently dropped unreadable result rows.**
+
+### Added
+
+- **Walk cut-off flags.** Call-graph path: `walk_depth_exhausted` and `walk_nodes_capped`, and the empty-result hint now differs by cause — node cap, depth limit, or an honestly exhausted reachable subgraph. Data-links path: `depth_exhausted`, `visited_nodes` and a ready call with a larger depth.
+- **Counters for what was lost.** `files_unreadable` in code and text search, `rows_unreadable` in term search — each stating outright that the result is partial. With zero skips the fields do not appear.
+- **Canonical object name in responses.** Impact map, data links and object profile return the name as stored in the configuration: the model copies it into the next call, where case does matter.
+
+### Compatibility
+
+- The extension schema gained an object-name key column and an index on it. **No reindex required:** the migration adds the column and fills the keys on the first daemon start over an existing database (verified on databases from 187 to 17,263 objects).
+- The serving layer opens databases read-only: until the daemon passes, resolution simply does not kick in and answers stay as before — nothing fails.
+- Response changes are additive; existing fields and their meaning are unchanged.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace` — 743 passed, 0 failed (was 730). Thirteen new ones cover: migration with key backfill and its idempotency, name resolution (exact match, different case, missing object, nodes outside the catalogue), data links and register recorders under a different case, object structure and its suggestions, the depth-exhausted flag in both graphs, the unreadable-file counter, the ordering of omitted sections and the hint wording.
+- **Live smoke** on a typical trade configuration: 561 incoming links and 105 recorders are found with a fully lowercase name; the suggestion list offers the right object for a typo; a set of 816 enum values is fetched in two turns using calls copied from the hint verbatim.
+- **Federated smoke** on three remote databases of the node (trade, accounting, payroll): matching numbers across spellings — 1,174, 1,577 and 1,607 incoming links respectively.
+
+## [0.56.0] — 2026-08-19
+
+**The data-links walk no longer depends on the number of paths: «what references this object» at depth 4 now answers in a fraction of a second instead of 42.9 s. A time cut-off appeared — there was none at all before, and a pooled connection stayed busy for all those seconds. Edges now arrive as a page, with per-kind link counts alongside.**
+
+> Context. The second half of the same review finding. The right kind of walk was sitting in the neighbouring file: path search over the same graph has long used breadth-first search with a visited set, and its comment says exactly why — on the cyclic 1C link graph there are millions of paths. Two adjacent tools walked the same data in fundamentally different ways.
+
+### Fixed
+
+- **The walk enumerated paths, not nodes.** The recursive query expanded every reachable path in full: on a central catalog the «what references it» direction took 0.0 s at depth 1, 2.6 s at depth 3 and 42.9 s at depth 4 — and the total-edge count ran the very same walk a second time. The walk was rewritten as breadth-first search with a visited set: every object is expanded exactly once, so the cost is set by the size of the reachable subgraph rather than by the number of paths through it. Measured afterwards: fractions of a second at every depth, the fourth included.
+- **There was no time cut-off.** Arbitrary SQL and the object passport have had one for a long time; data links did not, and a pooled connection was held for the entire walk. Now the walk checks the clock between steps (8 seconds) and an interrupt covers a single slow query inside a step; whatever was collected is returned with a `walk_stopped_by_time` flag instead of being lost.
+- **Terminal-node pruning was asymmetric.** Generalized references (`*CatalogRef`, `*AnyRef`, `*DefinedType.X`) were left unexpanded only in the outbound direction. In the new scheme terminal nodes are not expanded by the very structure of the walk, identically both ways.
+
+### Added
+
+- **Edge pages sized by the response budget** (`offset`): an edge-count cap alone never prevented overflow — a thousand edges is around 540 KB. Companion fields `<dir>_shown` / `_total` / `_offset` / `_has_more` and a ready-to-copy next call come along.
+- **Per-kind link counts** (`<dir>_by_kind`) in every response. The hint offers not only the next page but the cheaper route — narrow the query by link kind: attributes, register dimensions, postings, ownership.
+- **An honest partial-count flag.** At depth 1 the total edge count comes from an exact indexed count. Deeper, if the walk hit the cap or the deadline, the number is marked `<dir>_total_partial` — passing off what was collected as the whole would make the reader believe they see the entire graph.
+- **An edge cap on the walk itself** and **budget splitting** between directions for `direction=both`: otherwise the first direction consumed the whole budget and the second came back empty.
+- **A per-call response budget** (`max_response_bytes`).
+
+### Compatibility
+
+- The former `<dir>_truncated` flag is kept and means the same thing.
+- `<dir>_total` may be partial beyond depth 1 — an explicit flag sits next to it. At depth 1 the number is exact, as before.
+- The database schema is unchanged and no reindex is needed.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 730 passed, 0 failed (was 723). New ones cover: a closed cycle in the graph (the walk does not loop), a terminal generalized reference, the depth limit, the reverse direction, an expired deadline, the edge cap, the exact count at depth 1 and the partial-count marking deeper.
+- **Live smoke** on a typical trade configuration: the «what references it» direction — 0.0–0.1 s at depths 1–4 versus the former 42.9 s at depth 4; 561 edges collected over 4 pages; counts across eight link kinds; both directions at once with the budget split.
+- **Federated smoke** on a remote base of the node: the most connected catalog at depth 2 — 0.0 s.
+
+## [0.55.0] — 2026-08-19
+
+**A heavy response no longer breaks off silently: instead of a dropped section you get a listing with names and counts, and a ready-to-copy next call leads to the content. Large sections are now fetched page by page — enumeration values running into hundreds became reachable for the first time.**
+
+> Context. A finding from the full review: the response-size guard applied to only four tools out of eleven. An object passport for a document with 82 forms weighed 221 KB, and the client saves any response above ~25K tokens to a file, handing the model just a path and a short preview. Such a response is not «expensive» — it is silently incomplete, and the model answers from the fragment. In a multi-turn session the unit of cost is a turn, not bytes, so splitting is not free either: folding kicks in only where the full response genuinely does not fit.
+
+### Added
+
+- **Folding a section instead of dropping it.** The per-section guard used to discard a heavy section wholesale, leaving a marker and an element count: honest numbers, but you can neither answer from them nor build the next call — «82 forms» and not a single name. Now the section folds into a listing: names plus counts. A shared core helper picks the full variant while it fits the budget and the folded one when it does not.
+- **Pages measured in response bytes.** A page is filled by size, not by a fixed row count: a fixed count overflows on heavy elements and breeds extra turns on light ones. Companion fields `<key>_shown` / `_total` / `_offset` / `_has_more` come alongside. The first element is always returned even if it alone exceeds the budget — otherwise the offset would never advance and the client would loop on one call.
+- **Hints carrying a ready-to-copy call.** Instead of a template with angle brackets — a call assembled by the server with the names filled in, the number of turns stated, and not one sentence about causes: a weaker model needs the next action, not an explanation. When the full variant does not fit even the server ceiling, the hint honestly routes piece by piece.
+- **All handlers of an object's forms in one call** — the form name became optional. Previously the «fetch them per form» hint ran into an impossibility: 255 calls for an object with 255 forms.
+- **Enumeration values and other large structure sections — paged** (`offset` when a single section is requested). Before that a section of hundreds of values was dropped by the guard entirely and could not be retrieved by any means.
+- **One impact-map section in full, paged** (`section` + `offset`): structural references, code usages or role rights. The former three-section response with samples is unchanged.
+- **Per-call response budget** (`max_response_bytes`) on the object passport, form handlers and the impact map — where there was none at all.
+
+### Changed
+
+- **The object passport returns an overview, not a dump.** Forms — a listing with handler counts, modules — counts by type, data links — counts by kind without edges. Content is expanded via `expand` (`forms.handlers`, `modules.list`) or arrives on its own when the whole response fits the budget; the flags are `forms_handlers_included` and `modules_listed`. The tool description was rewritten: the promise «replaces a series of calls» made the passport the first call and justified dumping everything.
+- **`expand` raises the budget to the server ceiling** and folds first whatever was not asked for: otherwise a request for handlers also unfolded the neighbouring module list of 94 KB.
+
+### Compatibility
+
+- The passport's data-links section no longer carries an array of edges — a total and a per-kind breakdown instead. Edges come from the data-links tool, which has direction, depth and a cap for that.
+- Form handlers and the module list in the passport arrive as listings when the full response does not fit. The response itself states whether content is included, and the hint leads to it.
+- The database schema is unchanged and no reindex is needed: all edits are in the serving layer.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 723 passed, 0 failed (was 708). New ones cover: folding in three modes, pages (filling by budget, continuing from an offset, an offset past the end, an element larger than the budget, the guard disabled, companion fields), hint formatting, folding of passport forms and modules together with the next-call address, per-item handler counts, and a page-by-page walk of an impact-map section to the end of the set.
+- **Live smoke** on three local bases: a data processor with 255 forms — 242 KB of forms and 94 KB of modules → 19.1 KB; an ordinary document — 27.1 KB; all forms of an object in one call — 17.3 KB; 816 enumeration values collected in 2 turns; a full walk of 2,443 code usages — 10 turns, 0.2 s. The calls suggested by the hints worked verbatim.
+- **Federated smoke** on three remote bases of the node: the boundary object's passport 19.3 KB, all its forms 17.5 KB, the 816-value enumeration in 2 turns, an impact-map page of 269 rows out of 1,607.
+
+## [0.54.0] — 2026-08-19
+
+**A form event handler now knows which item it belongs to, and event names became identical across both dump formats. Previously a large form returned a flat list of hundreds of «event — procedure» pairs where an input field's handler was indistinguishable from a form-level one, and the same event was named differently in the two dumps.**
+
+> Context. Another finding from the same full review: for a single form the tool returned 356 records, 259 of them the same event on different fields, with no way to tell them apart. The event-name mismatch between formats surfaced alongside, while comparing two dumps of one configuration.
+
+### Fixed
+
+- **Form-item handlers were mixed with form-level ones.** Form collection picked up every event tag in the file without tracking which item contained it: the record held only the «event — procedure» pair. Whose handler it was could be guessed only from the procedure-naming convention, which is not always followed. Both parsers (Designer format and 1C:EDT) now keep an owner stack and write a third field: the item name for an item's handler, nothing for a form-level one. The nesting path is deliberately not stored — item names are unique within a form. On a typical trade configuration the owner is filled in for 51,299 records out of 76,758; form-level handlers have it empty, as they should.
+- **A form event's name depended on the dump format.** The 1C:EDT parser ran the event through a dictionary built for object event subscriptions, which overlaps with form events in only a handful of names — so a translated name stood next to an untranslated one, while the Designer format translated nothing. The same form yielded different names in the two dumps. A separate form-event dictionary, shared by both formats, now covers 91 names; unknown ones pass through unchanged, including add-in event identifiers that have no Russian name at all. The dictionary was verified against the configurations themselves: handlers are named «item name + event name», so the Russian name can be read from the tail of the procedure name; a check across four typical configurations corrected two translations and confirmed the rest. After the rebuild the set of named events matched across both formats exactly — 79 and 79.
+
+### Added
+
+- **An item filter for the form-handlers tool.** Optional `element` parameter: an item name returns only its handlers, an empty string only form-level ones. The response gains `handlers_shown` and `handlers_total`. On a large form of a typical accounting configuration — 8 records instead of 308.
+
+### Compatibility
+
+- The database schema did not change: handlers are stored as text in a single column and every reader parses it untyped, so bases can be rebuilt one by one and a mixed state is safe. The owner field and Russian event names, however, appear only after a forced reindex: the change affects parsing, and the fast modification-time path does not pick it up.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 708 passed, 0 failed (was 704). New ones cover: handler ownership in both formats (an item nested in decoration groups; a nested tooltip must not hijack ownership), the absence of the field for form-level handlers, translation of known names and pass-through of unknown ones, and three names recovered by data comparison.
+- **Live smoke** on four configurations, all force-reindexed: only add-in event identifiers remain in Latin (2 out of 47,750 records on the trade configuration), one form's output matched letter for letter across the two formats, and the item filter cuts a large form's response from 356 records to one.
+- **Federated smoke** on three node bases: ownership is filled in, events are Russian, the filter works.
+
+## [0.53.0] — 2026-08-19
+
+**Exports from 1C:EDT are finally collected in full and updated on the fly: role rights, configuration-level links and the module registry were never built for that format, every nested subsystem was lost, and no configuration edit reached the index until a full reindex. Plus two Designer-format defects visible only when the two formats are compared: common forms reached the index in neither of them, and a command module named after its own object lost its owner.**
+
+> Context. A continuation of the full review of the data-collection layer. Same method: one configuration exported two ways, with per-table number comparison. That comparison is exactly what exposed the two Designer-format defects — they are invisible while you look at a single format.
+
+### Fixed
+
+- **EDT exports had no role rights, no configuration-level links and no module registry.** Parsing of that format stopped right after the shared pass over object descriptions, skipping three phases entirely. Role rights live in a separate file whose contents match the Designer format — only the file name and directory depth differ, so the parser is shared. Configuration-level links (subsystem and exchange-plan contents, defined-type targets, functional-option location and contents) live inside the very object descriptions already being read, so no extra disk walk was needed. The module registry got its own phase for the EDT layout: identifiers of forms and commands come from the owning object's description, because a form file carries no identifier of its own. On a standard accounting configuration (Designer format in brackets): rights 0 → 48,476 (48,489), modules 0 → 18,263 (18,291), configuration-level edges 0 → 41,708 (41,543). The impact map of a catalogue matches exactly: 262 = 262 structural references, 29 rights from 5 roles in both formats. The object version stays empty for EDT on purpose — that format has no dump manifest, and a surrogate value must not be invented: the debugger checks it.
+- **Every nested subsystem was lost in EDT exports.** The walk went exactly two directory levels deep, while a nested subsystem sits deeper. The walk is now driven by a queue: a subsystem's subdirectories are appended as it goes, and appended before any checks — otherwise a whole branch would be lost when a subsystem's own description fails to read. On a standard accounting configuration: 73 → 617 subsystems, against 621 in the Designer format.
+- **Common form handlers reached the index in neither format.** Form collection looked for the "form inside an object" layout, but a common form has no forms directory at all — it is an object in its own right. The owner key is now the export folder name under which its module already sits, and the form name is its own name. The handler tool needed no change: it already normalises singular to plural. On a standard accounting configuration 0 → 428 forms in the Designer format and 0 → 427 in EDT; 344 on a standard trade configuration.
+- **A command module named after its own object lost its owner.** The owner lookup walked up the path until a directory name matched the object name — and for such a command the command's own directory came first, not the object's. The owner was then looked for next to it, never found, and the module was skipped silently. The losses were exactly the most typical case: a report or data-processor command named after the object itself — 91 modules out of 587 on a standard accounting configuration. The walk now stops at the commands directory, whose parent is the object. Found by format comparison: the EDT registry produced 587 command modules against 496, with an identical file count on disk.
+- **Incremental updates never worked for EDT exports.** Two independent causes, either sufficient on its own. First, description files were not listed as text and counted as binary — there was no search over that format's metadata at all, and the file watcher raised no events for them. Second, batch classification knew only the Designer format: it required the `xml` extension, an object directly inside a type folder and specific file names, so no branch ever matched. The incremental path now has its own branch: editing an object rebuilds just its registry row, structure, data links and event subscription; forms, role rights and the module registry are updated too. The file tree plays the role of the dump manifest — an object counts as deleted when its description disappears, and its links, forms and modules go with it.
+
+### Added
+
+- **Search over 1C:EDT export metadata.** Object descriptions, forms and role rights of that format are now indexed as text — `grep_text`, `search_text` and `read_file` work over them, as they long have for the Designer format. Large files (configuration description, rights, form) are exempt from the size limit, like their same-named counterparts.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 704 passed, 0 failed (was 696). New ones cover: nested EDT subsystems; EDT role rights; four kinds of configuration-level edges; the EDT module registry with an empty object version; a common form in both formats; a command named after its object; incremental updates of an object, a form and rights; object removal on a vanished description.
+- **Live smoke** on one configuration in two export formats, both force-reindexed. Every effect confirmed by numbers; the formats agree.
+- **Incremental-update rig** (a copy of two catalogues and a role under a separate alias): a synonym edit in an object description reached the index within seconds — previously nothing changed over 45 seconds of watching; deleting the description removed the object along with its modules and links.
+- **Federation smoke** on three node databases: common forms and command modules appeared, and the handler tool answers for a common form.
+
+## [0.52.0] — 2026-08-19
+
+**Seven data-completeness defects found by a full review of the collection layer. The main one: for exports from 1C:EDT the call graph lost almost half of its edges — calls to common modules and managers were dropped as local object methods. Now the same configuration exported either way yields a matching graph: a 0.03% difference instead of 44%.**
+
+> Context. The review compared one configuration exported two ways — from Designer and from 1C:EDT. Three of the seven defects are precisely format mismatches visible only through such a comparison.
+
+### Fixed
+
+- **The call graph lost almost half of its edges for EDT exports.** The lookup maps used to resolve call targets were built from Designer-style paths, which always contain an `Ext` directory inside the object. EDT exports have no such directory, so both maps stayed empty. On its own that would only leave targets unresolved, but the same map also guards the balast pruning step: a single-dot call is removed when its qualifier is not a known common module. For EDT that condition never held, so every common-module call left the graph. Path patterns now accept both layouts. On a standard accounting configuration: 651,324 edges before versus 1,161,479 after, against 1,161,817 in the Designer format; the share of edges with a resolved target is 88.3% in both formats.
+- **Data links diverged between the two formats in both directions.** The EDT parser had no resources and no owners sections: register resource references were lost (6 fields instead of 15 on a sample information register) and catalogue ownership was missing entirely (0 links instead of 45). The Designer format, conversely, never parsed attributes of data processors and reports (0 links versus 962). Both gaps are closed and the formats now agree.
+- **Object command modules never reached the module registry.** The command itself was treated as the owner, so the parser looked for a `Commands/<Command>.xml` file that does not exist: a command is described inside the XML of its object. The owner is now the object, and the identifier is taken from the command itself. A standard accounting configuration yields 496 such modules and a standard trade configuration 537 — previously none. Breakpoints inside object command modules are now possible.
+- **Nested subsystems had no synonym.** Synonyms were collected exactly one level deep inside each type folder, while a nested subsystem sits two levels deeper. On a standard accounting configuration 547 of 621 subsystems had no synonym — 88%. The subsystem folder is now walked as a tree, the same way the object registry already did; no subsystem is left without a synonym.
+- **Deleting a module did not remove its registry row.** The per-file branch could only insert and update: the type came from the file name, and the owner plus identifier from the XML of the object, which stays on disk — so the row was confidently rewritten after the module had disappeared. The incremental path diverged from the full rebuild. The row is now removed unconditionally and re-created only when the file exists.
+- **Document journals, sequences and filter criteria were missing from the code-usage index.** They were absent from the table of categories addressable from code, and that same table feeds the map used to resolve manager-module calls — so such references were neither indexed nor resolvable, and were additionally removed by pruning. A standard accounting configuration has 36 document journals, 33 of them with a manager module, and 0 indexed references; now 375.
+- **References made through the metadata object were not indexed.** Identifier pairs were matched without overlap: in `Metadata.Catalogs.<Object>` the collection is the second segment, so the first pair was discarded and the second was never examined. This is the primary way typical code refers to a metadata object — access-right checks, registration in platform mechanisms, attribute lookups. A single catalogue lost 99 references across more than sixty files.
+
+### Changed
+
+- The collection layer is split into purpose-oriented modules: entry points, full metadata scan, incremental updates, call graph, module registry, shared helpers. No logic changed — the tests were left untouched and stayed green. This also removed a duplication: the full module-registry pass carried its own copy of the owner-lookup logic, so a fix applied to one branch did not affect the other.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 696 passed, 0 failed (was 689). New tests cover: the path layout without an `Ext` directory; resources and owners in data links; an object command module with the identifier of the command; a nested subsystem synonym; removal of a module row when the file is deleted; references through the metadata object; the three new collection categories.
+- **Test-catches-the-defect check:** with the fix temporarily reverted, the EDT layout test fails exactly as the defect describes — the edge disappears from the graph entirely.
+- **Live smoke** on two databases — one configuration exported by Designer and by 1C:EDT, both force-reindexed. All seven effects confirmed on real data; owner links, journal references and subsystem synonyms match across formats.
+- **Split verification:** after the move, metrics on live databases matched the previous ones exactly.
+- **Federated check:** six node databases reindexed with 0 errors; remote repositories respond and the effects hold through federation.
+
+### Compatibility
+
+- **A reindex of every 1C configuration is required.** The changes affect what is collected: without a rebuild you will not get owner and resource links, object command modules, nested subsystem synonyms or references to the three new categories, and the call graph of EDT exports will stay incomplete.
+- Indexing time is effectively unchanged: across the six node databases deviations stay within ±5% in both directions, while the untouched core fluctuates by the same amount.
+- The index grows slightly: data links for data processors and reports, register resources, command module rows and references of three categories were added.
+- For 1C:EDT exports role rights, the module registry and configuration-level links are still not collected — that is a separate open defect, outside the scope of this release.
+
+## [0.51.1] — 2026-08-19
+
+**An export from 1C:EDT is finally recognised as a 1C configuration: previously indexing such a folder silently left the database without any metadata, and the whole EDT format parser never ran. The value type of an object was read for 10 objects out of 16,106 — now for 1,306. Scheduled jobs were not parsed at all, which lost the link between a job and the procedure it calls.**
+
+> Context. First verified against a real export of a standard accounting configuration from 1C:EDT — 16,212 `.mdo` files. The format mismatch is what exposed the defects: one and the same configuration, exported two ways, was described differently.
+
+### Fixed
+
+- **An export from 1C:EDT was not recognised as a 1C configuration.** Detection relied solely on a Designer-format `Configuration.xml`, which simply does not exist in an EDT export — there it is `src/Configuration/Configuration.mdo`. As a result, command-line indexing silently created no metadata tables at all: only core tables remained, and queries against them answered "no such table". The EDT parser — a thousand lines of code — was therefore unreachable in principle, because it is invoked inside metadata collection, which never started. It only worked when the language was set explicitly in the daemon configuration, meaning EDT support rested on manual setup rather than format detection. On a real export, metadata collection took 0.7 seconds and produced nothing before the fix; after it — 15,529 objects, 22,428 data links, 7,476 forms, 447 subscriptions.
+- **The structure of EDT objects was poorer than in the Designer format.** Three sections were missing: owners of a subordinate catalogue, predefined items and the value type of an object (charts of characteristic types, constants). They are now parsed, and strictly at the object itself — by tag nesting level. Without that boundary the object value type would mix with the types of every predefined item: one chart of characteristic types produced 308 values instead of 111 — exactly the number of type tags in the whole file. Cross-checking the same configuration in both export formats: owners 43 and 43, objects with predefined items 109 and 109, predefined item counts matched the export files item by item (1,263, 169, 121).
+- **The value type of an object was read for 10 objects out of 16,106.** Object files were opened only for types with reference attributes, while a constant, a defined type, a session parameter, a common attribute and a filter criterion have none — their XML was never opened, even though the value type is recorded there. These five types are now parsed: on a standard accounting configuration the value type is present for 1,306 objects (constants 708, defined types 481, session parameters 95, charts of characteristic types 8, common attributes 7, filter criteria 6, chart of accounts 1). Both export formats give identical counts line by line.
+- **A chart of accounts held junk instead of its analytics, and a task held the types of unrelated attributes.** Any `<Type>` outside an attribute was treated as the object's own type, so seven `xs:boolean` entries from accounting flags landed in the value type of a chart of accounts, and the types of addressing attributes landed in the value type of a task. The real value type of a chart of accounts — its extra dimension types — was not read at all. The value type is now taken strictly at the object level, and extra dimension types are parsed in both formats. A task has no value type of its own, so the section is empty, as it should be.
+- **Task addressing properties were read nowhere.** The addressing register, the main addressing attribute and the session parameter holding the current performer live in the object header; they were not part of the parse. They are now in the properties section: `Addressing`, `MainAddressingAttribute`, `CurrentPerformer`.
+- **Scheduled jobs were not parsed at all.** They were absent from the list of parsed types, so the most important part was lost — `MethodName`, the name of the procedure being called: the index could not tell what runs on a schedule. That is 168 objects on a standard accounting configuration and 219 on a standard trade configuration. The procedure name is now present for all of them, along with the usage flag and restart parameters.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 689 passed, 0 failed (was 685). New tests cover: a folder with `Configuration.mdo` is recognised as a 1C configuration; three EDT structure sections are parsed while a predefined item type does not leak into the object value type; a chart of accounts gets extra dimension types rather than accounting-flag booleans; a constant value type is read; a task exposes three addressing properties and an empty value type; a scheduled job exposes the called procedure name.
+- **Live check** against an accounting configuration exported from 1C:EDT (22,775 files, forced reindex): the log now shows schema extensions being applied and the EDT metadata collection line; 41 object types; subordinate catalogue owners match the three in the export file; the value type of a chart of characteristic types holds 111 values, exactly as the root tag of the file states (a broken intermediate version produced 308 — the number of all type tags in the file; that defect was caught by the live run, not by the tests).
+- **Cross-format check** of one configuration (the same accounting configuration exported by Designer and by 1C:EDT): owners 43 and 43, predefined items 109 and 109, value types 1,306 and 1,306 matching object type by object type, scheduled jobs with a procedure name 168 of 168 in both.
+- **Federated check:** the node was brought up on this build, remote databases respond, all repositories are ready.
+
+### Compatibility
+
+- **A reindex of every 1C configuration is required.** The changes affect both export formats: without a rebuild the value type stays with the previous ten objects, scheduled jobs remain without a procedure name, and task addressing properties never appear. For EDT exports additionally: command-line indexing yields no metadata at all until the database is rebuilt with the new build.
+- The index grows: XML files of six object types that were never opened before are now read (constants, defined types, session parameters, common attributes, filter criteria, scheduled jobs). On a standard accounting configuration that is roughly 1,500 additional files, extending metadata collection by about a minute.
+- Setting the language explicitly in the daemon configuration for EDT folders is no longer required, but does no harm.
+- A minor format asymmetry: the predefined flag of a scheduled job is read only from a Designer export — in EDT the tag with that name is taken by the predefined items block of a catalogue.
+
+## [0.51.0] — 2026-08-19
+
+**A truncated export manifest no longer wipes objects out of the index. Half of the 1C object kinds — roles, defined types, HTTP services, common forms — were never parsed at all; now they are. Nested subsystems made it into the object registry, and large export files made it into the index.**
+
+> Context. Findings X-1 … X-9 of the metadata XML parsing audit.
+
+### Fixed
+
+- **A truncated export manifest deleted objects from the index — silently.** `ConfigDumpInfo.xml` was parsed "until the first error": on a truncated file the part read so far was returned, with no sign of incompleteness. Area reconciliation treats anything missing from the manifest as gone and cascades the deletion — object, forms, modules, links. The platform rewrites that file on every export (over a megabyte in the UT configuration) and the watcher triggers reconciliation on its change event — so reading it mid-write was enough. On a test rig of three objects, one survived a truncated manifest, and restoring the full manifest recovered nothing: reconciliation only ever acts on deletions. Now a parse error is an error: the area is skipped whole, the reason is logged, the index is left alone.
+- **Half of the 1C object kinds were never parsed.** Recognising an XML file as an object went through a list of 18 kinds, while there are 45 top-level ones. Roles, defined types, HTTP and web services, common forms, scheduled jobs, functional options and two dozen more were not on it: their files stayed plain text — no structure, no object name, no line numbers. In the UT configuration that is 2,347 role files and 434 defined types for which `find_symbol` returned nothing. The core list is now complete, and the `known_meta_types_match_core` test fails on any divergence from the extension's list.
+- **Export files larger than a megabyte never reached the index.** The text-file size limit applied before a file could be recognised as an object, so alongside print-form templates it also cut off the configuration index (`Configuration.xml`, 1.2 MB in UT) and the rights of large roles (`Rights.xml`, up to 5 MB). Searching them silently returned nothing while the data was right there. These three kinds — configuration index, role rights and form structure — are now indexed regardless of size; print-form templates (up to 78 MB) still are not.
+- **Nested subsystems existed only as a source of links.** Only top-level subsystems — those listed in the configuration index — made it into the object registry. The nested tree was read (its content fed the link graph), but the subsystems themselves were never registered: they could not be found by name or asked for a profile, even the ones with five thousand content entries. UT has 447 unique subsystems; the registry held 60.
+- **Some subscription events stayed in English.** Event names were normalised to Russian through an 11-entry dictionary, while typical configurations also use others: form retrieval, presentation retrieval, five data-exchange events between nodes. In UT, 22 subscriptions out of 345 were stored under English names and could not be found by the Russian one. The dictionary now holds 24 entries.
+- **Extension subsystem content referenced targets by identifier.** An adopted object in an extension export is given by identifier rather than by name, and that string landed in the link graph as-is — a dangling edge. The identifier is now resolved to a name through the export manifest (the map is built lazily, only when such a target appears), and an unresolvable one is not written at all.
+- **Document numerators and style items were not listed as object kinds.** They appear in subsystem and functional-option content, so 591 links in UT pointed at objects absent from the registry.
+- **The business-process route point type produced a non-existent object.** `BusinessProcessRoutePointRef.X` yielded the target `BusinessProcessRoutePoint.X` — no such object exists in a configuration, a route point belongs to its business process. The type was also displayed with Latin and Cyrillic mixed together.
+
+### Changed
+
+- **1C object XML is now searched with `grep_code`, not `grep_text`.** A consequence of the complete kind list: object files are code files now. Tool hints and the architecture overview have been corrected — they used to send you to text search for these files. Other XML, including the configuration index, stays text.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace --all-features` — 689 passed, 0 failed (was 675). The new ones pin down: a truncated manifest is an error in all three parsing functions; the kind lists in core and extension match; role, defined type, HTTP service, common form and style item are recognised; configuration index, rights and form are indexed despite the limit while a template is not; a nested subsystem is registered and an identifier target resolves to a name; a route point leads to its business process.
+- **Test rig for the critical finding:** a separate daemon, its own three-object export, manifest truncated at 300 bytes. Before the fix — one object left in the index and a log line reading like routine "2 objects deleted"; after — all three intact and a complaint about the unreadable manifest.
+- **Live check locally** (`ut-test`, 57,072 files, forced reindex in 106 s): files parsed as 1C XML went from 15,769 to 23,479; roles gained 1,178 classes; `find_symbol("ЧтениеСделок")` returns a `Role` class at lines 1–15; the configuration index and nine large rights files are back in the index; the registry holds 447 subsystems instead of 60; identifier targets, route-point targets and English event names are all at zero.
+- **Federated check** across the node's six databases (58–95k files each, about 20 minutes total): same figures, and `find_symbol("ПолныеПрава")` returns the role class from a remote database. Indexing time stayed within the spread of previous runs (±2% either way).
+
+### Compatibility
+
+- **Reindexing required.** The fixes live in parsing and metadata collection: in already-built databases roles and other previously unseen kinds stay text, nested subsystems stay out of the registry, and English event names stay put until the database is rebuilt.
+- **Searching object XML changes tool:** `grep_text` no longer finds them — use `grep_code`. The configuration index and other XML without a metadata object are searched as before.
+- The index grows a little: files previously cut off by size return (twelve in UT), and objects of previously unrecognised kinds are added.
+
+## [0.50.0] — 2026-08-18
+
+**Line numbers for objects from 1C XML exports are no longer byte offsets, deeply nested expressions no longer kill the indexing process, and doc comments now show up for Go and C. The AST hash computation, which nothing ever read, has been removed.**
+
+> Context. Findings P-1 … P-6 and P-9 of the parser audit.
+
+### Fixed
+
+- **Line numbers for 1C attributes and tabular sections were byte offsets.** The XML export parser stored the reader's position in bytes instead of a line number: in a catalog of 488 lines, a tabular section was reported at line 15 268 and attributes at 17 932 and 19 273 (the real ones being 350, 405 and 442). Following such a pointer led nowhere, and a wrong value was indistinguishable from a correct one. Line numbers are now counted incrementally over the source text, and attributes, tabular sections and forms remember the line of their opening tag. All 1C export files in the index were affected.
+- **A deeply nested expression brought down the whole indexing process.** Traversal depth was capped only for some languages, and with different numbers (50 for Java, JavaScript and TypeScript, 80 for BSL and Rust, 100 for Go), while Python, PHP, C, C++, C#, Ruby, Swift and HTML had no cap at all. A chain of `1 + 1 + …` with five thousand terms — a 20 KB file — overflowed the stack, which is an abort of the entire daemon rather than a parse error on one file. The cap is now a single `MAX_VISIT_DEPTH` of 500 in every parser, and it is four times higher than the old ones, so deeply nested code now yields more calls.
+- **Only BSL was protected against pathological input.** The parse deadline and the binary-input filter were introduced for 1C protected modules, but neither is language-specific: non-linear parser degradation is just as reachable on minified JavaScript, and a binary file under a source extension shows up anywhere build artifacts sit next to sources. Both protections moved to a shared place: the deadline (10 s) is set by all thirteen parsers, and the binary filter lives in the common parse method that both indexing paths call.
+- **Go and C never extracted doc comments at all.** The description field for functions in these languages was always empty — not "when there is no comment", but by construction, even though a comment before a declaration is the standard way to document them. It is now collected the same way as in PHP, Ruby, Swift and C#.
+- **BSL compilation directives were stored in the "return type" field.** `&НаСервере` and `&НаКлиенте` were served where a declared result type is expected and read as one. The same information was already in the procedure description next to the export flag, so the field is now simply left empty. Selecting client-side procedures through `bsl_sql` still works — via the description.
+
+### Changed
+
+- **AST hash computation removed.** It ran for every file on every reindex (a full recursive traversal plus hashing of every node), was written to the `files.ast_hash` column and took part in no decision: "has the file changed" is answered by the content hash, and the field was stripped from tool output as plumbing. The column is dropped by a schema migration on first open.
+- **Doc-comment lookup sped up** in JavaScript, TypeScript, Java and Rust: instead of scanning all siblings from the start of the file, the immediately preceding node is taken — as was already done in PHP, Ruby, Swift and C#.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 675 passed, 0 failed, 0 build warnings (was 672; three new ones: XML line numbers on a file of known layout, doc comments in Go and in C).
+- **Depth bench** (release build, 2 MB worker stack). Before the fix: the Python traversal handled a chain of 2 000 terms and overflowed the stack at 5 000; on BSL, which had a cap, the overflow appeared around 10 000 — that is, the parser traversal overflowed first and AST hashing held out roughly twice as long. After the fix both languages parse a chain of 100 000 terms (a 400 KB file) without crashing.
+- **Live check on a local database** (1C configuration, 57 060 files, forced reindex in 106 s): for the catalog above, the tabular section and attributes landed on lines 350, 405 and 442; for a procedure with a directive the result-type field is empty and the directive is in the description; the AST hash column is gone from the files table. Index volume matched the previous state exactly for files, functions, classes, variables and imports; calls grew by 479, which is consistent with the higher depth cap.
+- **Cost of the removed hash, measured** on a copy of the same database (clean database before each run, warm-up plus alternating binaries): 106.0 and 102.5 s before the fix against 100.8 and 100.4 s after — a 2% saving on best times, with a 3.5 s spread between runs. The expectation of a "noticeable saving" was not confirmed: most of the time goes to the extension layer and database writes, not to tree traversal.
+
+### Compatibility
+
+- **A reindex is required.** The changes are in parsing, so in already built databases the line numbers of 1C objects, the BSL result-type field and Go/C descriptions stay as they were until the database is rebuilt. The schema itself updates on first open with the new binary.
+- The `ast_hash` field disappears from the files table. It never appeared in tool output — it was stripped as plumbing.
+
+## [0.49.9] — 2026-08-18
+
+**Line anchors now work in files with CRLF endings, and the path-prefix filter works on paths containing an underscore. Both failures were silent: the tool returned zero, indistinguishable from an honest "nothing found".**
+
+> Context. Findings H-1, H-2, H-5, H-6 of the storage audit.
+
+### Fixed
+
+- **The end-of-line anchor found nothing in files with CRLF.** The same expression was applied to two different representations of the text: the pre-filter to the whole text, where a line ends with carriage return plus line feed, and the line-by-line scan to lines with the carriage return already stripped. In multi-line mode `$` matches right before the line feed, and a carriage return sat there — so the file was discarded whole before the scan began. `grep_code`, `grep_text` and `grep_body` were all affected. Line endings are now normalised before the expression is applied — in the shared content-scanning path and in the SQL `REGEXP` function; the copy is made only when a carriage return is actually present.
+- **The path-prefix filter missed paths with an underscore or a percent sign.** Pattern-matching special characters were escaped with a backslash, but the query had no `ESCAPE` clause, so SQLite treated the backslash as an ordinary character and looked for a path literally containing it. There were never any matches: a `path_prefix` with an underscore — the norm for directories like `daemon_core` and for 1C external-processing names — silently returned an empty list. The escaping did not merely fail to help, it created the defect.
+- **Schema migrations were not applied on every database-opening path.** The set of migrations was listed twice — when creating a database and when loading an existing one into memory — and the second list lagged behind: the content-table migrations never made it there. A database from an older binary opened this way stayed without them, and the first content write failed with "no such table". The chain now lives in one function called by both paths; that path also explicitly enables foreign keys and sets the cache size, which it lacked entirely.
+- **A line longer than the soft limit made a file unreadable.** Line collection stopped as soon as one did not fit the budget; when the very first line exceeded it (minified js/css/json — the whole file on one line), empty content went out with a truncation flag. The file could not be read whole or by range — there is only one line. Its beginning is now returned, cut on a character boundary.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 672 passed, 0 failed (was 667; five new ones: anchors on content with CRLF specifically, for code and for bodies; a prefix with an underscore and with a percent sign; the full migration chain on a database whose content tables were dropped; a long line whole and by range).
+- **Live check on Windows (repository with CRLF endings):** `grep_code` for `^use std::sync::Arc;$` — 1 match, `grep_body` for `^\s+Ok\(\(\)\)$` — 30, `grep_text` for `^# Changelog$` — 1; before the fix all three returned zero. Prefix `crates/code-index-core/src/daemon_core/` — 13 files, exactly as many as the same directory by pattern; before the fix — zero.
+- **Checking the check:** the long-line test was run with the fix disabled and failed — so it catches this defect rather than passing incidentally.
+- **Live check through federation (remote node, a repository holding a 1C configuration):** a prefix for a directory whose name contains an underscore — 14 files against the previous zero, exactly as many as the same directory by pattern; on a repository with LF endings anchor search is unchanged, so normalisation broke nothing. The previous release's fixes were confirmed here too: the listing is capped and carries the total, path-scoped search returns 10 records with the incompleteness marker.
+- **What was NOT verified live:** the migration-chain divergence. All eight working databases are already migrated, so the defect is dormant — it can only be reproduced on an artificial database, which the unit test does.
+
+### Compatibility
+
+- No reindexing required: the changes live in the read path and in database opening. Search behaviour changes only where it previously returned a silent zero.
+
+## [0.49.8] — 2026-08-18
+
+**Responses no longer pass off a partial answer as a complete one: the file listing and path-scoped search now say that not everything is shown, and how much there is in total.**
+
+> Context. Findings M-11 — M-14 of the serving-layer audit. Common thread: a response looked complete when it was not, and conclusions were drawn from it.
+
+### Fixed
+
+- **The file listing was truncated silently (`list_files`).** The default is 500 files; beyond that the query simply stopped, and the answer was indistinguishable from a complete directory listing: on a 1C configuration a request for all modules returned 500 entries while many thousands matched. The response now carries `truncated`, `total` (how many actually match), `shown` and `limit`. The extra count runs only when the query hit its ceiling — if there are fewer files, there is no second database round-trip. The default of 500 is now stated in the tool and parameter descriptions.
+- **Path-scoped search stayed silent about incompleteness whenever anything was found (`search_function`, `search_class`, `search_text`).** The `prefilter_exhausted` marker arrived in 0.49.4 but hung on the "result is empty" condition. Yet the path filter is applied AFTER the top records are fetched by relevance: a dozen records out of many hundreds could remain, with nothing to indicate it. The marker is now emitted for non-empty results too, along with `prefetched` and `shown`. It sits next to `result` rather than in the internal field — that field is stripped before the response reaches the client.
+- **Mass mode lost the response's link to its source files.** A batched answer (`names[]` on `get_function`/`get_class`) was assembled without the internal field entirely. As a result its cache entry never entered the reverse index — per-file eviction could not reach it, and the "response built on a lagging index" check never ran for a batch. The dependencies of all elements are now merged into one internal field on the response.
+- **The `grep_body` truncation marker fired falsely.** In the branch without a path filter and without context it was derived from "matches are not fewer than requested": a request whose ceiling equalled the number of matches was marked truncated even though there were no more. It now fetches one match beyond the ceiling and sets the marker only if that extra one arrives.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 667 passed, 0 failed (was 664; three new tests: the marker on a non-empty result, counting files under the listing filters, merging dependencies in mass mode).
+- **Live check on Windows:** a listing of all configuration modules — 500 rows with `truncated: true` and the real count in `total`; a complete four-file listing — no extra fields. Path-scoped search — 11 records with the incompleteness marker and `prefetched: 75`; search without scoping — 16 records, no marker. Per-file cache eviction after a single and a batched call removed 2 entries instead of the previous 1. `grep_body`: with 2 matches, a ceiling of 2 yields `truncated: false`, a ceiling of 1 yields `true`.
+- **Live check on a second local repository (1C configuration):** the same listing — 500 rows with the truncation flag and the total; path-scoped search — 12 records with the marker (exactly the case that started the audit); `grep_body` on a sample with 9 matches: ceiling 9 — `truncated: false`, ceiling 8 — `true`.
+- **Federation was verified separately, after the release** (figures in 0.49.9): while preparing the next release it turned out that the repository taken here as remote is in fact served locally, so those requests went to the local index. The conclusion "the fixes work on the federation node" was confirmed by re-checking against a genuinely remote repository.
+
+### Compatibility
+
+- The new fields appear only when the response really is incomplete — complete answers keep their previous shape. The database schema and the tool set are unchanged; no reindexing is required.
+
+## [0.49.7] — 2026-08-18
+
+**The two longest functions in the project are split into standalone parts: editing command startup or the watch loop no longer means holding a five-hundred-line block in your head. Behaviour and tool responses are unchanged.**
+
+> Context. Finding G-2 of the audit. Seventh small release from it.
+
+### Changed
+
+- **Command dispatch (`cli.rs::run`, 692 lines).** The work of six large commands lived inside a single seventeen-arm match, so editing any one of them meant reading the whole function. The `serve`, `index`, `stats`, `query`, `clean` and `init` arms moved into their own functions with explicit parameters; what remains in the match is the dispatch itself plus eleven short seven-line arms. `run` is now 162 lines instead of 692.
+- **File watch loop (`worker.rs::run_worker`, 552 lines).** Folder preparation, initial indexing and change handling were one block: understanding what happens to a batch of events meant reading all of it. Handling a single batch — applying events, committing the transaction, rebuilding the derived layer per-file, invalidating the serving cache and setting the resulting status — moved into `process_batch`. The wrapping that stays the same from batch to batch is collected into `BatchContext`, and the mid-loop `break` became an explicit `BatchStep::Continue` / `Stop` outcome. The loop now reads in one go: check the shutdown signal, take a batch, handle it, decide whether to continue. `run_worker` is 386 lines.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 664 passed, 0 failed. The count is deliberately unchanged: the restructuring is internal, behaviour is the same, no new branches appeared.
+- **Live check on Windows, per-file indexing on edit:** a procedure appended to a common module landed in the index in under five seconds; the log shows `batch: 1 events` and a per-file derived-layer rebuild (`index_extras_for_files`, changed=1); the server returned the function body.
+- **Live check on Windows, per-file indexing on delete:** after reverting the edit the procedure left the index in under five seconds.
+- **Live check on Windows, full indexing:** a daemon restart brought every connected repository to ready in 20 seconds with no errors, and all fifteen database counters (files, functions, calls, metadata, forms, modules, subscriptions, data links, rights, call graph, enrichment, metadata usages, per-file edges, manifest) matched the values taken before the restart.
+- **Live check on Linux (federation node):** editing a file in a large remote repository took the same path — batch handled, per-file rebuild done, the function became available through federation; reverting removed it. File watching differs between Linux and Windows, so both were exercised.
+
+### Compatibility
+
+- The restructuring is internal: the tool set, response format and database schema are unchanged. No reindexing required.
+
+## [0.49.6] — 2026-08-18
+
+**Daemon startup after editing a few files no longer takes minutes: the derived layer is rebuilt per-file instead of wholesale. Rust modules finally land in the index, and a temporarily unavailable file is no longer dropped from it as deleted.**
+
+> Context. Findings S-5, S-6, M-5, G-5, G-6 of the audit. Sixth small release from it.
+
+### Fixed
+
+- **The derived layer was rebuilt wholesale because of a single changed file (S-6).** The skip gate at daemon startup required exactly zero changes, so any edit triggered a full rebuild of configuration metadata, forms, subscriptions and the procedure call graph. The per-file path existed, worked and was covered by tests, but only the file-watching loop could reach it — there the path list exists by construction, while the indexing result carried counters only. The result now carries the paths themselves (capped at 10 000, beyond which the lists are dropped), and startup has three branches instead of two: skip on zero changes, per-file rebuild when paths are known and the derived layer exists, full rebuild for a new database, an empty derived layer or an overflow. A failing per-file rebuild is not swallowed: a full rebuild follows, otherwise the derived layer would be left in an unknown state. Measured on 57 060 files with one changed file: **428 065 ms → 20 345 ms**, 21× faster.
+- **Rust modules did not land in the index (G-6).** Structs, enums and traits were parsed, `mod` was not — including `mod tests`, present in almost every file. As a result `get_class` could not find a module, the file map looked exhaustive without being so, and "what lives where" counts were understated. A module is now indexed on par with a type — both with a body and in the `mod foo;` form. On this repository after reindexing: 208 → 374 types, 166 of them modules.
+- **A temporarily unavailable file was taken for a deleted one (S-5).** The decision was made by an "is this a file?" check at event-handling time. If the file was invisible at that moment — antivirus scan, file locked by another process, mid-move — a modification turned into a deletion and the row left the index. No further event would come, so it would only return on a full pass. Deletion now requires an explicit "not found"; other errors are treated as a modification. In a doubtful case we keep a stale row: it goes away on the next full pass, while a lost live file would not return before it.
+- **Per-repository cache invalidation did not clear "dirty" marks (M-5).** A full flush cleared them, a per-repository one did not, so marks lived up to two minutes and suppressed caching of that repository's answers all that time. Wasted recomputation, not corruption.
+- **A failed file-metadata update was silenced (G-5).** The result was dropped via `let _ =`, although it means the file will miss the mtime fast path on the next startup and be parsed in full. The slowdown looked unexplained. Failures are now counted, the first five are logged with path and error, and a summary line states the count and the consequence.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 664 passed, 0 failed (was 659; 5 added).
+- **Live S-6 measurement:** both runs under identical daemon conditions on a 57 060-file bench with one changed file — 428 065 ms vs 20 345 ms.
+- **S-6 equivalence:** after the per-file path and after a full pass over the same file state, all twelve counters matched — `metadata_objects` 14 823, `metadata_forms` 5 284, `metadata_modules` 13 944, `event_subscriptions` 346, `data_links` 64 764, `role_rights` 49 695, `proc_call_graph` 593 515, `procedure_enrichment` 261 488, `metadata_code_usages` 280 449 (from 8 780 files), `direct_edge_files` 1 168 432, `config_manifest` 103 886.
+- **The per-file path really updates:** a function added to a module was found after startup in the core, in the enrichment layer with its terms, and in the call graph as an edge to the callee; counters moved by exactly +1 in the three code-derived tables, the other nine unchanged.
+- **Live G-6 check:** after a forced reindex `get_class` finds a module, the file map shows `mod tests` with its line range, and functions and types inside modules are still there.
+
+### Compatibility
+
+- **G-6 requires a forced reindex** of Rust repositories: swapping the binary is not enough, existing rows will not appear on their own. Nothing changes for other languages.
+- The remaining fixes require no reindexing.
+- After reindexing, output for Rust repositories contains STRICTLY MORE rows: modules were added. Existing rows are unchanged.
+
+## [0.49.5] — 2026-08-18
+
+**Line anchors no longer drop matches silently: `^` and `$` in `grep_text`, `grep_code` and `grep_body` mean line boundaries, not file boundaries.**
+
+> Context. Finding M-10 of the MCP serving-layer audit. Fifth small release from that audit.
+
+### Fixed
+
+- **A pattern with `^` or `$` returned nothing even though matches existed (M-10).** The line-by-line search itself was correct — matches were dropped by the pre-filter that runs before it. For `grep_code` and `grep_text` that is the early bail-out "no match anywhere in this file — skip the per-line pass", which applied the pattern to the whole file content. For `grep_body` the same role was played by the `body REGEXP` condition in the SQL query, applied to the entire function body. In that context `^` means the start of the whole text and `$` its end, so a file or a body was filtered out before the per-line pass that would have matched it. A query for `^## ` over a document full of headings returned zero, `^fn name` over code returned zero, and the empty answer was indistinguishable from an honest "no such text". The pre-filter pattern is now compiled in multi-line mode, consistent with the search itself.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 659 passed, 0 failed (was 656; 3 added).
+- **Defect reproduction:** the old compilation was temporarily restored in `grep_text` — only its own test failed ("`^` must match the start of a line, not of the file"), while the `grep_code` and `grep_body` tests stayed green: each test is bound to its own pre-filter site.
+- **Live, local node:** four calls that returned zero before the fix — `grep_text` with `^## ` (6 headings) and with a `$`-anchored pattern (line 126), `grep_code` with `^fn is_cacheable_tool` (line 1186), `grep_body` with `^\s+let compiled = regex` (two functions).
+- **Federation smoke:** both nodes on 0.49.5; `grep_text(repo="ut", regex="^#")` over the root README found headings on lines 1, 5, 11, 23, 27 (only the first would have matched before); `grep_text(repo="zup", regex="^## ")` — five headings; `grep_code(repo="ut", regex="^Процедура ")` over a common module — lines 70, 101, 119; the Accounting base stats over federation are normal.
+
+### Compatibility
+
+- **No reindexing required** — the fix touches the read path only, the database schema is unchanged.
+- Patterns with `^` and `$` now match STRICTLY MORE than before. Results for anchor-free patterns are unchanged.
+- Prefixing a pattern with `(?m)` remains valid — it was the workaround and keeps working.
+
+## [0.49.4] — 2026-08-18
+
+**Path filtering no longer misses files at the repository root, and refusals and empty answers no longer stick in the serving cache for an hour. On top of that, a search whose path filter left nothing now says openly that "empty" may be an artefact of the pre-selection.**
+
+> Context. Findings M-6 … M-9 of the MCP serving-layer audit. Fourth small release from that audit.
+
+### Fixed
+
+- **A path pattern with `**/` did not match files at the repository root (M-6).** Normalization collapsed `**` into `*`, but the separator after it stayed mandatory: `**/*.md` became `*/*.md`, so the path `CHANGELOG.md`, which has no separator, stopped matching. The failure was silent — an empty result is indistinguishable from an honest "no such text", and was read as absence. Every tool taking a path pattern was affected: `grep_text`, `grep_code`, `grep_body`, `list_files`, `search_*`, and the narrowing in `get_function`/`get_class`. The segment is now expanded up front into two variants — "through intermediate directories" and "without them" (`**/*.md` → `*/*.md` and `*.md`) — identically for the SQL-side filter and for the post-filter in the serving layer.
+- **Refusals and "not found" settled in the serving cache for up to an hour (M-7).** Only the protocol error flag was checked before storing, while "daemon unavailable", "indexing in progress", "path not tracked" and `{"error": …}` answers are returned as an ordinary successful string. They carry no dependent files, so per-file invalidation cannot reach them — nothing could evict them short of the hour expiring. In practice: the daemon was restarted and has been running for a while, yet the client keeps getting "daemon unavailable" for the same arguments. Such answers are no longer cached at all. Three adjacent cases are fixed along with it: answers without dependent files (including any empty search result) now live 15 seconds instead of an hour; `find_path` and `get_call_tree` are bound to the files their edges come from and are therefore evicted when code changes; `stat_file` was added to the non-cacheable list — it was meant to be one, as the code comment stated, but it was missing from the list itself.
+- **Narrowing a search by path silently lost matches (M-8).** With a path pattern set, `search_function`, `search_class` and `search_text` fetch five times more rows than requested (capped at 500) and only then filter by path. If the matching files ranked lower, the answer came back empty and was indistinguishable from an honest zero. Such answers now carry a `prefilter_exhausted` flag with the number of rows examined and a note to refine the query or use `grep_code`/`grep_text`, where the path is filtered in the query itself.
+- **A field that was built and immediately stripped (M-9).** `get_callers` and `get_callees` put `file_id` into every row, while the shared plumbing strip removed that key before delivery. The field never reached the client; the source file is already delivered as `path`.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 656 passed, 0 failed (was 647; 9 added).
+- **Defect reproduction:** the old normalization behaviour was temporarily restored and both new tests failed exactly as the finding describes ("root .md must be covered, got: `["**/*.md", "**/*.toml"]`", "file at root").
+- **Live, local node:** the three calls that returned zero before the fix — `grep_text` over the changelogs and over the root manifest, `list_files` with the `**/*.toml` pattern — returned the root files.
+- **Live, refusal with the daemon stopped (M-7):** the daemon was stopped, the call returned "daemon unavailable", and neither the entry count nor the hit count in the cache changed; after the daemon came back the same call immediately returned data rather than a stuck refusal.
+- **Live, file binding and lifetime:** after per-file invalidation on the edge source file a repeated `find_path` was a miss (the entry had been dropped); an empty search was a hit on repeat and a miss after 20 seconds.
+- **Live, `stat_file`:** after the file changed, the same call returned the fresh size and time; the cache counters did not move at all during those calls.
+- **Federated smoke:** both nodes on 0.49.4; `grep_text(repo="ut", path_glob="**/README.md")` found the root file on the remote node; queries over `zup` and two Accounting bases, plus an object structure through federation, behaved normally.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fixes are in the serving layer.
+- Path patterns with `**/` now match STRICTLY MORE files than before: matches at the repository root were added. Results without root files are unchanged.
+- `stat_file` is no longer cached and always returns current metadata.
+
+## [0.49.3] — 2026-08-18
+
+**A repeated tool call no longer comes back empty for clients that read the structured form of the response, and an answer computed before a commit no longer settles in the cache as fresh. On top of that, the serving cache now releases memory and survives an unrelated panic.**
+
+> Context. Findings M-1 … M-4 of the MCP serving-layer audit. Third small release from that audit.
+
+### Fixed
+
+- **Re-delivery filtering emptied the structured form of the response (M-1).** A tool response arrives in two shapes at once — as text and as structure (`structuredContent`) — carrying the same data. The filter processed them one after the other, but the first pass does not only drop already-delivered rows, it also remembers the new ones as delivered; by the second pass every row of the response was in memory, so it dropped all of them. A client reading the structured form lost exactly the new rows, and got a marker saying "already delivered earlier in this session" that had no basis. The second pass now makes no decision of its own: it replays the first pass's decision from the list of dropped fingerprints and never touches session memory. A response consisting only of the structured form is processed in full, as the single source.
+- **An answer computed before a commit was cached as fresh (M-2).** The guard against caching stale data looked only at the "dirty" file marks. If a call started before a batch was committed and finished after it, the mark was already cleared by then — and an answer built on old data was accepted as clean. The window equals the duration of the call, which is seconds for heavy queries. The cache now keeps an index generation per repository: any signal from the indexer moves it, it is taken before the answer starts being computed and compared when the answer is stored. A mismatch means the answer is not cached.
+- **The serving cache never released memory (M-3).** An expired entry was correctly treated as a miss but was never removed; the reverse index additionally accumulated references to keys already dropped by per-file invalidation of a different file. For a server that runs for weeks this is unbounded growth. An expired entry is now removed on the miss itself, and every 256 inserts a sweep runs: expired entries, orphaned reverse-index references, and stale "dirty" marks.
+- **A panic in an unrelated thread disabled the whole cache (M-4).** Every access to the cache maps and to the filter's session memory went through `unwrap()` on the lock: one panic and every later tool call died. The policy adopted in 0.49.2 for the connection pool is now extracted into shared lock helpers and applied in both modules — 13 sites.
+
+### Testing
+
+Verification levels are listed separately — "tested" without saying at which level says nothing.
+
+- **Unit tests:** `cargo test --workspace` — 647 passed, 0 failed (was 641; 6 added), no warnings. The lock is poisoned for real — by a thread that panics while holding it.
+- **Defect reproduction:** the old second-pass behaviour was temporarily restored and the main test failed exactly as the finding describes — the structured form arrived empty instead of carrying the row being delivered for the first time.
+- **Live on the test repository `ut-test`:** two consecutive `bsl_sql` calls in one session, the second a superset of the first. Both response shapes carried exactly one new row and the same elision marker.
+- **Live on the running server, with a control (M-2):** a change signal was injected in the middle of a call. Without interference the second identical call was a cache hit; with the signal at 100 ms into a 1.06 s call it was a miss, i.e. the answer was not cached.
+- **On an isolated test bed (M-3, M-4):** built with a 2-second entry lifetime instead of an hour and a temporary endpoint that panics while holding the cache lock. An entry past its lifetime is served as a miss and does not accumulate; after 301 inserts memory holds 199 entries instead of 301. After the panic under the lock, tool calls and `/cache-stats` keep working.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fixes are in the serving layer.
+- Response shapes are unchanged. What changed is that the structured form now carries the same rows as the text form — previously it arrived empty in that case.
+
+## [0.49.2] — 2026-08-17
+
+**A single long-past panic in an unrelated thread no longer takes the serving layer down for good, and shutting the daemon down no longer looks like a crash in the log. The lock guarding the list of idle connections was handled two different ways: returning a connection survived poisoning, while taking one called `unwrap()` and brought down the whole serving layer. Separately: closing the semaphore on shutdown is a normal event, yet both the indexing worker and the connection pool met it with a panic.**
+
+> Context. Findings G-1 and S-4 of the codebase audit. Second small release from that audit.
+
+### Fixed
+
+- **Poisoned lock in the connection pool (G-1).** Poisoning does not mean corrupted data — only that a panic happened somewhere else: the lock guards an ordinary list of idle connections, and operations on it never leave it half-done. Both places that touch the list now go through a single `StoragePool::lock_idle`, which takes the contents and carries on. The return path is fixed too: the previous branch dropped the connection on the floor when poisoned, and the pool silently degraded into opening a fresh connection per request.
+- **Panic instead of a quiet exit on semaphore close (S-4).** There turned out to be two such places, not one — the same pattern lived in the connection pool, which surfaced while reading the code before the fix. Indexing worker: slot acquisition moved into `acquire_initial_slot`; on a closed semaphore the worker logs a line and exits quietly — no redundant restart by the supervisor thread and no panic masking real failures. Connection pool: a closed semaphore is now an ordinary error to the caller, since `get()` already returned a `Result`.
+
+### Testing
+
+- `cargo test --workspace` — 641 passed, 0 failed (was 635; 6 added), no warnings.
+- The lock is poisoned for real in the tests: a thread panics while holding it, after which both taking and returning a connection are verified.
+- Local rollout and a live check of the serving layer: concurrent calls across different repositories, including remote ones over federation.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fix is in the connection layer and in worker startup.
+- Behaviour under normal operation is unchanged: both fixes touch exceptional situations only — a panic in an unrelated thread, and service shutdown.
+
+## [0.49.1] — 2026-08-17
+
+**Renaming a directory no longer desynchronises the index, and a failure inside a batch of changes is no longer reported as a successful update. A renamed folder went missing for the watcher twice over: files under the old name stayed in the index forever, and the contents of the new name were not indexed until the daemon restarted. On top of that, a write error on a single file and a failed rebuild of the add-on data (call graph, data links, object structure) were only logged — the folder still got the "ready" status, so a desynchronised snapshot looked fresh.**
+
+> Context. Findings S-1, S-2, S-3 of the codebase audit. From here on, fixes from that audit ship as small releases.
+
+### Fixed
+
+- **Directory rename (S-1).** File-by-file deletion, `rmdir`/`rm -rf` and branch switching produce an event per file inside, so the index cleaned itself within a couple of seconds. A rename, however, emits a SINGLE event on the folder itself, and two things broke at once. First: the event on the vanished name looked for an exact path match in the files table, and there is no row for a directory — so nothing was deleted. Deletion by path prefix did not exist in storage at all; `delete_files_under_prefix` was added, removing the path together with its whole subtree. The prefix is compared with `substr`, not `LIKE`: `_` and `%` in folder names are wildcards for `LIKE`, so `my_dir/` would have matched `myXdir/`. Second: the event on the new name was discarded by the "this is a directory" check, while the files inside never got events of their own. Directory creation and rename are now expanded by a recursive walk (with `.git` and `.code-index` excluded, otherwise the daemon picks up its own database journal writes and loops); other events on folders are still ignored.
+- **A failure inside a batch no longer yields "ready" (S-2, S-3).** On a read, parse or write failure the event handler only logged, the commit went through normally, the status was set to "ready" and the cache was told to drop stale data — the file in the index stayed as it was while the snapshot counted as current. Same for the add-on rebuild: function bodies fresh, call graph and data links from the previous version, with no sign of it in the responses. The status decision is now a pure function, `batch_outcome`: "ready" is allowed only when all three steps went through — applying the events, committing, and rebuilding the add-on data. Otherwise the folder is marked failed with a concrete reason in its `error` field. The status does not stick: the next successful batch returns the folder to "ready".
+- **A vanished file does not count as a failure.** A missing file at parse time is the normal course of an editor save (write to a temporary file, rename over the target). Otherwise every save would mark the folder as failed.
+
+### Testing
+
+- `cargo test --workspace` — 635 passed, 0 failed (was 628; 7 added: five for `batch_outcome`, two for `delete_files_under_prefix`).
+- **Live-daemon test bed on Windows and on Linux — both green.** A separate daemon instance with its own state directory; the production one was left alone. Scenarios: directory rename, directory removal by the OS, single-file deletion, a whole new folder appearing. Before the fix, a rename left 2 phantoms and complete blindness to the new path; after it — 0 phantoms, both new paths in the index including the nested one, index matching the disk exactly.
+- **A separate check under Linux.** There the watch is bound to the directory as a filesystem object rather than to its name, which allows a failure mode of its own: an edit to a file inside a renamed directory can arrive under the old name and recreate a phantom. Covered by a fifth scenario — it does not happen: the new content is picked up under the new path, with no phantoms.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fix is entirely in the synchronisation layer.
+- **Not verified on macOS** — the watch there goes through FSEvents with its own set of events. The fix does no harm regardless: both new branches only fire on events that were previously discarded outright.
+
+## [0.49.0] — 2026-08-15
+
+**Size capping no longer carries away the list of what was found. A search for configuration objects by name substring (`get_object_structure` with `name_like`) returned three numbers on the slightest budget overrun — `{matched: 38, results_omitted: true}` — and not a single name: the heaviest section in such a response was the results array itself, so it was the first thing dropped. Identification of what was found is now untouchable: heavy sections inside the items are removed first, and only then is the array itself shortened, with honest `results_total`/`results_shown`. Added a per-call budget parameter `max_response_bytes` with a server-side ceiling, and a names-only mode `names_only`.**
+
+> Context. The defect surfaced during a planner run: the model received three numbers, did not realise objects had been found, and burned every turn on blindly guessing metadata types. The budget overrun was a few percent (48,814 bytes against 48,000); the loss was a hundred percent.
+
+### Fixed
+
+- **A search response no longer loses the list of what was found.** The per-section guard `omit_oversize_sections` looked for the heaviest array section and dropped it wholesale. For a single object's structure that rule is right (hundreds of enum values go, the object's passport stays), but in a search response the heaviest section is the outer `results` array, with no other contenders nearby. So it went first, taking every name with it; the algorithm never descended into the items. A separate degradation path `shrink_search_results` now handles search responses (`name_like`, `full_names`): `full_name`, `meta_type`, `name` and `synonym` survive on every item at any budget above zero, and the array is never emptied — at the harshest budget at least one item is still returned.
+- **Degradation goes top-down, each step only if the previous one was not enough.** Heavy sections INSIDE the items are removed first, each marked with `<section>_omitted` + `<section>_count` (the `counts` block stays, so the number of attributes is visible even without the attributes). If that is still not enough, the array itself is shortened and `results_total` (how many were found) and `results_shown` (how many were returned) appear next to it. Exactly as much is removed as the budget requires: objects that fit come back with their sections intact.
+
+### Added
+
+- **`max_response_bytes` — a size budget for ONE call** (`get_object_structure`), overriding the server-wide `[cap].max_response_bytes`. A request above the ceiling is not rejected but clamped to it; the applied value comes back in `response_budget_applied`. The value `0` (disable the guard) is not allowed per call — the guard can only be lifted from the server config, otherwise a client tears its own context apart with a single parameter.
+- **`[cap].max_response_bytes_hard` in `daemon.toml`** — the ceiling for a requested budget. Absent or `0` → default of 4x the regular budget (192,000 bytes with the default 48,000). Zero means "default", not "zero ceiling": otherwise every client request would be clamped to zero, disabling the guard instead of tightening it.
+- **`names_only` — passport-only mode** (`get_object_structure`): return `full_name`, `meta_type`, `name`, `synonym` without the structure. The cheapest search mode: on the analysed case of 38 objects, 13,353 bytes instead of 48,814. A dedicated parameter was needed because `sections=[]` means "all sections" (backwards compatibility), leaving no way to ask for names alone.
+- **`response_shrink_hint` — a hint that names the knob and the price.** The previous text suggested `grep_code`/`grep_body` — tools the calling agent may not even have allowed — and named neither the actual size nor the parameter. The hint now carries both numbers (what the full response would weigh and what the budget was), a ready-to-use `max_response_bytes=N`, the server ceiling, and the list of next moves: `names_only=true`, requesting a single object by `full_name` from the list, narrowing `name_like`/`meta_type`.
+
+### Changed
+
+- **Markers on a shrunk search response.** Alongside the existing `response_sections_omitted` there are now `response_results_shortened` (the array itself was shortened) and `response_budget_applied` (which budget was in force). For search responses the generic `response_sections_omitted_hint` is no longer attached — `response_shrink_hint`, with concrete numbers and knobs, takes its place.
+
+### Testing
+
+- `cargo test --workspace` — 628 passed, 0 failed, 0 warnings. Seven new tests in `mcp::cap`, the key one being `search_results_never_dropped_wholesale`: at budgets of 50, 500, 5,000, 20,000 and 48,000 bytes the results array is never dropped wholesale, and every returned item still carries `full_name` and `meta_type`.
+- **Live verification on the serve layer at both levels — locally (`ut-test`) and federated (`ut` on a remote node), with identical results.** The exact call from the report (`name_like="Соглашения"`, `sections=["attributes"]`, default budget): it used to return `{matched: 38, results_omitted: true}` with no names, and now returns 38 items each with its passport, the wanted `Catalog.СоглашенияСКлиентами` present, and the heaviest object's section marked `attributes_omitted` + `attributes_count: 70`.
+- `names_only=true` → 38 items, passport only, 13,353 bytes. `max_response_bytes=70000` → full sections, 50,801 bytes, `response_budget_applied: 70000`. A request of 5,000,000 → response delivered, budget clamped to 192,000. A budget of 1,200 (not even the names fit) → 3 items out of 38, `results_total: 38` / `results_shown: 3`, and no `results_omitted` marker.
+- A single object's structure is unchanged: `Enum.ХозяйственныеОперации` (816 values) still comes back as before — `enum_values_omitted: true` + `enum_values_count: 816`, with the object's passport in place.
+
+### Compatibility
+
+- **No reindex required** — the DB schema and storage format are unchanged; the fix lives entirely in the output layer.
+- **The meaning of `sections=[]` is unchanged** — an empty list still means "all sections".
+- **The response shape for a SINGLE object's structure is unchanged** — the existing per-section `omit_oversize_sections` behaves exactly as before.
+- **Federated nodes must be updated together** — the new `names_only`/`max_response_bytes` parameters are handled by the node that owns the repository; a node on an older version simply ignores them and answers the old way.
+
+## [0.48.0] — 2026-08-06
+
+**Fixed silent row loss in responses over http: a repeated call to any tool that returns an array (`get_callers`, `get_function`, `search_function`, `list_files` and four more) came back as an empty list with no indication whatsoever that rows had been dropped. An empty response is indistinguishable from an honest "no data", so the model concluded "this code is unused" — and edited live code on that basis. The cause was the session-level re-delivery filter, which could not attach a marker to a bare array and therefore dropped rows silently. The marker is now mandatory for both response shapes, the row fingerprint accounts for repository and tool, the mechanism can be turned off from the config, and its memory can be cleared via `POST /dedup-reset`. Issue #5 (reported by @Ailirag).**
+
+> Context. Thanks to **@Ailirag** for an exemplary report: a ready reproduction script, a cross-check against the CLI output and an stdio-versus-http comparison pointed straight at the serve layer rather than the index or the queries themselves. That removed half the diagnosis — what remained was locating the spot in the code.
+
+### Fixed
+
+- **Silent row loss in tools returning a bare array** — `get_callers`, `get_callees`, `get_function`, `get_class`, `search_function`, `search_class`, `search_text`, `list_files`. The session filter (`serve_dedup`) does not re-deliver rows already sent within the same session and marks what it dropped with `rows_elided_already_delivered`. For the tabular shape `{result:{rows:[…]}}` the marker went inside `result`, but for a bare array `result:[…]` it was not set at all: a service field cannot be inserted into an array without breaking the shape. Rows were dropped regardless, so a repeated call arrived empty and unannotated. The marker is now placed next to `result`, in the enclosing object where `hint` and `truncated/total/limit` already live (`tools::wrap_with_meta_extra`) — the response shape is unchanged. This only manifested under `--transport http`: the filter is keyed by the `mcp-session-id` header, which does not exist in stdio, so there the filter never engaged and stdio/CLI returned full responses.
+- **Rows from different repositories and tools no longer cancel each other out.** The fingerprint was computed from row content alone, while the set of delivered rows was shared across the whole session. As a result the **very first** query against a neighbouring base came back empty whenever rows matched textually: records delivered from `ut-test` suppressed identical ones from `ut` (1C object names are literally the same across UT bases). This hurt most in exactly the task where matches are the point — comparing two configurations. The fingerprint now includes a scope — "tool\|repo". Call arguments are deliberately left out of the scope: models frequently re-ask the same question with a refined `limit`/`path_glob`, and an argument-aware scope would let such repeats slip through.
+
+### Added
+
+- **`[mcp].dedup_enabled` in `daemon.toml`** — turns the session filter on and off; enabled by default (the section may be absent). Previously the mechanism was hard-wired on in the server constructor with no way to disable it. Applied via the `apply_dedup_enabled` builder in both `serve` branches, federated and mono.
+- **`POST /dedup-reset`** — clears the filter's memory across all sessions; sits alongside `/mark-dirty`, `/invalidate` and `/cache-stats`. Needed where the model lost part of its context (history compaction on the client side) while the MCP session stayed alive: that event is not observable from inside the protocol for any client, so the signal has to come from outside. The reset covers all sessions at once — the caller does not know the `mcp-session-id`; the cost is a one-off re-delivery of rows, correctness is unaffected. Available to any client; in Claude Code the endpoint is conveniently driven by a `PostCompact` hook.
+
+### Changed
+
+- **The hint accompanying dropped rows is in English.** Server responses are read by any model and any client, not just a Russian-speaking setup, and weaker models handle an English phrasing far more reliably. The text is direct and jargon-free because the "dead code or not" conclusion hangs on it: it states that rows existed, that they were dropped as already shown, and that an empty or shortened list does not mean the data is absent. A foreign hint is never overwritten — under a limit cutoff `hint` is already taken and carries a different meaning, in which case only the dropped-row count is added.
+- **An originally empty response gets no marker.** If a tool returned an empty list on its own, the response is not rewritten at all — the tool's own hint stays (for example "0 callers ≠ dead code" from `get_callers`). "No data" and "already delivered" are told apart by the presence of `rows_elided_already_delivered`.
+
+### Testing
+
+- `cargo test --workspace` — 621 passed, 0 failed. `serve_dedup` has 11 tests, 6 of them new: marker on a bare array, originally empty result without a marker, foreign hint preserved, scope isolation, memory reset, disabled flag.
+- **Live check of all 31 tools before and after the fix** — serve layer against real bases, each tool called twice within one session. Response shapes: 9 array-based, 22 object-based or without `result`. Silent losses went from 8 to 0; all eight array tools now carry the dropped-row count and the hint (`get_callees` 29 → 0 with marker 29, `search_function` 20 → 0 with marker 20, and so on). `bsl_sql` with its `rows` shape behaves as before.
+- Scope isolation live: `bsl_sql(ut-test)` → 2 rows, then `bsl_sql(ut)` with the same query → its own 2 rows (before the fix an empty list arrived), a repeat on `ut` → 0 rows with marker 2.
+- `POST /dedup-reset` → `{"ok":true,"sessions_reset":2}`, the next call delivers rows in full.
+- The flag: a temporary serve instance with `dedup_enabled = false` — `/cache-stats` reports `dedup_enabled=false`, and three identical calls in a row each return the full response.
+
+### Compatibility
+
+- **No reindex required** — the DB schema and storage format are unchanged; the fix lives entirely in the serve layer.
+- **Tool response shapes are unchanged**: `rows_elided_already_delivered` and `hint` appear only when rows were actually dropped; existing fields are untouched.
+- **No federated node update required** — calls to remote repositories go through `/federate/<tool>` without an MCP session, so the filter never engages there; the marker is applied by the local serve layer on the final response.
+
+## [0.47.0] — 2026-08-02
+
+**Indexing is twice as fast on repositories with a large volume of sources. Content compression moved out of the single writer thread into a parallel phase, the zstd compressor is created once per thread instead of once per file, and for dual-indexed languages the same text is no longer compressed twice. Plus a prepared-statement cache on the hot write paths. Profile of a production PHP site (151,341 files): indexing core 86.1 → 41.2 s, of which the write phase 64.6 → 17.5 s. On a 1C base (57,060 files) the core went 59.8 → 46.3 s.**
+
+### Changed
+
+- **Content compression is a separate parallel phase.** `zstd::encode_all` used to be called inside `Storage`, i.e. in the writer thread: on the production PHP site that was 37.3 s out of a 64.6 s write phase while the other cores idled. Content is now compressed in a rayon phase (`Indexer`, stage 2c) — after the extras collector, which needs the raw text, and with the source string released immediately, so peak memory does not grow. The writer receives a ready blob.
+- **The zstd compressor is created once per thread** (`for_each_init`), not per file. This was the main source of the loss: with 151k small files, context initialization cost more than the compression itself — the compression phase went 18.2 s → 0.275 s.
+- **One blob instead of two for dual-indexed languages** (PHP, HTML, C, C++, C#, Ruby, Swift). The same text is stored in both `file_contents` and `text_contents`; previously it was compressed separately for each table. The new `Storage::upsert_file_content_blob` and `Storage::insert_text_file_blob` accept a ready blob; `ContentInput` in `Indexer::write_code_to_db` distinguishes raw text (single files from the watcher), a ready blob (bulk indexing) and oversize.
+- **Prepared-statement cache on the hot write paths** (`prepare_cached` in `upsert_file`, the function/class/import/call/variable inserts, content writes and the old FTS token removal; the connection cache capacity raised to 64). SQL is no longer re-parsed for every file: the write phase went 25.5 → 17.4 s on the PHP site and 20.5 → 18.5 s on the 1C base.
+- **Full time in the `index` output.** Only the core time was printed, while on 1C repos a comparable amount of time goes into extras (metadata, forms, rights, call graph) and flushing the database to disk — half the work appeared in neither the log nor the measurements. The output now shows the full time broken down as "core + extras + flush to disk", plus a separate timing line for the compression phase.
+
+### Testing
+
+- `cargo test --workspace` — 614 passed, 0 failed, 0 warnings.
+- **Before/after data verification — the key check.** The 1C base (`Repo1C-test`, 57,060 files) was indexed by both binaries and all 20 index tables compared: **0 discrepancies**, including `metadata_code_usages` (280,449), `proc_call_graph` (593,514), `data_links` (64,764), `procedure_enrichment` (261,487). On the PHP site the symbol counters matched as well (168,024 functions, 1,458,420 calls), the zstd blob signature is intact and full-text search works.
+- Live smoke of the BSL tools on the re-indexed base: object structure, data links (109 edges for `Document.ЗаказКлиента`), impact map (3,801 code usages for `Catalog.Номенклатура`), term search, read-only SQL.
+- Federated rollout: `bsl-indexer:0.47.0` image on the rag VM, both containers `healthy`; re-index of one base with the new binary — 20 tables compared, 0 discrepancies; smoke over federation against five node bases.
+- Local node — 51 repositories `ready`, MCP reports version 0.47.0.
+
+### Compatibility
+
+- **No reindex required** — the storage format is unchanged, the same zstd at the same level; the before/after table comparison confirms it. The DB schema is unchanged.
+
+## [0.46.0] — 2026-08-02
+
+**Six new languages with AST parsing: PHP, C, C++, C#, Ruby, Swift. There were 8 languages (Python, JavaScript, TypeScript, Java, Rust, Go, BSL, HTML) — now there are 14. The full universal toolset works for the new languages: `get_function`/`get_class`, `find_symbol`, the call graph (`get_callers`/`get_callees`/`find_path`/`get_call_tree`), `get_imports`, `get_file_summary`, `grep_code`/`grep_body`. Plus two serve-layer fixes: a meaningful status for an unknown repo alias, and `.h` language detection based on the repository language.**
+
+### Added
+
+- **PHP, C, C++, C#, Ruby and Swift parsers** (`crates/code-index-core/src/parser/{php,c,cpp,c_sharp,ruby,swift}.rs`). Functions/methods, classes (structs, interfaces, protocols, enums — per language), imports and call-graph edges are extracted; module-level variables for PHP, C#, Ruby and Swift (C/C++ do not emit them). C++ is parsed by the same parser as C, in C++ mode. Extensions: `.php`/`.php5`/`.phtml`, `.c`/`.h`, `.cpp`/`.cxx`/`.cc`/`.hpp`/`.hxx`/`.hh`, `.cs`, `.rb`, `.swift`.
+- **Dual indexing for the new languages.** Like HTML, they are written both to the AST tables and to `text_files` (`is_dual_indexed_language`), so `search_text`/`grep_text`/`read_file` keep working on them alongside structured queries.
+- **`unknown_repo` status** (`ToolUnavailable::UnknownRepo`) for calls against a non-existent repository alias. Previously such a call returned `not_started` — the very same answer as a real repo whose indexing has not started yet, making a typo in the alias indistinguishable from "wait, it is indexing". Set in `mcp::resolve_repo`, `get_stats` and the federation server.
+
+### Changed
+
+- **Kotlin remains a text-only language.** The `tree-sitter-kotlin` 0.3.5 crate pulls in an incompatible tree-sitter 0.20 core — until a crate for 0.25 appears, `.kt` is indexed for full-text search only.
+
+### Fixed
+
+- **`.h` language is detected from the repository language.** The `.h` extension is ambiguous between C and C++; it used to always land in C, so headers in C++ projects were parsed by the C parser. Added `file_types::categorize_file_in_repo(path, repo_language)` — `.h` is treated as C++ only when `repo_language == "cpp"`, and stays C otherwise. The repository language is threaded through `IndexConfig.repo_language` and applied identically on initial indexing and in the file watcher.
+- **Repository language detection by prevailing extension only scanned the root.** `detect_by_extension_majority` looked one level deep, so projects with sources in subdirectories (rocksdb, for one) got no language at all. It now walks the tree, samples up to 4,000 files and skips excluded directories; `.h` is excluded from the vote as an extension shared by C and C++.
+- **`find_path` returned `found=true` for a non-existent symbol** when `from` equals `to`: the "path to itself" shortcut fired before the existence check. Added a `Storage::symbol_known` check (a symbol is known if it appears in `functions` or as a `caller`/`callee` in `calls`, language-aware).
+- **Swift: part of a file lost with CRLF line endings.** The `tree-sitter-swift` 0.7.3 grammar fails to parse a multi-line `"""` literal with a `\` continuation when line endings are CRLF — the parse falls apart and everything after it is lost. On Windows (`core.autocrlf`) this meant losing about 12% of symbols on a real repository (`SystemFileHandle.swift` from swift-nio: 2 functions out of 57). The source is normalized `\r\n` → `\n` before parsing; line numbers are unaffected.
+
+### Known limitations
+
+- **Ruby: a call with no parentheses, receiver or arguments** (`foo`) is parsed by the grammar as an `identifier` and is indistinguishable from reading a local variable — such calls do not enter the call graph. A grammar limitation, pinned by a negative test.
+
+### Testing
+
+- `cargo test --workspace` — 614 passed, 0 failed, 0 warnings.
+- A matrix of 20 universal tools × 3 scenarios (data / call variant / robustness) × 6 new languages = 360 checks against a live serve instance: no discrepancies.
+- Index-vs-source verification on six OSS repositories (laravel/framework, redis/redis, facebook/rocksdb, jellyfin/jellyfin, rails/rails, apple/swift-nio): 3,629 of 3,629 symbols confirmed in the source text at the reported line; missed declarations — 0 out of 1,024 checked.
+- Live `.h` check: redis (C) — `.h` detected as `c` (312 files); rocksdb (C++) — `.h` as `cpp` (614 files), while genuine `.c` files stayed C (3 files).
+- Local rollout (Windows, 45 repos `ready`) and a 5-of-5 smoke test: PHP class parsing, `unknown_repo` on a non-existent alias, `find_path` on a made-up symbol, `get_object_structure` on a BSL repo.
+
+### Compatibility
+
+- **A reindex is required** (`index --force`). The DB schema is unchanged.
+
+## [0.45.2] — 2026-07-27
+
+**The indexer daemon no longer gets stuck in `indexing` status when a worker thread terminates abnormally. Previously, a panic or early exit during the batch-apply phase left the folder in "applying batch changes" status forever — `get_function`/`grep_body` returned the stub indefinitely, with no self-recovery (only a manual daemon restart helped). Added a worker watchdog and correct handling of transaction-commit failure.**
+
+### Fixed
+
+- **Stuck `indexing` status after a worker panic/abort.** A watchdog (`supervise_workers`, 5 s tick) was added to the daemon main loop: it detects abnormally finished worker threads (`JoinHandle::is_finished` during normal operation = panic or early exit), moves the folder to `Error`, and respawns the worker. The fresh worker re-indexes the changed files and returns the folder to `Ready`. Respawns are rate-limited via backoff — at most 5 attempts per 60 s per path, otherwise the folder stays in `Error` (respawn-storm guard).
+- **`Ready` is no longer set for an uncommitted batch.** On `commit_batch`/`begin_batch` failure the data is not in the database (transaction rolled back or never started), yet the worker still set `Ready` — the serve layer would then hand out a stale snapshot as current. Now a commit failure triggers a rollback (new `Storage::rollback_batch`, which clears a possibly hung transaction left after `SQLITE_BUSY` on COMMIT) and sets `Error` instead of a false `Ready`.
+
+### Testing
+
+- `cargo test --workspace` — 579 passed, 0 failed.
+- Unit: `rollback_batch` (idempotent rollback, clears a hung transaction), `allow_respawn` (backoff — 5 respawns allowed in-window, 6th denied, reset after window).
+- Live smoke via panic injection in an isolated daemon: a controlled worker panic right after the `ReindexingBatch` status was set (the exact point where status used to get stuck) → the watchdog caught it (`worker … crashed … respawn`) → re-index → `Ready`; the probe function landed in the index only thanks to the respawn (the first worker panics before applying the batch).
+- Local node (Windows, 46 repos) and federated node (VM rag, 6 repos) — deployed 0.45.2, both `healthy`; functional federated smoke against the Accounting base (`get_object_structure Catalog.Валюты`) via federation — correct structure.
+
+### Compatibility
+
+- **No reindex required** — the change affects only the daemon worker lifecycle; the parser and DB schema are unchanged.
+
+## [0.45.1] — 2026-07-19
+
+**Attribute indexing flag in `attributes_json` + fixed an infinite `daemon.toml` re-read loop in the MCP server on Linux.**
+
+### Added
+
+- **`indexing` in `metadata_objects.attributes_json`.** The `<Indexing>` tag inside `<Attribute>`/`<Dimension>`/`<Resource>` of the object XML now lands in the `indexing` field of `attributes[]`, `dimensions[]`, `resources[]` entries (values `Index`, `IndexWithAdditionalOrder`). `DontIndex` is not written — same rule as `required`: an absent field means «not indexed». Handled in both parsers — Designer format (`xml/object_attributes.rs`) and 1C:EDT format (`xml/edt_mdo.rs`, `<indexing>` tag).
+
+### Fixed
+
+- **`config_watch`: infinite `daemon.toml` re-read loop on Linux.** File access events (open/close for reading) were treated as a reason to re-read the config, while `reload_from_disk` opens that very file — a self-sustaining loop with the debounce period. On the rag VM — ~11,800 re-reads over two hours, continuously, starting at process start. Not reproducible on Windows: its watcher does not report file reads. `EventKind::Access(_)` events are now filtered out (`is_config_change`).
+
+### Testing
+
+- `cargo test --workspace` — 577 passed, 0 failed.
+- Local (`ut-test`, 57,060 files, `index --force` on a clean DB, 65 s): `Document.ЗаказКлиента` has exactly 7 fields with `indexing` — matches the XML (7 `Index` tags, 150 `DontIndex` not written); across the base — 891 objects with `Index`, 64 with `IndexWithAdditionalOrder`.
+- Federated rollout: reindex of all six node bases, `rc=0` each; the acceptance query and `get_object_structure` over federation both return `indexing`.
+- The loop was verified empirically after the fix: start — 1 re-read, two real file edits — +2, two file reads — +0 (was: continuous, every 500 ms).
+
+### Compatibility
+
+- **A reindex is required** for `indexing` to appear in already-built indexes (object XML is otherwise skipped by the mtime fast path). The DB schema is unchanged.
+
+## [0.45.0] — 2026-07-10
+
+**The BSL parser is switched from `tree-sitter-onescript` to the dedicated `tree-sitter-bsl` grammar (0.1.7) with a `bsl-parse` normalization layer. The OneScript grammar was an approximation of the 1C built-in language; `tree-sitter-bsl` parses BSL more accurately, and `bsl-parse` works around known grammar defects (source normalization before parsing). The key effect — platform-type constructors (`Новый Массив`, `Новый ТаблицаЗначений`, `Новый Структура`) no longer enter the call graph as procedure calls. A full reindex is required.**
+
+### Changed
+
+- **BSL grammar: `tree-sitter-onescript` → `tree-sitter-bsl` 0.1.7.** The `tree-sitter-onescript` dependency is removed from the workspace, `code-index-core` and `bsl-extension`. `.bsl` and `.os` files are parsed by the `tree-sitter-bsl` grammar.
+- **Unified BSL parsing layer `bsl-parse` (crate `crates/bsl-parse`).** Source normalization for `tree-sitter-bsl` grammar defects (`normalize_for_parser`) before feeding the parser. The crate is vendored into the repository (a copy of the shared layer used by the bsl-context project) — code-index builds self-contained, without external path dependencies.
+- **Call graph: false edges from constructors removed.** `Новый Массив`/`ТаблицаЗначений`/`Структура`/`Соответствие` and other platform-type constructors are no longer resolved as calls to same-named procedures. On a real UT 11.5: `Массив` 3525 → 0 edges, `total_calls` 2,139,478 → 2,021,203 (−118k false). Symmetric on ZUP and two Accounting bases.
+
+### Testing
+
+- `cargo test --workspace --features enrichment` — 581 passed, 0 failed, 0 warnings.
+- Local live-smoke on a WMS dump (59 modules): indexing, call graph (`get-callees` resolves qualified calls), FTS, `grep-body` — green.
+- Federated rollout on the VM (musl ELF): reindex of all four production bases — `ut` (58k files), `zup` (40k) and two Accounting bases (94k and 90k), `exit=0` each. Effect confirmed on all: `Массив` = 0, only genuine `ТаблицаЗначений` calls remain (4–5 edges).
+
+### Compatibility
+
+- **A full reindex is required** (`index --force`): the call graph is rebuilt by the new parser. The DB schema is unchanged.
+
+## [0.44.4] — 2026-07-08
+
+**The incremental rebuild of an object when a borrower leaves is now fully symmetric with a full reindex: `data_links`, `attributes_json` and `metadata_modules` are restored by merging across ALL remaining copies (base + extensions), not from the single arriving file. On a real UT 11.5 the incremental result after a borrower leaves matched the full rebuild across all 9 extras tables (there was a mismatch in `data_links` and in form-module `config_version`).**
+
+**Separately, the quadratic degradation of the incremental call-graph rebuild on a bulk batch is eliminated: resolution of callee addresses (`callee_proc_key`) is moved out of the per-file loop into a single once-per-batch pass (a shared helper with the full rebuild). On a real UT 11.5 (git roll-forward of 2921 files, Update_20260623 -> Update_20260707) a batch of 3193 file events: 585 s -> 25.6 s (~23x faster); the previous >12 min hang is gone.**
+
+> **Scope of the fix — objects INSIDE extensions (a specific object stops being borrowed: its copy is removed, the dump info is updated). Removing an extension AS A WHOLE is NOT handled incrementally** (no reliable signal: the extension dump info is deleted, not modified, and the watcher delete event is unreliable) — that case is covered normally by a full reindex on daemon restart.
+
+> When a borrower leaves, `remerge_object` rebuilt the object from base+remaining copies for `metadata_objects.attributes_json`, but `data_links` was parsed from the single arriving file (phantom extension edges or lost base edges), and `metadata_modules` was not touched at all → the `config_version` of the borrower's form modules went stale (the orphan module was not rebuilt). A full reindex produced a different result.
+
+### Fixed
+
+- **`data_links` on a borrower leaving — merge across copies.** `update_data_links_for_object` (in `remerge_object`) deletes all edges of the object and rebuilds them from every existing copy across all sub-configs (symmetric to the bulk `index_data_links`); the departed copy is filtered out on its own (no file). Closes: A — copy delete delivered by the watcher (the per-file parse wiped ALL edges, including base ones); A2 — delete lost, only a dump-info MODIFY (phantom extension edges remained); B — an extension copy changed (the base edge was lost).
+- **`metadata_modules` on a borrower leaving — rebuild the object's modules.** New `update_metadata_modules_for_object` (in `remerge_object`): DELETE all modules of the object (by `object_name`, all `extension_name`) + walk the object's `.bsl` modules across ALL roots and re-insert against the fresh dump info. Without it the `config_version` of the borrower's form modules stayed stale (the per-file path does not touch them — the `.bsl` did not physically change). The common logic is extracted into `build_module_row`/`insert_module_row`, reused by the per-file `update_metadata_module_for_file`.
+- **`sub_config_roots` and the dump-info cache (`cfgver_cache`) are computed once per batch** — `parse_config_dump_info` is not re-read for each object/module.
+- **Quadratic degradation of the incremental call-graph on a bulk batch — `callee_proc_key` resolution moved to once-per-batch.** `update_call_graph_direct_for_file` no longer resolves target addresses per file: every `.bsl` re-scanned the entire `proc_call_graph` via `substr(caller_proc_key…)` (no index) and rebuilt the temp map of common-module exports with a full `files x functions` scan (~57K x 260K per file). Now the per-file step only maintains the file's raw edges (index-backed, `callee_proc_key = NULL`), while global resolution and pruning are extracted into a shared helper `resolve_and_prune_direct_edges` (the same one the full `build_call_graph` calls), run ONCE after the batch loop in `run_incremental_extras`. Incremental==full identity for `proc_call_graph` is preserved (shared code + parity tests).
+- **`procedure_enrichment` — full scan replaced by an index seek.** In `update_procedure_terms_for_file` the predicate `proc_key LIKE ?||'::%'` (SCAN of ~257K rows, LIKE did not use the index) is replaced by a range `proc_key >= '<rel>::' AND proc_key < '<rel>:;'` (SEARCH via `idx_pe_proc_key`, confirmed by `EXPLAIN QUERY PLAN`).
+
+### Testing
+
+- Incremental==full symmetry unit tests: `incremental_borrower_drop_keeps_data_links` (A), `..._opis_only_...` (A2), `incremental_ext_copy_change_keeps_base_data_links` (B), `incremental_massive_object_change_matches_full` (C, N=60), and the new `incremental_borrower_drop_rebuilds_metadata_modules`. For the call-graph resolver — a new multi-file parity test `incremental_call_graph_multifile_batch_matches_full` (a batch of 2 common modules cross-referencing exports, incremental==full) plus the existing `incremental_call_graph_direct_matches_full` / `incremental_direct_shared_edge_survives`. The whole workspace is green (538 tests: 192 core + 23 indexer + 323 bsl-extension, 0 failed, 0 warnings).
+- **Federated "evil" measurement on a real UT 11.5** (57k files, 43 sub-configs): a borrower `Document.ЗаказКлиента` leaving the `ent_УправлениеДоставками` extension → the incremental result **matched the full reindex across all 9 extras tables** (`data_links`, `metadata_objects`, `config_manifest`, `metadata_modules`, `metadata_forms`, `role_rights`, `event_subscriptions`, `metadata_code_usages`, `proc_call_graph`). Before the fix `metadata_modules` diverged on form-module `config_version`.
+- **Mass load measurement:** dropping the `МодульУОП` extension's borrowing entirely (1046 file events, 1036 objects rebuilt) — the incremental run took **5.4 s versus ~60 s for a full index** (×11 faster, no degradation from the rebuild).
+- **Mass git-based resolver measurement on a real UT 11.5** (clone of the production gitlab, roll-forward Update_20260623 -> Update_20260707, a 2921-file diff): an incremental batch of 3193 file events (1746 changed + 1447 deleted) processed in **25.6 s** versus **585 s** on the previous per-file resolver (and the previous >12 min hang on a repeat run). A full index of the clone for comparison — 163 s (core 71 + extras 92). The second batch (426 files, 39.7 s) is the cost of the config-level rebuild (`data_links` config, `role_rights`, base reconcile), not the call graph.
+
+### Compatibility
+
+- The data format and DB schema are unchanged — no reindex required. The change touches only the incremental reconcile-area path when a borrower leaves; the initial index, the bulk update, and the per-file path are untouched.
+
+## [0.44.3] — 2026-07-05
+
+**Fixed the quadratic degradation of a bulk update of an existing DB: the old rows of changed files are deleted in a single batch pass while the indexes are still alive, instead of a per-file DELETE with no indexes. At UT scale (2M calls) the delete phase for a 500-file update went 260,385 ms → 234 ms (×1113); a reindex after a mass git pull: hours → minutes.**
+
+> On a bulk update of a non-empty DB (number of changed files > `bulk_threshold`), `prepare_bulk_load()` dropped the secondary `idx_*_file` indexes BEFORE the write loop, and the loop ran 5 `DELETE … WHERE file_id = ?` per file with the indexes already gone → a full table scan per file. On UT (`calls` ~2M rows × thousands of changed files) this meant tens of billions of row scans on a single core — hours instead of minutes. The initial index (empty DB) and the incremental path (< threshold, indexes alive) were not affected and were not changed.
+
+### Fixed
+
+- **Batch deletion of old rows in a single pass while the `idx_*_file` indexes are alive.** The bulk-update branch of a non-empty DB now: (1) drops the functions/classes FTS triggers so the batch DELETE does not fire them row by row; (2) deletes the old rows of the changed files (only those already present in the DB) with `DELETE … WHERE file_id IN (…)` in chunks across the 5 "code" tables (`functions`, `classes`, `imports`, `calls`, `variables`) in a single transaction — while the secondary indexes are still in place; (3) only then drops the B-tree indexes. In the write loop `skip_delete = bulk_mode || is_fresh_db` — per-row DELETEs are no longer run, the old rows are already gone. `finish_bulk_load()` (recreating indexes, triggers, FTS rebuild) is unchanged.
+- **Text/FTS is deliberately not touched in the batch.** `text_contents` has `file_id` as its primary key (deletion is cheap), and the contentless `fts_text_files` pointer is rebuilt idempotently in `insert_text_file` when the file is rewritten — a separate batch pass is unnecessary and would be incorrect (it needs the old text).
+- `drop_indexes_and_triggers()` was split into `drop_indexes()` + `drop_fts_triggers()`; the former function is kept as their composition.
+
+### Testing
+
+- New unit test `test_bulk_update_existing_db`: after a bulk update the `functions`/`classes`/`imports`/`calls`/`variables`/`text` counts strictly equal a fresh index of the same final snapshot (no duplicates), and FTS finds the new symbols and no longer finds the old ones. Whole `code-index-core` green (322 tests, 0 failed), workspace green.
+- Live smoke ON DISK on a real UT 11.5 configuration (a copy, 57k files, 4.3 GB DB, `calls` 2,075,353). A/B of the old binary (0.44.2) vs the new one on a bulk update of 500 changed files: the "DB write" phase **260,385 ms → 234 ms (×1113)**; all 7 count tables identical (the old one is correct but slow). Extrapolated to a git pull of ~15k files: the delete phase goes from hours to seconds.
+
+### Compatibility
+
+- The data format and DB schema are unchanged — no reindex is required, existing indexes are fully compatible. The change touches only the bulk-update path of a non-empty DB; the initial index and the incremental path are untouched.
+
+## [0.44.2] — 2026-07-04
+
+**The required `repo` parameter is now described consistently in the JSON schema of ALL tools with an explicit "REQUIRED" marker, and for `read_file`/`stat_file` the requirement is also spelled out in the tool description. Weak models kept omitting this parameter and the call failed (GitHub issue #3).**
+
+> For `read_file`/`stat_file`, `list_files`, `grep_text`, `grep_code` the `repo` field had no description at all — in `tools/list` the model saw neither the parameter's purpose nor that it was required. Other tools had a description but did not emphasize that it is required. Weak local models (e.g. qwen3-4b via LM Studio) called `read_file` with only `path` and got an opaque error. This change only touches the schema descriptions; behavior and data are unchanged.
+
+### Fixed
+
+- **Consistent `repo` field description across all parameter structs.** Every `repo: String` now carries the doc-comment "REQUIRED. Repository alias (from --path alias=dir…). The call fails without it. List — get_stats." — previously some tools (`read_file`, `stat_file`, `list_files`, `grep_text`, `grep_code`) had no description, and the rest did not stress that it is required. The optional `repo` of `get_stats` (`Option<String>`) is left untouched. `repo` was already required at the type level; this change makes it visible to the model in `tools/list`.
+- **`read_file` / `stat_file`: the requirement of both parameters is spelled out in the tool description.** The `#[tool(description=…)]` now states that `repo` and `path` are required; the `path` field also got a short description.
+
+### Testing
+
+- Whole `code-index-core` green (321 tests, 0 failed).
+- Live smoke of the built `code-index serve` (HTTP, MCP handshake → `tools/list`): for `read_file`, `stat_file`, `list_files`, `grep_code`, `grep_text`, `search_function`, `get_function`, `find_symbol`, `inputSchema.properties.repo.description` is non-empty and contains "REQUIRED", and `repo` is present in `required`; for `get_stats`, `repo` stays optional (`required` empty).
+
+## [0.44.1] — 2026-07-03
+
+**Speeding up the extras phase of a full index: procedure-term raw data collected during the parallel parse, batched full-text rebuild, one-shot materialization of the call graph. A reindex is required to benefit; the index is byte-identical to before.**
+
+> Profiling a full index of BP_TDK (88279 files) showed that the extras phase is dominated not by search but by write phases: per-row index/trigger maintenance and re-reading what the core already parsed. Three changes remove the redundant work without changing the data (verified with sha256 of the graph and the terms against the previous DB). They touch only the FULL-reindex path; the incremental path and the public `code-index` are untouched.
+
+### Changed
+
+- **`procedure_terms`: raw data collected during the parallel core parse (54 s → 17 s on BP_TDK).** Previously the term layer re-read every `.bsl` from disk and filled `procedure_enrichment` row by row, while that table has an FTS5 index with a trigram tokenizer on the `terms` column — tokenizing ~530k rows through per-row triggers was the dominant cost. Now the name/comment/object are collected straight from the hot `parse_results` during the parallel parse (like `code_usages`), the synonym is joined in after the XML synonym layer, and the full text is built with a single `INSERT … VALUES('rebuild')` with the FTS triggers dropped for the bulk insert and guaranteed to be restored afterwards. The terms of BP_TDK's ~530k procedures are byte-identical (sha256 matched).
+- **Call graph: `calls⋈files` materialized once (93 s → 52 s on BP_TDK).** Building `proc_call_graph` (direct edges) and `direct_edge_files` ran the expensive `JOIN … DISTINCT` over `calls⋈files` twice — once per table — and paired with a per-row insert into an indexed table it degraded worse than the sum of its parts. Now the edge set `(path, caller, callee)` is collected into a temp table once with `DISTINCT`, and both tables are filled from it with plain inserts, no repeated JOIN/DISTINCT. The graph is byte-identical (sha256 of all edges matched).
+
+### Testing
+
+- Full `index --force` on BP_TDK: `procedure_enrichment`(mech) = 529756, `metadata_code_usages` = 260166, `proc_call_graph` = 1236771 (direct 1165856), `direct_edge_files` = 2424236 — all match the previous DB; sha256 of the graph and sha256 of the terms are identical. FTS is in sync (fts = content = 529756), trigram search works, FTS triggers and graph indexes are intact after the reindex.
+- Whole workspace green (514 tests, 0 failed), including `procedure_enrichment_inserts_propagate_to_fts`, `procedure_enrichment_update_resyncs_fts`, `incremental_terms_update_and_cleanup`, `proc_call_graph_unique_constraint_works`.
+- Confirmed by diff: the incremental functions (`update_procedure_terms_for_file`, `update_code_usages_for_file`, `update_call_graph_direct_for_file`) are unchanged — the edits are only in the full-reindex path.
+
+### Compatibility
+
+- **A full reindex is required** to get the speedup (the changes are in the full-reindex path). The data format is unchanged: an old index keeps working, and the speedup appears on the next full reindex (`index --force` or recreating `.code-index`).
+
+## [0.44.0] — 2026-07-02
+
+**`did_you_mean` suggestions with similar names on empty `get_function`/`get_class` + cosmetic hint refinements (dynamic calls in the call graph).**
+
+> A follow-up to **Yuri Gridunov**'s call statistics (see 0.43.0): after fixing the case-related misses, two frictions remained — repeated blind calls with name variations, and the false conclusion "0 callers = dead code" on dynamic dispatchers. Both changes live in the serve output layer; no reindex required.
+
+### Added
+
+- **`did_you_mean` in `get_function`/`get_class`.** When both the exact and the case-insensitive lookup return 0, the response includes up to 5 similar names. Candidates come from two complementary sources: prefix-LIKE on the name probing from a long prefix to a short one (12 → 9 → 6 characters — on "hot" 1C name starts like `Провер%`/`Заполн%` a short prefix with a LIMIT collects random names and loses the target) and FTS (token-part matches — names with `_`). Ranking — case-insensitive Levenshtein distance with a sanity threshold (a third of the query length, minimum 3): an empty `did_you_mean` beats five unrelated names sharing a prefix. A "continuation" name (`ЗаполнитьЖурналОпераций` → `…ОперацийМаксимо`) is not penalized for its long tail. Same pattern `get_object_structure` and `bsl_sql` already had.
+
+### Cosmetic changes
+
+- **Clarified the `get_callers`/`get_callees` hint on 0 edges.** Added an explicit warning: "0 callers ≠ dead code" — the function may be invoked dynamically (`Выполнить`/`Вычислить` building the name from strings, a typical dispatcher pattern), with a recommendation to check `grep_code` by a name fragment (it also sees string literals). This closes the frequent model error "no edges → dead code" with text alone, no indexer changes: a measurement across 6 production repos showed ~42 real name dispatchers over 5 configurations — a dedicated dynamic-call candidate table would not pay off.
+
+### Testing
+
+- Unit tests: suggestions on a typo in the word tail, lowercase+typo, no garbage suggestions for a non-existent name, a mirror test for classes. Whole workspace green (code-index-core 321, bsl-extension 168, integration 23, 0 failed).
+- Live smoke locally and via federation: `ОбработатьЗапрсо` → `ОбработатьЗапрос` (wms, single suggestion — noise cut by the threshold), `ПроверитьУсловияТригера` → `ПроверитьУсловияТриггера` first (ut, "hot" prefix), the new call-graph hint from both nodes, ci-fallback regression (`уоп_подключаемыекоманды_выполнить` → 31 locations).
+
+## [0.43.0] — 2026-07-01
+
+**1C code navigation resilient to case and to parameter confusion: case-insensitive symbol lookup, `name` accepted in the call graph, clarified grep tool descriptions.**
+
+> Context. Thanks to **Yuri Gridunov** for detailed statistics of code-index calls from a real bulk 1C-integration documentation session (Composer + Sonnet, ~260 tool calls) — it precisely surfaced the recurring Cyrillic friction points and pointed at what to fix. All three changes are backward-compatible; no reindex required (serve output layer only).
+
+### Added
+
+- **Case-insensitive symbol lookup in `get_function`/`get_class`.** Exact name matching in SQLite is byte-wise and does not fold Cyrillic case: `заполнитьжурнал` failed to find `ЗаполнитьЖурнал` even though the function exists. Now, when the exact match is empty, a fallback via FTS kicks in (the `unicode61` tokenizer folds Cyrillic case) with a strict case-insensitive name check in Rust — the fast exact path is untouched, and the more expensive fallback runs only when the query would otherwise return 0. It catches a common model error ("lowercase name from memory") and works correctly on names with underscores (`уоп_подключаемыекоманды_выполнить`).
+
+### Changed
+
+- **`get_callers`/`get_callees` accept `name` (and `symbol`) as an alias for `function_name`.** Models regularly confused the parameter key with `get_function`, and a blind call failed with the opaque parser error "missing field function_name" — a wasted turn. Added a serde alias (as `find_symbol` already had). The canonical `function_name` works as before.
+- **Clarified `grep_code` and `grep_body` descriptions.** The `grep_code` description wrongly framed it as a complement to `grep_body` ("everything grep_body misses"), whereas it actually searches the FULL file text (module-level + bodies) — a superset. The descriptions now explicitly distinguish: `grep_code` — all occurrences of a string/name anywhere in the file (routing tables, `Перем` declarations, literals + bodies); `grep_body` — bodies only, but tells you which procedure the match is in. This removes the frequent miss "used grep_body for a service name and missed its module-level usage".
+
+### Testing
+
+- Unit tests: ci-fallback (Cyrillic + underscores + no false positives), class fallback, alias deserialization. Whole workspace green (code-index-core 319, bsl-extension 168, 0 failed).
+- Live smoke on real data: local serve (lowercase `get_function` → function body) and the federated node via federation (lowercase `уоп_подключаемыекоманды_выполнить` on `ut` → 31 locations).
+
+## [0.42.2] — 2026-06-30
+
+**1C:EDT export format support: parsing of `.mdo` metadata and parser protection against binary modules.**
+
+> Context. Configurations exported via 1C:EDT (rather than the Configurator) are stored in a different layout: metadata lives in XML `.mdo` files (the `mdclass` schema), and vendor-protected modules are written by EDT under the `.bsl` extension with a binary image instead of text (the Configurator uses `.bin` for the same modules). This release adds `.mdo` parsing and fixes the parser degradation on such binary "`.bsl`" files.
+
+### Added
+
+- **Parsing of 1C:EDT export metadata (`.mdo`).** A new layer builds the same tables (`metadata_objects`, `data_links`, `metadata_forms`, `event_subscriptions`) as for the Configurator export, by walking `src/<Type>/<Name>/<Name>.mdo` across all object types — downstream tools (`get_object_structure`, `get_object_profile`, `get_data_links`, `get_register_writers`, `get_form_handlers`, `get_event_subscriptions`, `find_references`, etc.) work on EDT repositories unchanged. Format detection is by `Configuration.mdo` at the export root.
+
+### Fixed
+
+- **Indexing hang on binary "`.bsl`" files from EDT exports.** EDT stores vendor-protected modules as `ObjectModule.bsl` containing a 1C binary container (signature `FF FF FF 7F`) instead of source text. tree-sitter degraded quadratically on such input — a single 1.3 MB module took tens of minutes on one core and hung indexing of the whole repository. Added binary-content detection on raw bytes (in `file_hash`): a file with the container signature or a NUL byte is flagged binary and not handed to the parser. As a safeguard against any other pathology — a per-file parse deadline (10 s) in the BSL parser. Verified on ~81,000 `.bsl` files (5 configurations, both Configurator and EDT exports): no false positives.
+
+### Testing
+
+- 316 unit/integration tests green (including 2 new ones for binary-content detection).
+- Live smoke on an EDT export of an Accounting base (23,155 files): indexing in 70 s versus an indefinite hang before the fix.
+- Regression on a federated Configurator repository of an Accounting base (90,024 files, force-reindex from scratch): index statistics matched the previous run bit-for-bit — the protection is strictly a no-op on normal repositories.
+
+## [0.42.1] — 2026-06-29
+
+**Cosmetic release: internal code-cleanliness fixes with no behavior change. Tool output, indexing and the protocol are untouched. No reindex required.**
+
+> Context. Targeted cleanup following an external code review: removed a `clippy::never_loop` pattern, de-duplicated the grep output layer, and dropped a dead function in the indexer. Observable behavior is identical to 0.42.0 (verified: 314 tests green, grep output diff before/after, live smoke on both nodes — local and federated).
+
+### Changed
+
+- **Grep-layer dedup: shared streaming helper `grep_zstd_stream`.** `grep_code_filtered` and `grep_text_filtered` (storage) shared ~80 lines of identical post-processing (zstd decode → per-line regex → `context_lines` → `limit`/byte caps). Extracted into a single helper taking a row iterator — this also removes the intermediate materialization of all blobs into a `Vec` (early exit on caps no longer reads the rest). Output contract (`GrepTextMatch`, ordering, `truncated`) unchanged.
+- **`extract_docstring` (Python parser): removed the `clippy::never_loop` pattern.** A `for` loop that always ran a single iteration with an unconditional `break` was replaced by an explicit read of the first body node (`next()?`). Docstring extraction logic is identical.
+
+### Removed
+
+- **Dead function `collect_candidates_standalone` (indexer).** A full duplicate of the `collect_candidates` method with no caller anywhere in the codebase. The live candidate-collection path (`Indexer::collect_candidates`, used by `full_reindex`) is untouched.
+
+## [0.42.0] — 2026-06-24
+
+**Result cache + session re-delivery dedup + PER-FILE freshness and invalidation — all INSIDE serve. Stripping of internal `_meta` moved into serve: a separate mcp-cache-ci proxy in front of serve is no longer needed in the ci chain. No reindex required (all on the serve output layer).**
+
+> Context. Caching of responses lived in a separate mcp-cache-ci proxy in front of serve — an extra hop, a second cache layer, and session identity (for dedup) did not reach serve cleanly. Moving it inside serve makes it self-sufficient in the ci chain. Freshness and invalidation are PER-FILE (parity with the removed proxy): only requests that actually depend on the changed file are affected, not the whole repo.
+
+### Added
+
+- **In-serve result cache (`ServeCache`, `serve_cache.rs`).** Cross-session (key `{repo}|{tool}|{sha256(args without repo)}`, NO session — results reused across conversations), stores the full response, TTL 3600s (a safety net for invalidation). Only LOCAL repos cached; `health`, `get_stats` and federation repos bypass the cache (federation is cached on the remote node).
+- **Session re-delivery dedup (`SessionDedup`, `serve_dedup.rs`).** Keyed by `mcp-session-id` from the HTTP header (rmcp puts `http::request::Parts` into `context.extensions`). Elides tabular-result rows (`result.rows`) already delivered IN THIS session, with a `rows_elided_already_delivered:N` marker. Non-tabular responses untouched. A layer separate from the cache: the cache stores the full (session-independent) result, dedup trims at delivery per session. Another session with the same query gets the full result.
+- **Per-file freshness + event-based watcher→serve invalidation.** The daemon sends `POST /mark-dirty {repo, files:[{path, mtime}]}` (files changed on disk with observed-mtime, index not caught up) and post-commit `POST /invalidate {repo, file_paths}`. A response is NOT cached and NOT served from cache **only** if its source file is dirty — disk observed-mtime newer than `index_mtime` from the response's `_meta.file_mtimes`; per-file invalidation drops only the keys depending on that file (a "file → keys" reverse index). Requests about untouched files are unaffected — **no whole-repo coarsening**. New serve HTTP routes: `/mark-dirty`, `/invalidate`, `/cache-stats` (observability). Wired by a `[[cache_targets]] url="http://127.0.0.1:8013"` line in `daemon.toml` (the daemon sends one payload to all targets). `invalidate` with `all`/without `file_paths` is a full/repo reset (force-reindex).
+
+### Changed
+
+- **Stripping of internal `_meta` moved from the proxy into serve (`finish` → `strip_meta`).** The output throat `finish` (all `call_tool` return paths, including the federation forward) removes `_meta` (`dependent_files`/`file_mtimes`) from the client response — three forms: `content[*].text` (nested JSON), top-level `{result,_meta}`, `structuredContent._meta`. By delivery time `_meta` has already been used by the freshness/invalidation channel; the model does not need it and it bloats context. Mirrors mcp-cache-ci's `strip_meta`. Result: serve is self-sufficient in the ci chain — a separate ci proxy cache is not mandatory, clients talk to serve directly.
+- **Serve cache and dedup are enabled by default** (TTL 3600s — hardcoded; moving to config is the next step). Not affected: indexing (the daemon compares `content_hash`/`mtime` over SQLite, not over output), data/call graphs, BSL tools, the federation protocol, **concurrent request handling** (multi-threaded tokio + SQLite connection pool — short cache locks, never held across `await`).
+
+## [0.41.0] — 2026-06-23
+
+**Criterion selector `name_like` (+ optional `meta_type`) on `get_object_structure`: structures of ALL objects of one theme in a single call, without enumerating names. No reindex required (serve layer). Empirically the model adopts it readily — it is a parameter on an already-used tool, unlike generic SQL.**
+
+> Context. The model queries object structures one by one (a series of `get_object_structure`). The list form `full_names[]` is not adopted spontaneously (it requires enumerating all names first). A flat name-based predicate collapses that series into one turn — and, unlike `bsl_sql`, it is adopted without a system-prompt mention (it rides the already-used `get_object_structure`).
+
+### Added
+
+- **`name_like` and `meta_type` on `get_object_structure`.** `name_like` is an object-name substring (without the type prefix): the server expands the criterion via a single SQL over `metadata_objects` and returns the structures of ALL matching objects in one call. `meta_type` (optional, RU/EN: `Catalog`/`Document`/…) narrows to a single metadata kind. Combines with `sections=` (narrow sections per object). Response — `{matched, truncated, results:[...]}`. Broad-criterion guard: cap of 50 objects (`truncated=true` if more matched — refine the criterion). A shared `expand_object_criterion` helper lays groundwork for the same convention on other object-keyed tools. Substring matching is case-sensitive for Cyrillic (SQLite `LIKE` is case-insensitive for ASCII only).
+
+## [0.40.0] — 2026-06-22
+
+**Strip internal technical fields (internal ids, hashes, timestamps) from model-facing MCP responses. Fields the model never uses are removed at response serialization time — the payload is cleaner and consistently shorter, independent of model behavior. No reindex required (all on the serve output layer).**
+
+> Context. In an E2E run on UT-11, `cache_read` was ~90% of the token bill — every turn re-reads the whole accumulated context, so any useless field in a tool response is amplified on every turn. An audit of output fields isolated a "plumbing" class — internal row/file identifiers, node/content/AST hashes and the index timestamp — that the model needs in no tool.
+
+### Changed
+
+- **Internal technical fields are stripped at the response serialization choke point.** The `strip_plumbing_recursive` helper recursively (over objects and arrays — the top level of many tools is a `Vec<Record>`) removes the keys `id`, `file_id`, `node_hash`, `content_hash`, `ast_hash`, `indexed_at` from the response body. It is called at two points covering both serialization paths of model-facing responses: `wrap_with_meta_extra` (the `{result, _meta}` wrapper — `get_function`/`get_class`/`get_callers`/`get_callees`/`get_call_tree`/`find_symbol`/`get_imports`/`get_file_summary`/`read_file`/`list_files`/`grep_*`/`search_*` and others) and `to_json` (flat responses without the wrapper — `stat_file`/`get_stats`/`health`). The strip runs BEFORE `_meta` is attached, so `_meta.dependent_files`/`file_mtimes` (the input for event-based cache invalidation) are untouched. Under federation the strip runs on each node locally (the federation forward passes already-stripped JSON through).
+- **`stat_file` no longer returns `content_hash`/`indexed_at`** — the `size`/`mtime`/`lines_total`/`language`/`exists`/`category` fields are kept; the tool description is updated.
+- **Untouched:** the `path`/`file_path`/`body`/signature fields, the data-link and call graphs, the BSL tools (their own wrapper is built from SQL rows and carries no plumbing), the cache invalidation mechanism, and indexing (the daemon compares `content_hash`/`mtime` directly against SQLite, not against the model-facing output).
+
+## [0.39.0] — 2026-06-18
+
+**The daemon no longer hangs on bulk git updates of 1C repos. A metadata-composition change (`Configuration.xml` in the batch) now rebuilds only the lightweight XML enrichment layer, not the heavy code layer — no reindex required (daemon serve watcher-path change).**
+
+> Context. On a bulk update of a local BSL repo (`git reset --hard` / `pull` to a distant commit) the watcher collects a batch containing a changed `Configuration.xml`. Previously this triggered a FULL `run_index_extras` right inside the watcher loop — rebuilding `metadata_*` + `data_links` + `role_rights` + `code_usages` + `procedure_terms` (hundreds of thousands of procedures) + the call graph, in a "live" context competing with the `serve` reader for SQLite → busy-spin at 100% CPU for tens of minutes. Reproduced identically on the VM (docker) and Windows.
+
+### Fixed
+
+- **A `Configuration.xml` change no longer triggers a full re-enrichment in the watcher loop.** In `run_incremental_extras`, the `config_changed` branch (fires on any changed `Configuration.xml` — which is rewritten on every `DumpConfigToFiles` export, not only on real composition edits) used to `return run_index_extras(...)`, a full heavy pass. It now rebuilds only the **XML layer** and does NOT `return`: the heavy code layer is kept current by per-file `update_*_for_file` over the batch's `.bsl`. On full UT (57K files) a config-changed batch of 43 `Configuration.xml` files takes **~21 s** (XML layer) instead of a multi-minute hang. The object list stays correct — adding/removing/renaming an object is reflected in `metadata_objects` equivalently to a full rebuild (3 regression tests).
+
+### Changed
+
+- **`run_index_extras` split into an XML layer and a code layer.** The new `run_index_extras_metadata_layer` builds the object list, structure (`attributes_json`), data links, config-level edges, role rights, synonyms, forms, subscriptions, modules — an XML-export walk (seconds even on UT). The heavy code layer (`metadata_code_usages`, `procedure_terms`, `build_call_graph`) is called from the full `run_index_extras` afterwards, and is left untouched on the incremental path on a composition change. A full rebuild still runs on initial reindex and `index --force`. Full-pass behavior is unchanged: phase order preserved, dependencies (attributes/synonyms → metadata_objects, call_graph → forms/subscriptions) respected.
+
+## [0.38.1] — 2026-06-17
+
+**The daemon no longer rebuilds enrichment tables for nothing on startup. A daemon restart on unchanged data is now instant (previously every start = a full rebuild of `metadata_*`/terms/call-graph, minutes on large configs).**
+
+### Fixed
+
+- **Gate against idle re-enrichment on daemon startup.** On startup, after `full_reindex` (mtime fast-path), the daemon **unconditionally** ran the full `index_extras` — rebuilding `metadata_objects`/`data_links`/`role_rights`/`code_usages`/`procedure_terms` (hundreds of thousands of procedures)/`forms`/`subscriptions`, even when mtime reported "0 changes". On the full federation (UT, ZUP and two Accounting bases) that was ~15 minutes wasted on any container restart. Now `index_extras` is skipped when: the DB already existed, `full_reindex` indexed 0 and deleted 0 files, and the processor's extras tables are non-empty (`LanguageProcessor::extras_present` — for BSL: non-empty `metadata_objects` + mechanical terms in `procedure_enrichment`). Any data change, a new DB, or empty extras → a full pass as before; incremental edits are still handled by the watcher loop via `index_extras_for_files`.
+- **Limitation:** the gate does not track the extras SCHEMA. If a release adds a new extras table, it will stay empty on unchanged data — such releases need a one-off full rebuild (`index --force` or a DB rebuild). Noted in the `extras_present` doc comment.
+
+## [0.38.0] — 2026-06-17
+
+**Guard the output against client-side disk offload. Heavy responses (a large module's map, long arrays of values/sources/attributes) are trimmed at the source to a sample or a compact form — with a marker for the full count — and are no longer dumped to a file by the client at the cost of a lost turn. No reindex required (all on the serve output layer).**
+
+> Context. The client (`claude` CLI / Claude Code) caps a single `tool_result` streamed inline into context (`MAX_MCP_OUTPUT_TOKENS` ≈ 25,000 tokens). A response over the cap is **dumped to a file on disk** by the harness, handing the model only a path + preview — after which structured inline access is lost and the model greps the file in extra turns. The core hard caps (`grep_*` 1 MB, `read_file` 2 MB) miss this class: it's not one giant string but a long array (enum values, subscription sources, the function map of a large module).
+
+### Added
+
+- **`cap_response` — a generic response-size guard (serve layer).** While the serialized JSON exceeds the `[cap].max_response_bytes` budget (default **48,000 bytes** ≈ 12–24k Cyrillic tokens, comfortably under the 25k-token offload), it repeatedly finds the heaviest array-valued key and halves it, leaving `<key>_total` (original element count, set once) and `<key>_truncated: true` next to it. Only **arrays** are trimmed — large strings (`read_file`/`grep` content) are untouched. Gated by the `[cap].cap_tools` list (default: `get_event_subscriptions`, `bsl_sql`, `find_references`, `get_register_writers`).
+- **`[cap].cap_enabled` — a global on/off switch for `cap_response`** (default `true`). Takes precedence over the list: when `false`, cap applies to nothing regardless of `cap_tools` (structural omit and the navigational body cap work independently). Needed because an empty `cap_tools` means “default set”, not “off”.
+- **`omit_oversize_sections` for structural tools (`get_object_structure`).** Where an array/map is the FULL authoritative answer (a 1C object's structure), a partial sample would lie (“here are all the enum values”). So the heaviest section (array > 1 element / map > 16 keys) is dropped WHOLESALE with `<section>_omitted: true` + `<section>_count: N` — a section is either fully present or honestly omitted with its count.
+- **Navigational body cap (`get_function`/`get_class`).** A body longer than `[cap].max_function_body_chars` (default **15,000 chars**) → a navigational stub: head + tail + marker + a hint to `read_file(line_start,line_end)` / `grep_body`. A body is connected code, so it's cut head+tail (not by the middle) with an exact line range.
+- **`[cap]` config:** `max_response_bytes`, `cap_tools`, `cap_enabled`, `max_function_body_chars` (all optional; 0 for the byte/char thresholds disables the guard).
+
+### Fixed
+
+- **`get_file_summary` on giant modules no longer goes to disk offload.** `get_file_summary` is a core tool wrapped via `wrap_with_meta_extra`, where `cap` doesn't apply to the core; adding it to `cap_tools` didn't cover it. On `УправлениеДоступомСлужебный` (972 functions, 47,399 lines), even the compact map (`MAP_DETAIL_CAP = 120` — names+lines only, no signatures/docstrings) was **100,164 chars** on a single line → the client dumped the response to a file and the turn was lost (weak spot #4 of the UT-11 run, Q08 “RLS”). Now the core calls `cap_response` before wrapping: a sample + `functions_total` + `functions_truncated` remain, and the response is returned inline.
+
+### Measurement (UT-11 run, Q08 “access rights / RLS”, Sonnet)
+
+- On the fixed build: **0** disk offloads over the run, the largest `tool_result` was **19,128 chars** (~4.8k tokens) against the ~25k-token offload threshold. 38 `*_truncated` markers in the trace = the cap mechanisms working as intended. Verdict on the question — COMPLETE.
+- Smoke via federation (production UT, `УправлениеДоступомСлужебный` 47,399 lines): `functions_total: 972`, `functions_truncated: true`, compact map — response inline (~48 KB), offload eliminated.
+
+## [0.37.1] — 2026-06-16
+
+**Deterministic counts in BSL tools + compact subscription output when filtered by `source`. The model cites a ready-made number instead of recounting an array (LLMs undercount long lists), and `get_event_subscriptions` with a filter no longer blows past the output limit. No reindex required.**
+
+### Added
+
+- **`get_register_writers`: counts `writers_count` / `writes_to_count` + `*_count_by_type`** (per register type). The model used to recount the array of names by hand and undercount (43 → “40”); now the number is ready in the response.
+- **`get_object_structure`: a `counts` section** — element count for each array section (`tabular_sections`, `attributes`, `dimensions`, `resources`, `enum_values`…). Fixes the tabular-section undercount (10 → “5”).
+
+### Changed
+
+- **`get_event_subscriptions` with a `source` filter: instead of the full `sources` array — `sources_count` + `matches_source: true`.** For global events (`ПередЗаписью` etc.) subscriptions carry `sources` of up to hundreds of types (one had 256); echoing them ballooned the response past 80K chars and broke the output limit (the response went to a file, a turn was lost). Now for `source=РеализацияТоваровУслуг`: 80,183 → ~2,700 chars. Without a filter — the full `sources`, as before.
+
+## [0.37.0] — 2026-06-16
+
+**Output token economy + robust resolution of 1C object names in BSL tools. Compact output format for `grep_*`/`list_files`; single-object BSL tools accept Russian type prefixes and no longer depend on the argument key name; `find_symbol` tolerates name synonyms. Output-format and resolution changes — NO reindex required.**
+
+### Changed
+
+- **Compact output format for `grep_body`/`grep_code`/`grep_text`/`list_files` (core).** Instead of JSON objects with repeated keys (`{"line":N,"content":"X"}` on each of thousands of matches) — flat strings grouped by file: `grep_text`/`grep_code` → `"N: content"`; `grep_body` → `"<name> (<kind>) L<start>-<end>: <lines>(+N)"`; `list_files` → `"<path> | <lang> | <N> lines | <size>"`. The structural JSON overhead was the main token cost (~55% of the response). `_meta` (dependent_files/file_mtimes) is assembled separately and not duplicated. Default `limit` lowered 100 → 30.
+- **`find_symbol`: sharpened description.** Call by bare name only for a unique name; for standard handlers / common names — pass `path_glob` right away (otherwise hundreds of locations, `truncated`).
+
+### Fixed
+
+- **BSL tools accept Russian type prefixes.** `get_object_structure`/`get_register_writers`/`get_data_links`/`find_data_path`/`find_references`/`get_object_profile`/`get_event_subscriptions`/`get_form_handlers`/`bsl_sql` with `object="Документ.X"` used to return empty (the index stores English types only). Input normalization via the `META_FORMS` table (`canonical_meta_type`/`normalize_object_ref`/`normalize_sql_object_refs`): `Документ.X` → `Document.X`; for `bsl_sql` — both singular and plural forms in query literals. Eliminates a wasted cascade: an empty `get_register_writers` triggered an avalanche of `read_file` over ManagerModule.
+- **Single-object BSL tools no longer depend on the key name.** `get_register_writers`/`get_data_links`/`find_references`/`get_object_profile`/`get_object_structure` take the value of the first non-empty string argument, skipping service keys (`repo`/`depth`/`limit`/…) — the model no longer trips on `object` vs `full_name`.
+- **`find_symbol` accepts `symbol`/`query` as aliases of `name` (core).** A call with `symbol=…` previously failed with the opaque deserializer error “missing field `name`” (a wasted turn). `#[serde(alias)]` — synonyms are picked up as `name`; the schema contract (required `name`) is unchanged.
+
+### Benchmark (UT 11.5, question “lifecycle of РеализацияТоваровУслуг”)
+
+- Old format (baseline): **1,282,904** tokens / 33 turns.
+- Compact format WITHOUT name resolution: **2,172,388** / 48 (+69% — empty `get_register_writers` drove a `read_file` cascade).
+- Compact format + name resolution (final): **917,247** / 24, clean re-run **926,170** / 27, `retry=0`, verdict COMPLETE — vs baseline **−28%**.
+
+## [0.36.0] — 2026-06-14
+
+**CORE B: the call qualifier is preserved in the graph. BSL stores `callee` glued (`Module.Method`) — consistent with the other languages; precise resolution of common-module and manager-module calls. Direct-edge resolution 52% → ~80-82%, zero false bindings.**
+
+> ⚠️ **Full reindex required** (`index --force` per repo): the format of `calls.callee` (BSL) and `proc_call_graph` changed. The mtime fast-path won't pick it up. On federation — rebuild all nodes synchronously.
+
+### Changed
+
+- **CORE (engine, affects all languages): BSL no longer drops the call qualifier.** When parsing `Module.Method()` the engine previously stored only the bare method name in `calls.callee` — the qualifier `Module` lives in a sibling node of the onescript tree and was ignored, making BSL the only language that lost the receiver. BSL now glues `receiver.method` the same way Python/JS/Go/… already store `obj.method`, so the call graph is uniform across languages. Bare local calls stay a bare name. **Affects `get_callers`/`get_callees`/`find_path`/`get_call_tree` and `find_path_bsl` output for BSL: qualified calls are now shown as `Module.Method`** (like Python's `requests.get`) — more informative, but a format change for BSL queries. Non-BSL languages are untouched (verified by an A/B run on 6 languages Python/JS/TS/Java/Go/Rust — `calls` output is byte-for-byte identical).
+
+### Added
+
+- **Common-module call resolution by qualifier (Tier C).** `ОбщегоНазначения.ЗначениеРеквизитаОбъекта` → the exact address `…/CommonModules/ОбщегоНазначения/Ext/Module.bsl::ЗначениеРеквизитаОбъекта`. Removes the dependency on the "unique export" heuristic (v0.35.0): names exported in ≥2 common modules now resolve precisely via the qualifier. On full UT: 88.3% of common-module calls bound, zero false.
+- **Manager-module call resolution by chain (Tier D).** `Справочники.Номенклатура.НайтиПоКоду` → `…/Catalogs/Номенклатура/Ext/ManagerModule.bsl::НайтиПоКоду`. Collection→dump-folder mapping (`Справочники`→`Catalogs`, irregular plurals handled) from the single `META_FORMS` table. Platform manager methods (`ПустаяСсылка`, `НайтиПоКоду`) not exported in the object module correctly stay NULL. On UT: ~28k manager calls bound.
+- **Object-call pruning by qualifier.** Glued `Объект.Метод` where the qualifier is a local variable / platform object (`Запрос.Выполнить`, `Выборка.Следующий`, `НаборЗаписей.Записать`) are removed from the graph more precisely than the static ballast list: knowing the receiver isn't a module, even colliding method names are cut. Three guards against losing real edges: common modules, metadata collections (`Справочники`/`Документы`/…) and multi-dot manager chains are spared; only unresolved (`callee_proc_key IS NULL`) edges are cut. Object noise is cleaned — `get_callees`/`get_call_tree` are readable (previously drowned in `Запрос.Выполнить` leaves).
+
+### Resolution summary
+
+- Full UT (57k files): direct-edge resolution **52.1% → 82.1%**, **zero false bindings**. Federation (UT, ZUP and two Accounting bases): **80-82%**.
+
+### Tests
+
+- BSL: `resolves_callee_key_by_module_qualifier` (Tier C — collision resolved by qualifier), `prunes_object_calls_protects_modules_collections_chains` (Tier D + prune — spares modules/collections/chains, resolves manager), updated `test_parse_bsl_calls` (gluing). 150 BSL + 277 CORE green. Multi-language A/B (Python/JS/TS/Java/Go/Rust): non-BSL graph byte-for-byte identical to the old binary.
+
+## [0.35.0] — 2026-06-14
+
+**BSL call-graph fix: same-named procedures are split by module, call targets resolve to an address, platform ballast is pruned. CORE: call-graph edges carry the source file path.**
+
+> ⚠️ **Full reindex required** (`index --force` per repo): the data format of `proc_call_graph` and the `calls` query output changed. The mtime fast-path won't pick it up — a force reindex is needed. On federation — rebuild all nodes synchronously.
+
+### Fixed
+
+- **The call graph no longer collapses same-named procedures.** `caller_proc_key` in `proc_call_graph` is now `<rel_path>::<name>` (same as `procedure_enrichment.proc_key`) instead of a bare name — built via `JOIN calls ⋈ files`. On the full UT config, 240 modules each defining their own `ОбработкаПроведения` stopped collapsing into 2 rows → 259 distinct callers. Previously `find_path_bsl`/`bsl_sql` over the graph couldn't tell the documents apart.
+
+### Added
+
+- **`callee_proc_key`: call-target address resolver (stage 4e).** Two safe tiers: (a) local call — a bare callee name declared in the caller's own file → `<file>::<callee>`; (b) unique export — the callee name is exported in exactly one place in the configuration (detected by `Экспорт` in the signature) → that address. The core strips the module qualifier when parsing a call (`Module.Method` → `Method`), but target uniqueness removes the ambiguity. Ambiguous / dynamic (`Object.Method` via a variable) / platform → `NULL` (a false binding is worse than an honest NULL). On UT, 52% of direct edges resolve.
+- **Platform ballast pruning.** Edges into collection/object methods and platform global functions (`Вставить`/`Добавить`/`НСтр`/`Структура`…, whose target is outside configuration code) are removed from the graph (~35%; on UT 1.14M inserted → 739K). Two guards against losing real edges: only unresolved edges are removed (`callee_proc_key IS NULL`); a name that is exported anywhere in the configuration (`Записать`/`Получить`/`Удалить`…) is left untouched entirely (adaptive per UT/BP/ZUP — each computes its own export set).
+- **CORE: `get_callers`/`get_callees`/`find_path`/`get_call_tree` return the source file path of each edge** (`path`, resolved `file_id → files.path`). This distinguishes same-named functions from different files — previously the output showed a bare name + numeric `file_id` ("N indistinguishable rows"). Language-neutral, no reindex required (query layer only).
+- **`find_path_bsl`: walk by resolved address.** Between hops the link is `COALESCE(callee_proc_key, callee_proc_name)` — by the target address where present, otherwise by the raw name (unresolved leaf / synthetic edges). `from`/`to` accept `<rel_path>::<name>` (a bare name is allowed for unresolved leaves). Path edges now include `callee_key`.
+
+### Tests
+
+- BSL: `resolves_callee_keys_local_unique_export_and_null` (both tiers + honest NULL), `prunes_platform_balast_keeps_real_and_resolved` (pruning + IS NULL guard + collision guard on an exported name), `incremental_direct_shared_edge_survives` rewritten for path semantics. CORE: 277 tests green (including `get_call_tree` with `file_id` in the CTE).
+- Reindex impact measurement (honest Rust A/B on full UT, 57K files): total time 54.15s → 54.86s (+0.7s, noise), call-graph build phase 18.35s → 27.18s (+8.8s). rag-query card #1524.
+
+## [0.34.1] — 2026-06-13
+
+**Diagnostic message when the daemon is unreachable + fix of incorrect `CODE_INDEX_HOME` docs (issue #1).**
+
+### Fixed
+
+- **The "daemon not running / runtime-info missing" message now explains the real cause.** The `serve` process and the daemon find each other only through `$CODE_INDEX_HOME/daemon.json`. If `serve` has the variable unset or pointing at a different folder than the daemon, runtime-info is not read — and tools reported "daemon not running" while the daemon was alive. The message now states the expected `daemon.json` path, the current `CODE_INDEX_HOME` value, and the common cause: on Linux/macOS, GUI MCP clients (VS Code, Continue, Cline) **do not read `~/.bashrc`/`~/.zshrc`**, so a `serve` they launch with an empty `env` never sees the `CODE_INDEX_HOME` from your shell, while the daemon started from a terminal does. Fix — set `CODE_INDEX_HOME` to the same absolute path in the client's MCP config `env` section. Affects `client::base_url` (all data tools and `daemon status`) and the `health` MCP tool. Reproduced on a clean Linux box with the release binary. Issue #1 (reported by @NorfLoud).
+- **README/README_RU: removed an incorrect fallback claim.** The docs promised that with `CODE_INDEX_HOME` unset the daemon falls back to `%APPDATA%`/XDG — no such fallback exists in the code; the variable is required. Replaced with the correct statement + added a Troubleshooting section about `CODE_INDEX_HOME` mismatch.
+
+## [0.34.0] — 2026-06-12
+
+**Automatic terms fallback in `bsl_sql`: an empty result over procedure tables now returns `search_terms` output right away, not just a hint.**
+
+### Added
+
+- **`bsl_sql`: `terms_fallback` field on empty results over procedure tables** (`functions` / `proc_call_graph` / `procedure_enrichment`). Models ignore the v0.33 hints (5 live runs — 0 `search_terms` calls), so on `row_count == 0` the terms search now runs automatically inside the same call: words are taken from SQL string literals (`'%ПоШтрихкоду%'` → "по штрихкоду") and text `params`, normalized the same way as terms (`split_identifier`: CamelCase split, lowercase, ё→е, words ≥3 chars), then the same trigram FTS query as `search_terms` (OR over words, LIMIT 10). Response: `terms_fallback = {fts_query, results: [{proc_key, signature, score}]}`. The model uses data "in hand" as a regular result — live run test03: an empty `IN ('ХранилищеОбщихНастроек', …)` → fallback returned `ОбщегоНазначенияВызовСервера::ХранилищеСистемныхНастроекСохранить/Загрузить/Удалить`, and the model put them into the report as fact (the hint in the same run was ignored again).
+- **Trigger boundary:** only BSL repos with populated enrichment tables (no terms / old index → silently no fallback, previous behavior); queries not touching procedure tables (e.g. `metadata_objects`) — previous hint. When the fallback fires, no hint is added — the structure is self-documenting; when it doesn't, the v0.33 hints stay as they were. On exam-style questions (196, rerun 2026-06-12) the fallback is neutral — it never fired; its niche is searching code by meaning.
+- **Known limitation:** the `signature` field in `results` is the enrichment mechanism fingerprint (`mech:v1`), not the procedure signature.
+
+### Tests
+
+- Unit tests: `sql_string_literals` (escaped `''`, wildcards), `searched_proc_tables`, `terms_fallback_for_sql` (hits via literals and via text params; `None` without terms / without words ≥3 chars).
+
+## [0.33.0] — 2026-06-11
+
+**Empty procedure search on a BSL repo now hints at search_terms — for search_function, grep_body, grep_code, find_symbol.**
+
+### Added
+
+- **An empty procedure-search result on a BSL repo now hints at `search_terms`** — across `search_function`, `grep_body`, `grep_code` and `find_symbol`. Per-call analysis of the 11.06 benchmark (10 business tasks on UT-11) showed the model reflexively picks exact search (by name or text) for "find a procedure by meaning" and never reaches `search_terms` (0 calls per run), while the residual empty calls are exactly its niche (handlers living in common modules: prefixing, default values, exchange conflicts — grep over the object's own modules returns 0 because the code lives in an SSL module wired via an event subscription). A live test03 run showed three consecutive empty `grep_body` calls (steps 17/20/21), none of which pointed to `search_terms` — so the hint is attached to EVERY empty response of these tools, not just `search_function`. Same trick that worked in 0.31 (hints break chains of blind retries). Non-BSL repos keep the old hints; `search_class`/`grep_text` were left untouched (terms index procedures, not classes or xml/text).
+- **An empty `bsl_sql` result set (0 rows) hints too.** A live run showed Opus reflexively prefers `bsl_sql` (LIKE over `metadata_objects`/`functions`) for "find a procedure by meaning" rather than search_function/grep, and never switches to search_terms. So on `row_count == 0`: if the query touched procedure tables (`functions`/`proc_call_graph`/`procedure_enrichment`) the hint points to `search_terms`; otherwise a generic hint (check filters; Cyrillic in `LIKE`/`=` is case-sensitive — SQLite `lower()` doesn't fold it). This covers the exact point where the model got stuck (test03 steps 10/14 — empty `bsl_sql` over `functions` with no further direction).
+- **Known limitation:** the hint fires on an EMPTY result. If exact search returns a non-empty but irrelevant "noise" set (e.g. `search_function` on a frequent word yields dozens of namesake matches) the hint does not appear, since the tool cannot judge relevance (the model does). This case is partially covered by mentioning `search_terms` in the tools' descriptions.
+- **Effect note:** across several live runs on Opus (test03/test05) the model never went to `search_terms` — it solved the task via `bsl_sql` over object synonyms (the same semantic bridge the terms provide). The hints are correct and harmless, may help other models/strategies, but were not a "silver bullet" on Opus — no behavioral effect was observed.
+
+## [0.32.0] — 2026-06-11
+
+**New object-structure sections (owners/value_types/properties/enum_synonyms/commands + attribute synonym/required), owner and functional_option_content edges in data_links, roles in metadata_objects, `{a,b}` brace alternates in path_glob, LIMIT hint in bsl_sql. Fixed "—" types for DefinedType.**
+
+### Added
+
+- **`get_object_structure`: five new structure sections** (driven by the 747-question 1C:Professional run on UT-11):
+  - `owners` — owners of a subordinate catalog from `<Owners>` (`Catalog.ЭквайринговыеТерминалы` → `Catalog.ДоговорыЭквайринга`);
+  - `value_types` — value type of a chart of characteristic types / constant from the root `<Type>`: for a CCT this is the list of available analytics dimensions (`СтатьиДоходов` → 8 types);
+  - `properties` — whitelisted scalar header properties: information-register periodicity/write mode (`ЦеныНоменклатуры25` → `Periodicity=Second`), accumulation register kind, document numbering, catalog hierarchy/code lengths;
+  - `enum_synonyms` — UI labels of enum values as a separate map, the `enum_values` format is unchanged (`ЗакупкаПоИмпорту` → "Импорт"; 814 labels on `ХозяйственныеОперации`);
+  - `commands` — object commands `[{name, synonym?}]` from `<ChildObjects>/<Command>`: "create on basis", print forms, etc.
+- **Attributes in `attributes_json` now carry `synonym` (UI label, ru-priority) and `required`** (`<FillChecking>ShowError`): "which field is mandatory in X" is now answerable without XML.
+- **`data_links`: two new edge kinds** — `owner` (subordinate catalog → its owner) and `functional_option_content` (functional option → objects in its `<Content>`; `ИспользоватьЛимитыРасходаДенежныхСредств` → 3 objects).
+- **Roles in `metadata_objects`**: `Role` added to the known metadata types — 1288 UT-11 roles with synonyms are reachable via `bsl_sql`/synonym search.
+- **`{a,b}` brace alternates in `path_glob`/`pattern`** (`grep_code`/`grep_text`/`grep_body`/`list_files`): SQLite GLOB has no alternation, so `**/*.{bsl,xml}` silently returned nothing — the pattern is now expanded into an OR group of GLOB conditions (`expand_glob_braces`, up to 64 variants, no nesting — same as globset).
+- **`bsl_sql`: a hint when the row count equals the LIMIT from the query text** — "the output may be cut by your SQL LIMIT" (previously the agent took a truncated result for a complete one).
+
+### Fixed
+
+- **DefinedType attribute types were reported as "—"** in object structure: a `DefinedType` is serialized in the export as `<v8:TypeSet>`, while the parser only matched `:Type` tags. Now `ИНН` → `ОпределяемыйТип.ИНН`.
+
+### Tests
+
+- Units: parsing of owners/TypeSet/properties/FillChecking/synonyms/value_types/enum_synonyms/commands, `expand_glob_braces` (cartesian product, nesting/unclosed brace — literal), `sql_limit_value`. Full workspace green.
+- Smoke on live UT-11 (ut-test, 57,102 files): 11/11 checks green; full force reindex — 2 min 23 s (stop the services during reindex — SQLite contention slows it down by an order of magnitude).
+
+## [0.31.0] — 2026-06-11
+
+**Fixed the "blind" `get_form_handlers`, `source` filter and unknown-parameter rejection in `get_event_subscriptions`, hints on empty responses of graph and file tools.**
+
+### Fixed
+
+- **`get_form_handlers` could not find ANY form on production configurations.** The tool matched `owner_full_name = 'Document.X'` exactly (as its own docs suggested), while the DB stores values in export-folder format — `'Documents.X'` (plural; on UT-11: 1350 rows plural, 0 singular). Both formats are now accepted: exact match first, then retry with `<Singular>.<Name>` → `<PluralFolder>.<Name>` conversion (shared `meta_type_to_folder` helper, extracted from `get_object_profile`); the response echoes the actually matched DB key.
+- **Broken-regex error text in `grep_body`/`grep_code`** read as "Invalid parameter name: regex parse error…" (an artifact of mapping the compile error into `rusqlite::Error::InvalidParameterName`) and misled the agent into hunting for a "wrong parameter name". Now `UserFunctionError`: "grep_body: regex parse error…".
+
+### Added
+
+- **`get_event_subscriptions`: `source` filter** — subscriptions by source object. Accepts `'Document.ЗаказКлиента'`, `'DocumentObject.ЗаказКлиента'` or the short name `'ЗаказКлиента'`; case-insensitive; type `Document` automatically matches `DocumentObject` from `sources_json`.
+- **`get_event_subscriptions`: unknown parameters are rejected** with the list of valid filters. Previously `object=…` was silently ignored and the tool dumped ALL subscriptions (~52K tokens into the agent context instead of pointing out the mistake).
+- **Smart `get_form_handlers` error**: form not found but owner exists → response carries `available_forms` (the owner's real forms); owner missing → hint about the owner format and how to verify via `get_object_structure`/`bsl_sql`.
+- **Hints on empty responses** (previously a bare `{"result":[]}` — the model kept repeating the same call): `get_callers`/`get_callees` (the name must be exact, no parentheses or owner; empty also means genuinely no calls), `list_files` (pattern is a glob from the repo root), `get_imports` (file_id: no import statements — normal for BSL; module: it is the NAME of the imported module, not a file path).
+
+### Changed
+
+- **`get_event_subscriptions`: default limit 200 → 50.** A filterless call on UT-11 returned ~52K tokens; `truncated`+`total` in the response suggest narrowing the filter or requesting a larger limit. MAX_LIMIT (2000) unchanged.
+- The empty-result hint of `get_function`/`get_class` now mentions `search_class` too (previously only `search_function`).
+- `bsl_sql` description: documented the `metadata_forms.owner_full_name` format = `'<PluralFolder>.<Name>'` (`'Documents.ЗаказКлиента'`) — same convention as `metadata_modules.object_name`.
+
+## [0.30.0] — 2026-06-11
+
+**Mechanical term enrichment at index time (no LLM) + trigram FTS: `search_terms` works on production-size configurations for the first time. Smart `bsl_sql` errors.**
+
+### Added
+
+- **Mechanical filling of `procedure_enrichment.terms` at index time** — new `terms.rs` module and the `index_procedure_terms` pass (+ per-file incremental). Terms for every procedure are built from four cheap sources: words of the procedure name (CamelCase/underscore/script-change split: УточнитьДанныеПоШтрихкоду → "уточнить данные по штрихкоду"), words of the owner object name (from the module path), the owner object's SYNONYM from `metadata_objects.synonym` (a mechanical bridge between the Russian presentation and the English identifier), and the comment above the procedure. No LLM: 259,414 procedures of UT-11 get enriched within a fraction of the 63-second full rebuild. Signature `mech:v1`; rows written by the LLM `enrich` pass (different signature) are not overwritten. Ё is folded to Е at write time.
+- **Trigram FTS tokenizer for terms** (`tokenize='trigram'` instead of unicode61) — word forms and substrings of 3+ characters work ("штрихкод" matches "ПоШтрихкоду"), case and ё/е are irrelevant. Existing databases migrate automatically (`ensure_trigram_tokenizer`: drop + rebuild from the content table on DDL mismatch).
+- **Smart `bsl_sql` errors** — on `no such column/table` the response is extended with `did_you_mean` (Levenshtein), `column_exists_in_tables` (which tables actually contain the column — catches the meta_type/module_type confusion) and the columns of the tables referenced by the query. The error becomes self-correcting within the same turn (benchmark finding: a bare error cost the agent an extra reconnaissance turn).
+
+### Changed
+
+- **`search_terms` reworked for mechanical terms**: a multi-word query without explicit operators is rewritten server-side into an OR of words (implicit AND on short terms almost always returned 0 — a benchmark finding), words shorter than 3 characters are dropped, ё is folded to е, and the rewritten query is visible in the response (`fts_query`). New description ("FIRST choice for finding functionality", how to query), two contextual hints on an empty result.
+- **Fixed the repo filter in `search_terms`** — the routing alias was bound instead of `'default'` (as in all other BSL tools): the tool returned nothing even with a populated table. The bug stayed invisible while the table was empty.
+- **Missing-parameter error texts** of `get_function`/`get_class`/`get_object_structure` no longer suggest `names`/`full_names`: with mass-mode disabled the hint led the model into a rejected call (benchmark observation).
+
+### Tests
+
+- Units for `terms.rs` (Cyrillic/Latin/acronym/digit splitting, ё→е, object from path, comments), `index_procedure_terms` (mechanics + LLM protection + incremental with cleanup), `ensure_trigram_tokenizer` (migration + substring matches), OR-rewrite and ё in `search_terms` (integration), `enrich_prepare_error` (column and table cases). Full workspace green.
+- E2E benchmarks on ut-test (10 business tasks, Opus headless): the "where is feature X" spiral case is solved by a single `search_terms` call instead of ~22 lexical attempts; the no-`bsl_sql` arm confirmed its value (+33% turns, +19% cost without it).
+
+## [0.29.0] — 2026-06-10
+
+**Synonyms for ALL metadata objects; narrow `sections` selection in `get_object_structure`; columnar `bsl_sql` result format.**
+
+### Added
+
+- **Synonyms (Russian presentations) for ALL metadata objects.** A new lightweight indexing pass `index_object_synonyms` fills `metadata_objects.synonym` for every object type — including `CommonModule`/`Constant`/`CommonPicture`/`FunctionalOption` and other types without an attribute structure that are not part of `OBJECT_FOLDERS` (previously only objects with a structure had a synonym). The `parse_object_header_xml` parser reads only the root XML header (meta_type/Name/Synonym) and stops at `<ChildObjects>` — the pass is cheap. `v8:lang=ru` takes priority, otherwise the first non-empty presentation; the base configuration's synonym is not overwritten by an extension. Why: the synonym is a mechanical bridge "Russian presentation ↔ English identifier" for meaning-based search without LLM enrichment.
+- **`sections` parameter in `get_object_structure`** — narrow selection of structure sections (like `sections` in `get_object_profile`): return ONLY the requested keys out of `attributes`/`tabular_sections`/`dimensions`/`resources`/`posting`/`enum_values`/`predefined`. Without the parameter — all sections (backward compatible). Works in both single (`full_name`) and mass (`full_names`) mode. A context-economy lever: `["posting"]` — posting behavior at ~0.2 KB instead of the full object; `["attributes"]` — header attributes without tabular sections; `["dimensions","resources"]` — for registers.
+
+### Changed
+
+- **`bsl_sql`: columnar result format.** `rows` are now arrays of values positioned by `columns` instead of JSON objects `{column: value}` — column names are not duplicated in every row, saving context on wide result sets. The format is explicitly described in the tool description.
+- **Softened mass-mode wording** in the descriptions of `get_function`/`get_class`/`get_object_structure` and the `names`/`full_names` parameters: batch ONLY when the whole set is definitely needed and one element's result cannot make the rest unnecessary; when filtering candidates — one at a time with early stopping; "when in doubt — one at a time". Encodes the ut-test benchmark conclusion from 0.28.0 (token front-loading and over-fetch caused by unconditional batching). Relevant for configurations with `[mcp].mass_mode_tools` enabled.
+
+### Documentation
+
+- `docs/operations.md` — indexer administration procedures (adding a repo to daemon.toml+serve.toml, daemon config hot-reload, restart/rebuild, "MCP not responding" diagnostics), moved out of session rules.
+
+### Tests
+
+- `parse_object_header_xml` (ru synonym priority, break at `<ChildObjects>`, object without a synonym), `apply_sections_filters_top_level_keys` (None/empty list/non-object — unchanged), columnar `collect_rows_*` tests. Full workspace green.
+
+## [0.28.0] — 2026-06-10
+
+**Bulk mode (`names[]`/`full_names[]`) is OFF by default; enabled via the `[mcp].mass_mode_tools` allowlist in `daemon.toml`.**
+
+### Changed (default behavior)
+
+- **Bulk mode is now opt-in and off by default for all tools.** A benchmark on ut-test (10 business tasks, Opus, ci arm with the new tools vs baseline) showed the promised token savings from batching **do not hold**: total input tokens went up (+37% on the run) while turns barely changed. Mechanism: a batch *front-loads* data (all targets land on the first turn and are re-read on every subsequent one), provokes over-fetch (the model pulls more targets than it would sequentially with an early stop), and on "hot" (non-unique) names `get_function`/`get_class` the response inflates without bound. Tokens are the dominant cost on a subscription, so bulk mode is disabled by default.
+  - Controlled by a new `daemon.toml` section:
+    ```toml
+    [mcp]
+    # a tool in the list advertises its plural param (the model decides whether to batch);
+    # not in the list -> the server does not offer batching. Empty/absent -> off for all.
+    mass_mode_tools = ["get_object_structure"]
+    ```
+  - A tool **in the list** advertises `names[]`/`full_names[]` in `tools/list` (model can batch). **Not in the list** — the server strips the plural param from the schema (`list_tools`) and rejects `tools/call` carrying it (`-32602 Invalid params`, double protection).
+  - **Compatibility:** single `name`/`full_name` works as before. This is a behavior change vs 0.26.0/0.27.0, where bulk mode was on for all three tools. To restore the old behavior — `mass_mode_tools = ["get_object_structure", "get_function", "get_class"]`.
+
+### Tests
+
+- `strip_mass_mode_param` (removes the plural param from the schema + trims the description), `apply_mass_mode_tools` (empty list → off; allowlist → membership), parsing of `[mcp].mass_mode_tools` and the empty default. `cargo test`: code-index-core green.
+
+## [0.27.0] — 2026-06-10
+
+**Bulk mode now runs in parallel: `names[]`/`full_names[]` elements are processed concurrently instead of in a loop.**
+
+### Changed
+
+- **Mass-mode `get_function`/`get_class`/`get_object_structure` executes IN PARALLEL.** Previously — a sequential loop with `await` per element (and in `get_object_structure` — a `map` over a single connection). Now each element checks out its own read-only connection from the `StoragePool` and runs in `spawn_blocking` — synchronous rusqlite no longer blocks the shared async runtime, and parallelism is naturally bounded by the pool semaphore (`pool_size`, default 4). The response format is UNCHANGED: `{results:[...]}` strictly in request order, per-element `{error}` preserved (a broken element does not fail the batch), `_meta` stripped from elements as before. Single `name`/`full_name` path untouched. Internals: shared helper `mcp::tools::mass_map` (pool checkout + `spawn_blocking` + ordered assembly), sync cores `get_function_with`/`get_class_with` extracted from `get_function`/`get_class`, the `resolve_one` closure in bsl-extension became a free fn. Live serve smoke (`oleg`, local KA 1.1 repo): a batch of 4 heavy objects — 3.0 ms vs 19.7 ms as the sum of singles.
+
+### Tests
+
+- `mass_map_runs_concurrently_and_preserves_order` (4 elements × 100 ms on a 4-connection pool — wall < 250 ms, order intact), `mass_map_on_single_pool_stays_correct` (pool of 1 — degrades to sequential without losing correctness), `get_object_structure_batch_non_string_element` (non-string element → `{error}` in its slot), `get_object_structure_batch_empty_list`. `cargo test`: code-index-core 267 + bsl-extension 19, 0 failed.
+
+## [0.26.0] — 2026-06-10
+
+**Bulk mode for tools: structures/bodies of several objects in one call (`get_object_structure`, `get_function`, `get_class`).**
+
+### Added
+
+- **`names: [...]` parameters in `get_function` and `get_class`** — bodies of several functions/classes in one call instead of a series. Response is `{results: [...]}` in request order (each element is `{result: [...records...], hint?}` without the internal `_meta`); a missing name yields an empty `result` + `hint` in its slot and does not fail the batch. Single `name` unchanged (backward compatible). `find_symbol` intentionally untouched (stays single — it has its own `NameParams`). Candidates chosen by series statistics of a real run (`get_function` is 2nd by groupable calls after `get_object_structure`). Heavy `bsl_sql`/`get_object_profile` are NOT made bulk: high reuse would bury their expensive per-object cache in a blob (needs a dissolving layer — separate task).
+- **`full_names: [...]` parameter in `get_object_structure`** — request the structure of several objects in a single call instead of a series of single ones. Response is `{results: [...]}` in request order; a missing object yields `error` + `did_you_mean` in its own slot and does not fail the rest of the batch. Single `full_name` works as before (backward compatible). Why: on tasks like "structures of these N documents/catalogs/registers" the model groups independent objects into one call — fewer round-trips, less history re-reading (the main token cost). Elements are processed in a sequential loop on one connection (`get_object_structure` is a cheap indexed SELECT, parallelism is unnecessary). Probe on ut-test (Opus, headless): the model adopts the bulk mode on its own from the tool description — in 3/3 tasks it sent `full_names` as a batch (4 documents / 5 catalogs / 3 registers) without any hint about the parameter format.
+
+### Tests
+
+- New integration test `get_object_structure_batch_full_names` (3 objects: 2 exist + 1 missing — order, structure, graceful error in slot). `bsl-extension` green (17 tests, 0 failed). Live MCP smoke (ut-test) confirmed the bulk mode.
+
+## [0.25.0] — 2026-06-09
+
+**Document posting properties in `get_object_structure`; BSL call-graph accuracy; token trimming on hot names; false `indexing` status removed.**
+
+### Added
+
+- **`posting` section in `get_object_structure`/`get_object_profile`** — document posting properties from the root `<Properties>`: `Posting`, `RealTimePosting`, `RegisterRecordsDeletion`, `RegisterRecordsWritingOnPost`. Documents only (other objects have no such section). Previously these properties were not indexed — an agent could not learn the posting/unposting movement behaviour and fell back to guessing (on 1C-Trade business questions: "what happens to register records on unposting?" → assumption instead of fact). Live smoke on ut-test: `Document.РеализацияТоваровУслуг` → `posting: {Posting: Allow, RealTimePosting: Deny, RegisterRecordsDeletion: AutoDeleteOff, RegisterRecordsWritingOnPost: WriteSelected}`.
+
+### Fixed
+
+- **BSL call graph now captures function calls inside expressions.** `get_callers`/`get_callees` silently returned a handful of edges instead of thousands: the parser walker caught only `call_statement` (a procedure call as a statement), while function calls inside expressions (`Result = Module.Func(...)` — `method_call` nodes inside assignment/condition/arguments) were lost entirely. Rewrote `visit_body_for_calls` + `visit_node` (helper `record_method_call`). On ut-test (1C-Trade 11.5): `get_callers(ЗначениеРеквизитаОбъекта)` 1 → 4560 edges; `proc_call_graph` direct 458011 → 790835.
+- **False `indexing` status from the daemon's `path_status`.** Previously `std::fs::canonicalize()` was called on EVERY request — FS-dependent, and under the load of reindexing neighbouring repos it mismatched, reporting a false `indexing` on a ready repo. Now an FS-free match by normalized key (symmetric to `/health`): exact match or the nearest parent — the longest tracked-key prefix.
+
+### Changed (context trimming on large repos)
+
+- **Location cap (`LOCATION_CAP=50`)** in `find_symbol`/`get_function`/`get_class`: on a super-hot name (352 definitions of `ОбработкаПроведения`) the location payload drops 32K → 5.3K tokens (−84%); on truncation — `{truncated, total, shown}`. A unique name + `path_glob` still returns the body.
+- **`get_call_tree` deduplication** (`expanded: HashSet`): a node with many parents is expanded once (repeat → `{name, repeated:true}`). callers depth=5: 178K → 8.4K tokens (−95%).
+- **`grep_body` on 0 matches** now hints: for a compound name `Object.Field` use a short anchor (just `Object` or just `Field`) or a regex with flexible whitespace (`Object\s*\.\s*Field`) — the identifier may be split by formatting or live inside query text.
+- Tool descriptions in `mcp/mod.rs` synced with behaviour: `search_*`/`find_symbol` return locations without bodies; `get_function`/`get_class` on multiple matches omit bodies and ask to narrow `path_glob`.
+
+### Tests
+
+- Entire workspace green (265 tests, 0 failed). New unit tests: parsing the `posting` section, absence of the section for non-documents. Full ut-test reindex (57102 files) + live MCP smoke confirmed `posting` and the call graph.
+
+## [0.24.0] — 2026-06-08
+
+**Per-repo pool of read-only connections in `serve`: requests to one repo are no longer serialized behind a single mutex.**
+
+### Added
+
+- **Per-repo connection pool (`storage::pool::StoragePool`).** Previously each repo in `serve` was served by a single `rusqlite::Connection` behind a `tokio::sync::Mutex` — any tool held the mutex for its whole duration, so a heavy query (`bsl_sql` up to 8 s, a full `grep_code`, recursive `find_path`/`get_call_tree`) delayed ALL other requests to the SAME repo, including an instant `get_function`. Now `serve` keeps several read-only connections to one `index.db` and reads the index in parallel (SQLite in WAL mode is designed for many readers). Connections are opened lazily up to `pool_size` and returned to the pool when the request finishes; the number of concurrently checked-out connections is bounded by a semaphore. Does not affect data/results — concurrency only.
+- **`[pool]` section in `serve.toml`** — three optional parameters (defaults in parentheses): `pool_size` (4) — connections per repo; `per_conn_cache_kib` (16384 = 16 MB) — page-cache per connection; `busy_timeout_ms` (5000) — wait on brief locks during the daemon's checkpoint/backup. A missing section or fields fall back to defaults; `0` is sanitized (`pool_size`→1, `cache`→default). **The default is memory-neutral:** 4 × 16 MB = 64 MB per active repo — the same as the previous single connection (`cache_size=-64000`).
+- **`busy_timeout` on read-only connections** (previously unset → default 0): a brief `SQLITE_BUSY` during the daemon's checkpoint/backup window is now waited out instead of becoming an error.
+
+### Changed
+
+- `RepoEntry.storage` field: `Option<Arc<Mutex<Storage>>>` → `Option<Arc<StoragePool>>`; method `local_storage()` → `storage_pool()`. Tool handlers (core `mcp::tools::*` and all extension BSL tools) acquire a connection via `pool.get().await` instead of `lock().await`. Internal change — no effect on the MCP contract (`tools/list`, response shapes).
+- `CodeIndexServer::from_federated` takes a `PoolConfig` (from `serve.toml [pool]`); mono-mode and test constructors use the default `PoolConfig` / a single-connection pool (`StoragePool::single`).
+
+### Tests
+
+- Pool unit tests: connection reuse, `0` sanitization, single-mode; **"a heavy holder does not block a second request" at `pool_size>=2`** and the contrast **"a single-connection pool serializes"**. Whole workspace green (262+ tests).
+
+## [0.23.0] — 2026-06-08
+
+**Universal call graph: recursive `find_path` and `get_call_tree` over the `calls` table (any language). The BSL-specific `find_path` was renamed to `find_path_bsl`.**
+
+### Added
+
+- **MCP tool `find_path(repo, from, to, max_depth=5, language?)`** — shortest path in the call graph from function `from` to `to` (iterative cycle-safe BFS over unique nodes of the `calls` table, `max_depth` in [1..10]). Universal, any language — previously the recursive path walk lived only in the BSL extension (`proc_call_graph`); now the core (`code-index`) has it too. Returns `{from, to, found, path: [{caller, callee, line}], max_depth}`. On an empty result — a `hint`.
+- **MCP tool `get_call_tree(repo, root, direction='callees', max_depth=3, max_nodes=200, language?)`** — call tree from function `root` up to `max_depth`. `direction`: `callees`/`down` (what root calls, downstream) or `callers`/`up` (who calls root). Previously the core exposed only a single level (`get_callers`/`get_callees`). Returns a flat edge list `[{caller, callee, line, depth}]` and a nested tree `{name, children}`. When `max_nodes` is reached — `truncated=true`.
+- Federation routes `/federate/find_path` and `/federate/get_call_tree`; `CallEdge`/`CallTreeEdge` types in `storage::models`; storage methods `find_call_path` (iterative cycle-safe BFS over UNIQUE nodes — each node expanded once, no blow-up on cycles/duplicate edges) and `get_call_tree` (recursive CTE), seek via `idx_calls_caller`/`idx_calls_callee`. Unit tests for direct edge, two hops, depth limit, language filter, tree directions and `max_nodes` truncation.
+
+### Compatibility
+
+- **The BSL tool `find_path` was renamed to `find_path_bsl`** (module `find_path_bsl.rs`, struct `FindPathBslTool`). Its behavior and parameters (`from`, `to`, `max_depth`, over `proc_call_graph` with `call_type`) are unchanged — only the name. The name `find_path` is now taken by the universal core tool. Clients that called the BSL `find_path` directly must switch to `find_path_bsl`.
+- On the `bsl-indexer` build in federated mode, `tools/list` returns two more tools (the universal `find_path` + `get_call_tree`); the BSL tool set is unchanged in count (a rename).
+
+## [0.22.0] — 2026-06-08
+
+**Cyrillic in `bsl_sql` and graph tools (case-insensitive search over Russian names) + fuzzy word-based FTS for functions/classes + lighter search payload + `sections` parameter for `get_object_profile`.**
+
+### Fixed
+
+- **SQLite `lower()`/`upper()` now handle Cyrillic.** The built-in SQLite functions fold case for Latin only, so in `bsl_sql` a query `WHERE lower(name) LIKE '%эдо%'` over Russian metadata names returned nothing and the agent fell back to enumeration. We register Unicode-aware `lower`/`upper` (Rust `String::to_lowercase`/`to_uppercase`) overriding the built-ins on every DB-open path (`register_sql_functions` next to `register_regexp`). Verified on production UT-11: `lower('ЭДО')='эдо'`, the slice `WHERE lower(name) LIKE '%эдо%'` over `metadata_objects` — 0 → 336 objects.
+
+### Added
+
+- **Case-insensitive reverse lookup over Cyrillic in `find_references`.** Columns `data_links.to_object_key` (= `lower(to_object)`) and `role_rights.object_name_key` (= `lower(object_name)`), computed in Rust (SQLite `lower()` does not fold Cyrillic), plus indexes `idx_dl_to_key` / `idx_rr_object_key`. `find_references` (`data_refs` / `role_rights`) finds references to an object regardless of the Russian name's case. Backfilled on (incremental) graph population.
+- **`sections` parameter for `get_object_profile`** — `['structure'|'forms'|'modules'|'data_links']` narrows the response (cost lever: `['structure']` returns only attributes/tabular sections/dimensions/resources, without forms, modules and links).
+
+### Changed
+
+- **Fuzzy word-based FTS for `search_function`/`search_class`.** OR between query words, prefix terms, bm25 ranking (name outweighs `qualified_name`/docstring/body). Accepts a multi-word description ("расчёт цены продажи реализация"), no single exact identifier required; on 0 matches — a `hint` field. Query normalization — `sanitize_fts_query`.
+- **Lighter `search_function`/`search_class` payload** — without function/class bodies: only name, `qualified_name`, path, line range, signature, truncated docstring (200 chars), `override_*`. Previously up to 20 results with full bodies bloated the response to tens of thousands of characters.
+- **Compact `get_file_summary` map** for files with > 120 functions — names + lines + `override_type` without signatures/docstrings (guard against bloat on large modules).
+- **`grep_text`/`grep_code`: `regex` is now optional** (can search via the `query` alias); grep-tool parameters forwarded through federation in lockstep.
+
+### Compatibility
+
+- **BSL index schema: added `*_key` columns** (`data_links.to_object_key`, `role_rights.object_name_key`) with `DEFAULT ''` + indexes — additive, existing queries unaffected. On older indexes the keys are backfilled on the new binary's first start.
+- **Existing-DB migration (`migrate_schema` hook on `LanguageProcessor`).** Before `apply_schema_extensions`, the language processor idempotently adds missing `*_key` columns via `ALTER TABLE ADD COLUMN` (no-op on a fresh DB). Without this, upgrading on top of a 0.20.0/0.21.0 DB broke: `CREATE TABLE IF NOT EXISTS` does not add a column to an existing table, and the subsequent `CREATE INDEX` on the missing column aborted the whole DDL batch, so the `role_rights`/`metadata_code_usages` tables were not created and `find_references` did not work.
+- The `lower()`/`upper()` override changes behavior only for Cyrillic (Latin — as before); internal queries and FTS are untouched.
+- Workspace version 0.21.0 → **0.22.0** (minor — new functionality + a fix).
+
+## [0.21.0] — 2026-06-07
+
+**1C data-graph expansion and per-object "impact map" (reverse links + code usage + role rights) + text-file storage moved to a compressed format (`migrate_v5`).**
+
+### Added
+
+- **New configuration-level edge kinds in `data_links`.** The parser `bsl-extension/src/xml/metadata_refs.rs` (event-based `quick_xml`) adds, alongside the object edges (`attr`/`tabular_attr`/`register_dim`/`recorder`/`owner`), four links: `subsystem_content` (`from=Subsystem.X` — subsystem contents), `exchange_plan_content` (`from=ExchangePlan.X` — exchange-plan contents), `defined_type_content` (`from=DefinedType.X` — defined-type targets, reusing `object_attributes::classify_type`), `functional_option_location` (`from=FunctionalOption.X`, `from_path` = full `Location`). On production UT: subsystem_content 22762, exchange_plan_content 9302, defined_type_content 4728, functional_option_location 564.
+- **Table `role_rights`** (`repo, role_name, object_name, right_name`, UNIQUE + indexes by object and by role) — role rights on objects from `Roles/<X>/Ext/Rights.xml` (only `<value>true</value>`). A right is an attribute of the role↔object pair, hence a separate table rather than a `data_links` edge. UT: 49,695 rights / 1236 roles / 6329 objects.
+- **Table `metadata_code_usages`** — a reverse index of metadata-object usage IN `.bsl` CODE (module `bsl-extension/src/code_usages.rs`, a hand-written scanner with no `regex`): `manager` (`Документы.X` in code), `ref_type` (`"ДокументСсылка.X"` / `"DocumentRef.X"` in a string literal), `query` (a metadata path inside query text; the 3rd segment → `member_path`). UT: ~280k usages (query 149,835 / manager 110,194 / ref_type 20,420). `object_ref_key` is stored lowercased (SQLite `lower()` does not lowercase Cyrillic) — for a pinpoint lookup filter by the exact `object_ref`.
+- **MCP tool `find_references`** — a per-object "impact map" in one call: reverse `data_links` (by `to_object`) + `metadata_code_usages` + `role_rights`, broken down by kind with samples (`limit`).
+- **MCP tool `bsl_sql`** — an arbitrary read-only `SELECT`/`WITH` over a repo's `index.db` (the long tail of metadata/graph queries with no dedicated named tool). Guard: `SELECT`/`WITH` only + `Statement::readonly()` + row cap + timeout.
+- **MCP tool `get_object_profile`** — a full object "passport" in one call (structure + forms + modules + data links) instead of a series of `get_object_structure`/`get_form_handlers`/`get_data_links`.
+- BSL tool count 8 → **11**. All new tables are maintained incrementally in the daemon's watcher loop (rebuild by path component / per-`.bsl`).
+
+### Fixed
+
+- **`attributes_json` merge with extensions present** (`object_attributes::ObjectStructure::merge_from`) — attributes from the base configuration and extensions are merged rather than clobbering each other. `extension_override` edges are accounted for when (re)building the call graph.
+
+### Compatibility
+
+- **Index schema v4 → v5.** Text-file storage (md/xml/yaml/json/toml/sh…) moved from `text_files(content TEXT)` + external-content FTS to `text_contents(content_blob BLOB)` (zstd) + a contentless `fts_text_files` fed from Rust. `migrate_v5` migrates existing indexes IN PLACE on the first start of the new binary; fresh DBs are created directly in the new schema. `search_text`/`grep_text`/`read_file(text)`/`stat_file` behave as before. (Implementation — a separate `feat(core)` commit.)
+- **External consumers that read the index's text directly via the `text_files` table must switch to `text_contents`** (raw → zstd-decode). In particular `code-index-guard` (`serveability`) was updated in lockstep: otherwise on a migrated DB the query fails with `no such table: text_files` and native `Read` blocking silently turns off.
+- Additive for BSL: the new tables / edge kinds / tools do not break existing responses.
+- Workspace version 0.20.0 → **0.21.0** (minor — new functionality).
+
+## [0.20.0] — 2026-06-06
+
+**`_meta.file_mtimes` in search-tool responses + an early daemon signal `POST /mark-dirty` — for write-triggered lazy cache revalidation in `mcp-cache-ci` (#1471).**
+
+### Added
+
+- **`_meta.file_mtimes` in MCP tool responses.** Alongside the existing `_meta.dependent_files`, serve now returns a `{<rel_path>: <index_mtime>}` map (unix seconds from the `files.mtime` column) for each dependent file. This is the input for write-triggered lazy revalidation in `mcp-cache-ci`: the proxy compares the index mtime against the observed mtime from `mark-dirty` and caches a response only once the index has caught up with disk (`index_mtime >= observed`). Implemented in `wrap_with_meta` (batched via the new `Storage::mtime_for_path`), applied to all cacheable search tools (`search_function`/`get_function`/`grep_body`/`grep_code`/`read_file`/`get_file_summary`/...). `stat_file` is unaffected (non-cacheable, carries no `_meta`).
+- **The daemon sends `POST /mark-dirty` on FS events.** At the start of batch processing (BEFORE reparse/commit), in addition to `POST /invalidate` after commit, the daemon sends cache-ci `{repo, files:[{path, mtime}]}` with the observed mtimes of changed files (`PathEntry::effective_alias()` as `repo`). The proxy marks dependent entries dirty immediately, shrinking the window in which the cache could serve stale data; the flag is cleared by the mtime check on the cache-ci side. Best-effort: errors and 404s (a cache-ci without support) are logged and never block the daemon. New `CacheClient::mark_dirty_files`, helper `collect_dirty_paths` in `worker.rs`.
+
+### Compatibility
+
+- **Additive, not breaking.** `_meta.file_mtimes` is a new field next to `dependent_files`; old consumers ignore it. `mark-dirty` is a separate channel in addition to `invalidate`. Full effect requires `mcp-cache-ci` ≥ 0.4.0; with an older cache-ci `mark-dirty` returns 404 (swallowed) and `file_mtimes` is ignored.
+- BSL tools (`bsl-extension`) do **not** yet emit `file_mtimes` (follow-up): for dirty files depended on only by BSL responses, cache-ci keeps forwarding while the path is dirty (safe degradation).
+- Workspace version 0.19.2 → **0.20.0** (minor — new functionality).
+
+## [0.19.2] — 2026-06-06
+
+**Renaming a file to a new name no longer leaves an orphaned index row under the old name.**
+
+### Fixed
+
+- **The watcher now correctly removes the old name on a file rename.** Previously the `notify` event `Modify(Name(RenameMode::From))` — delivered for the old name's path that no longer exists — was either dropped by the `!path.is_file()` check or turned into `Modified` and silently swallowed by `NotFound` during hashing, leaving the old-name row as a phantom in the index until the next full reindex (showing up in `stat_file`/`list_files`/the graph with stale data). The classification logic was extracted into `classify_event`: directories are ignored, and `Create`/`Modify` on a path missing from disk are treated as `Deleted`. Covered by the test `test_classify_event_rename_from_becomes_delete`. (Atomic-save `tmp`→rename over an existing file worked before and still works — the target path stays a file.)
+
+## [0.19.1] — 2026-06-06
+
+**The daemon's incremental path now writes `mtime`/`file_size` for new and changed files — previously the watcher left these fields NULL.**
+
+### Fixed
+
+- **`Storage::upsert_file` now persists `mtime`/`file_size`** (added to `INSERT` and `ON CONFLICT DO UPDATE` with `COALESCE` so real values are never clobbered by `NULL`). With a live daemon, creating/changing a file used to leave the `files` row with `mtime = NULL` and `file_size = NULL`: the values did reach the `FileRecord` (both from full indexing and from the watcher via `std::fs::metadata`), but `upsert_file` dropped them. A real `mtime` was written only by the separate `update_file_metadata`, which on the write path runs only for unchanged-hash files — so freshly created/just-changed files (the "hottest" ones) kept an empty `mtime`. This hurt `stat_file`/`list_files`, the cheap freshness check (`code-index-guard`), and the phase-1b "fast skip by mtime+size" on subsequent full reindexes. Both paths now write `mtime`/`file_size` in one place. Covered by the regression test `test_upsert_file_persists_mtime_and_size`.
+
+## [0.19.0] — 2026-06-05
+
+**Online extras-layer updates during live editing: after a file edit the call graph, data links and object structure refresh incrementally right in the daemon's watcher loop — surgically (cost scales with the edited file, not the graph), no restart, no full XML walk.**
+
+Previously the daemon built the extras layer (`proc_call_graph`, `data_links`, `metadata_objects.attributes_json`, `metadata_forms`, `event_subscriptions`) once at worker startup and it went stale until restart: `find_path`/`get_callers`/`get_data_links`/`get_object_structure` returned an outdated view during an editing session. The full rebuild (`run_index_extras`) is expensive (~2s, walks all XML), so it was not run on every save.
+
+### Added
+
+- **Incremental extras update in the daemon's watcher loop** (after `commit_batch`), routed by changed-file type:
+  - `.bsl` → **per-file** update of the `direct` call-graph layer: only the edited file's edges are touched (previous ones from the `direct_edge_files` side-map, current ones from the core `calls` table), cost independent of graph size. On KA 1.1 (~123k edges) — ~0 ms vs ~2 s for a full layer rebuild;
+  - object XML (Catalogs/Documents/Registers/…) → per-object update of `data_links` (by `from_object`) and object structure (`attributes_json`);
+  - `Form.xml` / `EventSubscriptions/*.xml` → per-file row update + slice-rebuild of the matching graph layer (`form_event` / `subscription`);
+  - `Configuration.xml` (object-set change) → full `run_index_extras`.
+- New `LanguageProcessor::index_extras_for_files` method (default no-op; universal languages unaffected). BSL implements it via `run_incremental_extras`.
+
+A helper table `direct_edge_files` was added for the per-file graph update (maps direct edges to their source files); `proc_call_graph` stays deduplicated, so `find_path`/`find_data_path` are unaffected. Worker logs now include extras-update timing (full and incremental paths). Equivalence of incremental updates to a full rebuild is covered by tests (`incremental_object_xml_matches_full`, `incremental_call_graph_direct_matches_full`, `incremental_direct_shared_edge_survives`).
+
+## [0.18.0] — 2026-06-05
+
+**Targeted BSL tooling and CLI refinements from the E2E comparison with `rlm-tools-bsl` (KA 1.1): subscription filter by short module name, a `search_terms` hint when enrichment is empty, a fast `index --force` plus a PID-lock for one-off indexing, and an updated `get_object_structure` description.**
+
+### Added
+
+- **`search_terms` returns a `hint` on empty results with an empty enrichment table** — states that `bsl-indexer enrich` has not been run for the repo and points to `grep_body`/`grep_code`/`search_function`/`get_function`. Previously an empty answer read as "no matches" and wasted the call. (E1)
+- **PID-lock for the `index` command** — two concurrent `index` runs on the same path no longer fight over SQLite (RAII lock on `index.lock` next to `index.db`). Shares the daemon mechanism (`acquire_at`). (A2)
+
+### Changed
+
+- **`get_event_subscriptions`: the `handler_module` filter matches both the full name (`CommonModule.X`) and the short one (`X`)** via a suffix `LIKE '%.X'`. Previously a short name found no subscription. (D1)
+- **`index --force` recreates `index.db` from scratch** instead of upserting over the existing DB. On a large DB the old path was pathologically slow (full load into RAM + per-file upsert); deleting the file turns `--force` into a fast fresh path with the same result. (A1)
+- **Updated `get_object_structure` description** — reflects the full structure (attributes with types, tabular sections, register dimensions/resources, `enum_values`, `predefined`, always-present base sections) and explicitly notes that object XML is not indexed as text (don't search it via `list_files`/`grep_text`). (D2)
+
+## [0.17.0] — 2026-06-05
+
+**`get_object_structure`: a `predefined` section — names of predefined items (Catalog / ChartOfAccounts / ChartOf*).**
+
+Closes the C2 gap from the E2E comparison with `rlm-tools-bsl`: predefined items (`Catalogs.Quality.New`, etc.) live in a separate `<Object>/Ext/Predefined.xml` and previously required manual XML reading. Now there is a `predefined` section right in the object structure.
+
+### Added
+
+- **`get_object_structure` returns a `predefined` section** — names of an object's predefined items from the adjacent `<Object>/Ext/Predefined.xml` (`<Item>/<Name>`). Populated during indexing for `Catalog`/`ChartOfAccounts`/`ChartOfCharacteristicTypes`/`ChartOfCalculationTypes`; absent for objects without predefined items. Verified on live KA 1.1: `Catalog.Качество` → `["Новый"]`, `Catalog.СтатьиЗатрат` → `["СписаниеНДСНаРасходы","СписаниеНДСНаРасходыПрочие"]`.
+
+## [0.16.0] — 2026-06-05
+
+**1C metadata tools: `get_object_structure` now returns the full structure (including enum values), a new `get_register_writers` tool (register recorders / document movements), subscription event names normalized to Russian.**
+
+A round of BSL-layer improvements following the E2E comparison with `rlm-tools-bsl` on the KA 1.1 configuration: the main gap "which documents write movements into a register" is closed, and `get_object_structure` is no longer a stub for enums and always returns a predictable response shape.
+
+### Added
+
+- **New MCP tool `get_register_writers`** — register recorders and document movements from the declarative `<RegisterRecords>` set (recorder edges of the `data_links` graph). For a register (`AccumulationRegister.ТоварыНаСкладах`) it returns the documents writing movements in `writers`; for a document (`Document.РеализацияТоваровУслуг`) the target registers in `writes_to`. A single call covers both directions — no need to know the object kind in advance. 8 BSL tools on top of the 18 universal ones.
+- **recorder edges in the `data_links` graph** — the "document → register" relation (`link_kind=recorder`) from a document's declarative movement set. `get_data_links(register, direction=in)` now lists recorder documents (previously empty — register movements were not modeled by the graph). The source is the document XML `<RegisterRecords>`, not posting-code parsing — no false positives.
+- **`get_object_structure` for enumerations** — an `enum_values` section with the enum's values (previously `Enum.*` returned an empty structure). The `Enums` folder was added to the metadata indexer's walk.
+
+### Changed
+
+- **`get_object_structure` returns the full object structure** — attributes with types in 1C notation (`СправочникСсылка.X`, composite via `|`), tabular sections with columns, register dimensions/resources. Previously a documented stub `attributes: null`.
+- **`get_object_structure` always emits the base sections** `attributes`/`dimensions`/`resources`/`tabular_sections` (empty as `[]`, not omitted). The consumer distinguishes "the section is absent" from "the tool did not return it" and does not fall back to raw XML.
+- **Event names in `get_event_subscriptions` normalized to Russian** (`OnWrite`→`ПриЗаписи`, `Posting`→`ОбработкаПроведения`, etc.); the filter is bidirectional — accepts both the Russian name and the English platform enum.
+
+### Fixed
+
+- **Updated the `read_file` tool docstring** — it returns content for code files too (zstd-decode from `file_contents`, Phase 2 v0.8.0+; the `category` field is `"text"`/`"code"`), not "text files only, empty for code". The old description was stale after Phase 2 and misleading.
+
+## [0.15.0] — 2026-06-04
+
+**`grep_text` and `grep_body`: output grouped by file + a `truncated` flag — path duplication eliminated, the same treatment `grep_code` got in 0.14.0.**
+
+`grep_text` and `grep_body` returned a flat array of matches where the full file path was repeated in every match. With many matches in one file this bloated the response (and billed tokens when running over an API). `grep_code` switched to `{files: {"<path>": [...]}}` grouping back in 0.14.0; the same treatment is now applied to the two remaining grep tools.
+
+### Changed
+
+- **`grep_text` groups matches by file.** Response shape `[{path, line, content, context}]` → `{files: {"<path>": [{line, content, context?}]}, shown, limit, truncated}`. The path appears once as the `files` key; `context` is omitted when `context_lines=0`.
+- **`grep_body` groups matches by file.** Shape `[{file_path, name, kind, …}]` → `{files: {"<path>": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated}`. `match_count` is omitted when there are ≤3 matches; `context` when `context_lines=0`.
+- **Both tools now return `truncated`.** Storage methods `grep_text_filtered` and `grep_body_with_options` now return `(Vec, bool)` — the flag is set when `limit` or the 1 MB response byte cap is reached, just like `grep_code`. For the legacy `grep_body` path (no `path_glob`/`context_lines`) `truncated` is derived from hitting `limit`. The model sees that not everything is shown and can re-request with a larger `limit`.
+
+### Compatibility
+
+- Consumers that parsed the flat `grep_text`/`grep_body` array must read `result.files` (a "path → array of matches" object) instead of an array; the path field moved out of each match into the key. A one-off output-format breaking change — same as `grep_code` in 0.14.0.
+
+## [0.14.2] — 2026-05-31
+
+**`find_data_path`: traversal rewritten as BFS with a visited-set — combinatorial blow-up on dense link graphs eliminated.**
+
+After 0.14.1 (ANALYZE fixed the seek), `find_data_path` traversal on a dense cyclic data-link graph could still expand millions of paths: the recursive CTE enumerated ALL paths up to max_depth without node deduplication (on KA 1.1 a dense node at depth=4 produced ~4.9M intermediate rows plus `path_json` memory growth).
+
+### Fixed
+
+- **`find_data_path` now uses BFS with a visited-set instead of the recursive CTE.** Each object is expanded exactly once (visited HashSet) → traversal is bounded by the reachable subgraph (thousands of nodes), not the number of paths (millions); link-graph cycles are no longer walked in circles. The same shortest-by-edge-count path from → to is returned. Terminal generic `*`-nodes have no outgoing edges and are not expanded. Each step is an index seek on `(repo, from_object)` (provided by the 0.14.1 ANALYZE). `find_path` (call graph) is untouched — its CTE stays, already made fast by ANALYZE.
+
+## [0.14.1] — 2026-05-31
+
+**`find_path`/`find_data_path`: graph-traversal timeouts on large BSL repos fixed (`ANALYZE` after graph build).**
+
+On large configurations (KA 1.1 — `proc_call_graph` ~125k edges, `data_links` ~11.5k) `find_path`/`find_data_path` traversal hit timeouts: depth=3 on the call graph took ~240s. The cause — the repo's SQLite index had no statistics (`sqlite_stat1`), so in the recursive CTE step the planner used only the constant index prefix (`repo=`), scanning all repo edges on every iteration instead of seeking on `(repo, caller_proc_key)` / `(repo, from_object)`. Forcing the index via `INDEXED BY` did not help — statistics are the only lever.
+
+### Fixed
+
+- **The indexer now runs `ANALYZE` at the end of `run_index_extras`** — after rebuilding `proc_call_graph`/`data_links` (and the other BSL tables), SQLite statistics are gathered, and the planner uses a two-column seek in the recursive step of `find_path`/`find_data_path`. On KA 1.1: `find_path` depth=3 went 240s → 0.05s. `ANALYZE` costs ~0.6s on a 2.4 GB DB (it scans index B-trees, not the zstd content blobs) and runs on every (re)index in sync with the graph rebuild.
+
+### Known limitations
+
+- `find_data_path` on a **dense node at depth 4** still traverses millions of paths even after `ANALYZE` — the recursive CTE has no visited-set/cycle-detection and the 1C data-link graph is dense and cyclic. For typical queries and depth ≤3 it is instant; eliminating the blow-up on deep dense traversals is planned separately.
+
+## [0.14.0] — 2026-05-30
+
+**`grep_code`: matches grouped by file — the path is no longer repeated on every line.**
+
+Previously `grep_code` returned a flat array where the full file path was duplicated in every match — yet matches often cluster in one file (dozens of hits with the same `path`). Matches are now grouped: the path is a key in the `files` object, with a list of `{line, content, context}` under it. On clustered results this noticeably shrinks the response.
+
+### Changed
+
+- **`grep_code` result format**: `{matches: [{path, line, content, context}], …}` → `{files: {"<path>": [{line, content, context}], …}, shown, limit, truncated}`. The path is stored once per file. The `context` field is omitted when `context_lines=0`. The `shown`/`limit`/`truncated` fields are unchanged.
+
+### Compatibility
+
+- **`grep_code` response format change** (`matches` array → `files` object grouped by path). Consumers read `result.files["<path>"]` instead of `result.matches[].path`. `grep_text`/`grep_body` are unaffected — their format is unchanged.
+
+## [0.13.0] — 2026-05-30
+
+**Compact JSON in MCP tool output instead of pretty.**
+
+MCP tool output is consumed by the model, not a human — pretty-JSON indentation and newlines waste tokens for nothing. We switch response serialization to compact (`to_string` instead of `to_string_pretty`). ~30% saved on every tool response, especially noticeable for federation (remote repos) and text tools. The data itself is unchanged — same JSON, just unformatted.
+
+### Changed
+
+- **MCP tool response serialization is now compact** (`to_string`): `wrap_with_meta` (18 universal tools — read_file, grep_*, get_function, list_files, etc.), `to_json` (`get_stats`/`stat_file`/`health`), `format_unavailable`, federation forwarding (`federation_error` + per-repo `get_stats` aggregation).
+- BSL-tools already emitted compact via `CallToolResult::structured` — unaffected.
+
+### Compatibility
+
+- The data format is unchanged — only pretty-formatting (indentation/newlines) was removed. Any JSON parser reads the result as before.
+- **CLI output** (`--json`) and the `daemon.json`/`config.json` files stay pretty — they are human-readable and not on the model's hot path.
+
+## [0.12.0] — 2026-05-30
+
+**`grep_code`: default `limit` lowered 500→100 and an explicit `truncated` flag added.**
+
+Based on real usage stats (a 2-month sample, ~240 `grep_code` calls): when the model sets `limit` itself, it picks ~20–40 matches (median 30), and specified 500 only twice out of a hundred calls. The old default of 500 (with a `path_glob`/`language` filter) inflated the response twofold versus native Grep (`head_limit` 250) — especially with `context_lines`. We lower the default to 100 and make truncation visible so the model can re-request a larger `limit` instead of treating a truncated list as complete.
+
+### Changed
+
+- **`grep_code` default `limit` 500 → 100** (new `GREP_CODE_DEFAULT_LIMIT` constant). Previously the default depended on the filter: 100 on full-scan / 500 with a `path_glob`/`language` filter; now a single default of 100. An explicitly passed `limit` works as before.
+- **`grep_code` result format**: instead of a bare array `[{path, line, content, context}]`, it now returns an object `{matches: [...], shown, limit, truncated}`. `truncated=true` means the result was cut off by `limit` or the byte cap (1 MB) — there are more matches, re-request with a larger `limit`. Previously truncation was silent and read as "these are all matches".
+- **`Storage::grep_code_filtered`** now returns `(Vec<GrepTextMatch>, bool)` — the second tuple element is the truncation flag.
+
+### Compatibility
+
+- **`grep_code` response format change** (array → object `{matches, …}`). Consumers that parsed the response as an array must read `result.matches`. `mcp-cache-ci` (uses only `_meta.dependent_files`) and federation forwarding are unaffected. `grep_text`/`grep_body` formats are **unchanged** — still arrays.
+
+## [0.11.0] — 2026-05-30
+
+**Optional whitelist of MCP tools via `[tools].enabled` in `daemon.toml`.**
+
+The fight for your tokens and speed continues: the server can now be configured to expose only a subset of tools in `tools/list` instead of all 25 (18 universal + 7 BSL). Fewer schema tokens on every `initialize`, less confusion for weaker models when picking a tool, same functionality for stronger ones. Default behavior is unchanged — if there is no `[tools]` section or `enabled` is empty, all registered tools remain available (backward compatible).
+
+### Added
+
+- **`[tools]` section in `daemon.toml`** with an `enabled: Vec<String>` field. Empty array or missing section — all tools available. Filled — only listed names appear in `tools/list`; others are blocked at `tools/call` with `-32602 Invalid params: tool 'X' is disabled by [tools].enabled whitelist in daemon.toml`. Double protection is needed because the model may invoke a tool from its memory / system prompt bypassing `tools/list` — a `list_tools`-only filter would not stop that.
+- **`CodeIndexServer::with_allowed_tools(Option<BTreeSet<String>>)`** — builder for setting the whitelist programmatically (used by `cli.rs`).
+- **`CodeIndexServer::validate_whitelist(&BTreeSet<String>) -> Vec<String>`** — returns names that do not match any registered tool (typos, removed tools). Used by `cli.rs` for a startup warning.
+- **Startup logs**: empty `enabled` → `[tools].enabled is empty — whitelist disabled, all tools available`; non-empty → `[tools].enabled whitelist active: N known tools enabled (M in list)` + warning on unknown names.
+- **3 parsing tests** for the `[tools]` section in `daemon_core::config::tests` (`tools_section_default_empty`, `parses_tools_whitelist`, `parses_empty_tools_section`).
+
+### Compatibility
+
+- Fully backward compatible. Old `daemon.toml` without a `[tools]` section continues to work as before (all tools available). Default behavior matches v0.10.x.
+- Minimum functionally safe set: `read_file`, `grep_code`, `get_function`, `find_symbol`, `list_files`, `get_stats`, `health`. Trimming below this (e.g., keeping only `grep_body` without `grep_code`) leads to blindness on imports / directives / module-level code and fallbacks via the expensive full `read_file` — the token savings will be destroyed.
+
+## [0.10.4] — 2026-05-22
+
+**Fix for publishing to the MCP registry: namespace case.**
+
+The registry rejected `server.json` with a 403 — the namespace was given in lowercase (`io.github.regsorm`), while OIDC grants rights to a namespace that exactly matches the GitHub login (`io.github.Regsorm`). The case in `name`/`mcpName` is fixed. npm publishing already succeeded in 0.10.2/0.10.3; this patch completes the registration of the listing in the official registry.
+
+### Fixed
+
+- **`server.json` `name` and `package.json` `mcpName`** — namespace case `io.github.Regsorm/code-index` (exactly as the GitHub login).
+
+### Changed
+
+- **Workspace version** 0.10.3 → 0.10.4.
+
+## [0.10.3] — 2026-05-22
+
+**Fix for publishing to the MCP registry: description length.**
+
+The registry rejected `server.json` with a 422 — the `description` field exceeded the 100-character limit. Shortened to 98. npm publishing already succeeded in 0.10.2; this patch completes the registration of the listing in the official registry.
+
+### Fixed
+
+- **`server.json` `description`** shortened to ≤100 characters (registry requirement).
+
+### Changed
+
+- **Workspace version** 0.10.2 → 0.10.3.
+
+## [0.10.2] — 2026-05-22
+
+**Auto-publish fix: a working workflow trigger.**
+
+In 0.10.1 publishing did not fire — `publish-registry.yml` was on a `workflow_run` trigger, which GitHub only runs when the file is present on the default branch (`main`); releases, however, are tagged from a working branch. In addition, the `mcp-publisher` download pattern was picking up an extra asset.
+
+### Fixed
+
+- **`publish-registry.yml` trigger** switched from `workflow_run` to `push: tags: ['v*']` — works from any branch. Added a step that waits for the GitHub Release (the code-index archives) to be ready before `npm publish`, to eliminate a race.
+- **`mcp-publisher` download** — exact asset pattern `mcp-publisher_linux_amd64.tar.gz` (previously `*linux_amd64.tar.gz` also matched `registry_linux_amd64.tar.gz`).
+- The `mcp-publisher login github-oidc` and `publish` commands were verified against the actual CLI (v1.7.9).
+
+### Changed
+
+- **Workspace version** 0.10.1 → 0.10.2.
+
+## [0.10.1] — 2026-05-22
+
+**Publishing to npm and the official MCP registry.**
+
+The public `code-index` can now be installed via `npx`/`npm` and is registered in the [official MCP registry](https://registry.modelcontextprotocol.io/) (`io.github.regsorm/code-index`). The Rust binary is still distributed via GitHub Releases — the npm package is only a thin wrapper that downloads the archive for the current platform on install. `bsl-indexer` stays private and is not published to the registry.
+
+### Added
+
+- **npm wrapper `@regsorm/code-index-mcp`** (the `npm/` directory): `package.json` with `mcpName`, `bin/cli.js` (transparently proxies arguments and stdio to the native binary), `scripts/postinstall.js` (downloads the `code-index-<platform>` archive from GitHub Releases and unpacks it with the system `tar`/bsdtar). Supports Windows x64, Linux x64, macOS arm64.
+- **`server.json`** — the listing for the official MCP registry (npm package, stdio transport, the `serve` subcommand).
+- **`.github/workflows/publish-registry.yml`** — after a successful `Release` on a `v*` tag: `npm publish` + `mcp-publisher publish`. The version is substituted from the tag. Requires the `NPM_TOKEN` secret.
+
+### Changed
+
+- **Workspace version** 0.10.0 → 0.10.1.
+
+### Compatibility
+
+- Fully backward compatible. There are no changes in the indexer code — only the distribution infrastructure.
+
+## [0.10.0] — 2026-05-21
+
+**1C data-link graph (data-graph): new BSL tools `get_data_links` and `find_data_path`.**
+
+Complements the CALL graph (`proc_call_graph`) with a DATA-LINK graph — "object → object" edges built from the reference types of attributes, register dimensions, and tabular-section attributes. It closes a common "wandering through the structure" pattern: instead of a series of `get_object_structure`/`get_metadata_structure` calls to trace links by hand — a single graph traversal. (On the real "collapse stock by customs declaration" case this used to be 37 structure queries → now a single `get_data_links`.)
+
+### Added
+
+- **`data_links` table** in the `bsl-extension` schema (`SCHEMA_EXTENSIONS`, additive via `CREATE TABLE IF NOT EXISTS` — no migration required): `from_object`, `from_path` (attribute / `Table.attribute` / dimension), `to_object`, `link_kind` (`attr`/`tabular_attr`/`register_dim`), `is_composite`, `is_universal`. Indexes `idx_dl_from` (forward traversal) and `idx_dl_to` (reverse — "who references X").
+- **`crates/bsl-extension/src/xml/object_attributes.rs`** — a parser for reference types from individual objects' XML (`Catalogs/<X>.xml`, `Documents/<Y>.xml`, registers). Type classification: a concrete `cfg:CatalogRef.Контрагенты` → an edge to `Catalog.Контрагенты`; a composite one (several `<v8:Type>`) → several edges (`is_composite`); a generic one (`cfg:CatalogRef` without a name, `cfg:AnyRef`, `cfg:DefinedType.X`) → a terminal `*`-node (`is_universal`, not expanded during traversal — protection against fan-out and noise); primitives (`xs:`/`v8:`) are discarded. A safety cap for pathological type lists (>30 concrete types → `*Multiple`).
+- **`index_data_links`** in `index_extras::run_index_extras` — traverses the object XML and populates `data_links` via a full rebuild (like the rest of `index_extras`). On a large configuration (~1900 object XMLs / ~68 MB) — ~1.3–1.9 s; incrementality is not needed.
+- **MCP tool `get_data_links(repo, object, direction=out|in|both, depth=1..4)`** — the neighborhood of an object in the data-link graph via a recursive CTE. `out` — what it references; `in` — who references it; terminal `*`-nodes are not expanded during traversal.
+- **MCP tool `find_data_path(repo, from, to, max_depth=4)`** — a path (a chain of reference links) between two objects (BFS over `data_links`, analogous to `find_path` for the call graph).
+- Both tools are registered in `BslLanguageProcessor::additional_tools` (now **7 BSL tools**, **25** in total in the `bsl-indexer` build), available through federation as well (`POST /federate/extension`). Parser unit tests (3 type cases, tabular section, dimensions, cap) and population tests.
+
+### Changed
+
+- **Workspace version** 0.9.1 → 0.10.0.
+
+### Compatibility
+
+- Fully backward compatible. The new table is created idempotently at startup; existing indexes and tools are untouched. The public `code-index` binary does not change — the feature lives only in `bsl-indexer` (`bsl-extension`).
+
+## [0.9.1] — 2026-05-12
+
+**Stage 3 of the migration to event-based cache invalidation: notifying `mcp-cache-ci` after reindexing.**
+
+It closes the loop: file saved → daemon (watcher) detected it → reindexed into SQLite → **sent `POST /invalidate {file_paths: [...]}` to cache-ci**. Using `reverse_index` (populated in stage 2 via `_meta.dependent_files`), cache-ci surgically drops only the dependent entries; the rest of the cache hits are preserved.
+
+### Added
+
+- **`crates/code-index-core/src/daemon_core/cache_client.rs`** — `CacheClient` with a pool of `reqwest::Client` (timeout 2s, keep-alive 60s) and a list of target URLs. The `invalidate_files(&[String])` method POSTs to all targets in parallel; on failure (network, 5xx, timeout) — an `eprintln!` warning and we move on; it must not panic, and the TTL on the cache-ci side serves as a safety net.
+- **`[[cache_targets]]` section in `daemon.toml`** + the `CacheTargetEntry { url: String }` struct in `daemon_core/config.rs`. Example:
+
+  ```toml
+  [[cache_targets]]
+  url = "http://127.0.0.1:8011"
+  ```
+
+  Multiple entries are allowed (multi-cache-ci topologies: local Windows + remote rag-VM). Absence of the section (or an empty list) → the event channel is off, behavior as before v0.9.1.
+- **Helper `worker::collect_invalidate_paths(root, batch)`** — collects a deduplicated list of relative file paths from a batch of FS events. It accounts for all types (Modified/Created/Deleted) — deleting a file must also drop the associated cache entries.
+- **`cache_client: Option<Arc<CacheClient>>` parameter** in `worker::run_worker` and `runner::spawn_worker`. It is threaded through from `runner::run` and `runner::handle_reload` (reload recreates `CacheClient` from the new config for added folders; existing workers keep their client until a daemon restart).
+- **Unit tests** for `cache_client.rs`: empty targets → `is_empty()`; trailing slashes are stripped; an invalid target does not panic (connection refused → 0 successes). Tests for config.rs `cache_targets_default_empty` and `parses_cache_targets_list`.
+
+### Changed
+
+- **`worker::run_worker` signature** — a new trailing parameter `cache_client`.
+- **`runner::spawn_worker` signature** — the same.
+- **`commit_batch()` now returns a check result** — if the commit failed, no invalidate is sent (there is no new data in the index anyway; let cache-ci keep serving the old data — it will be corrected either on the next successful batch or via TTL).
+- **Workspace version** 0.9.0 → 0.9.1.
+
+### Compatibility
+
+- `daemon.toml` without `[[cache_targets]]` — fully functional (behavior as before v0.9.1, no network traffic to cache-ci).
+- `daemon.toml` with `[[cache_targets]]` — the event channel is activated automatically at startup.
+- The `run_worker` / `spawn_worker` API — the signature changed (additive last param). External clients of the `code-index-core` crate (if any) must pass `None` for compatibility.
+
+### Architecture (final state of the chain)
+
+After v0.9.1 + cache-ci 0.2.0:
+
+1. **The daemon's read-tools** return `{result, _meta: {dependent_files: [...]}}` (v0.9.0).
+2. **`mcp-cache-ci`** on cache-fill writes `cache_key → file_paths` into `reverse_index` (cache-ci 0.2.0).
+3. **The daemon watcher** on an FS event → reindex → `commit_batch` → `cache_client.invalidate_files(...)` → cache-ci drops surgically via `reverse_index` (v0.9.1).
+4. **TTL fallback** — the third echelon of the safety net: if an event is lost (network, daemon crash, ReadDirectoryChangesW buffer overflow), the entry expires on its own after 600s/3600s.
+
+## [0.9.0] — 2026-05-12
+
+**Phase 2 (a stage of the migration to event-based cache invalidation): `_meta.dependent_files` in read responses.**
+
+All MCP data tools now return a unified JSON format:
+
+```json
+{
+  "result": <prev plain payload>,
+  "_meta": { "dependent_files": ["src/X.bsl", "src/Y.bsl"] }
+}
+```
+
+`dependent_files` is the list of file paths the response was built from. The intended consumer is `mcp-cache-ci`: on cache-fill it registers `cache_key → file_path` links in `reverse_index` and then surgically drops the affected entries on a signal from the daemon after a file is reindexed (stage 3, in preparation).
+
+### Compatibility (BREAKING CHANGE to the response format)
+
+All read-tool clients must be ready for the new `{result, _meta}` structure:
+
+- Before: `search_function` returned a flat array `[FunctionRecord, ...]`.
+- Now: `{"result": [FunctionRecord, ...], "_meta": {"dependent_files": [...]}}`.
+
+For the existing consumer (`mcp-cache-ci` 0.2.0+) the behavior is backward compatible: cache-ci parses `_meta.dependent_files` if present, otherwise works as before (insert without dependencies, TTL fallback).
+
+Tools **without** the wrapper (response format unchanged):
+
+- `health` — non-cacheable.
+- `get_stats` — diagnostic; its format is extended across federation, and a wrapper would break the aggregation.
+- `stat_file` — trivial single-file.
+
+### Added
+
+- **Wrapper helpers in `crates/code-index-core/src/mcp/tools.rs`:**
+  - `wrap_with_meta<T: Serialize>(result, dependent_files)` — final serialization into `{result, _meta}` with deduplication of file paths.
+  - `collect_paths_via<R>(storage, records, extract: fn(&R) -> file_id)` — collect paths from a vec of records via an extractor.
+- **Wrapper helpers in `crates/bsl-extension/src/tools/mod.rs`:**
+  - `wrap_with_meta(result: Value, dependent_files: Vec<String>) -> Value` for BSL extension tools.
+  - `wrap_error(error_value: Value) -> Value` — even on error the format is unified.
+- **Support for `_meta.dependent_files` in core data tools:**
+  - `search_function`, `search_class` — DISTINCT file paths from the vec of records.
+  - `get_function`, `get_class` — the same.
+  - `find_symbol` — the union of paths from functions+classes+variables+imports.
+  - `get_imports` (by file and by module).
+  - `get_file_summary` — path from args.
+  - `get_callers`, `get_callees` — file ids from CallRecord.
+  - `grep_body` — file_path directly from GrepBodyMatch.
+  - `grep_code`, `grep_text`, `search_text` — path directly from the match structs.
+  - `read_file` — path from args.
+  - `list_files` — paths from ListedFile.
+- **Support for `_meta.dependent_files` in BSL extension tools** (an empty array for now — the XML metadata parser is not tied to file_path; real dependencies are a task for the next iteration):
+  - `get_object_structure`, `get_form_handlers`, `get_event_subscriptions`, `find_path`, `search_terms`.
+
+### Changed
+
+- **Workspace version** bumped 0.8.1 → 0.9.0 (minor — a backward-compatible format extension for the cache-ci client, breaking for clients that parsed the flat payload).
+
+### Next steps
+
+- Stage 3: `POST /invalidate {file_paths}` from the daemon to cache-ci after the SQLite `transaction.commit()` for a batch of FS events. The cache-ci 0.2.0 side is already ready to receive it.
+
+## [0.8.1] — 2026-05-06
+
+**Patch release: BSL extension tools in daemon mode and through federation.** It fixes two public regressions of v0.8.0 that made five BSL tools (`get_object_structure`, `get_form_handlers`, `get_event_subscriptions`, `find_path`, `search_terms`) non-functional in the standard production scenario (repos served by the daemon, federation repos on a remote node).
+
+### How we found it and why we fixed it ourselves
+
+The regression was discovered by us **while operating v0.8.0** (2026-05-06): an attempt to call `get_object_structure` on any BSL repo led to `database error: no such table: metadata_objects`, and on a federation repo — to `extension tool '...' currently supports only local repos`. No one had reported the errors before us — external users of v0.8.0 may not have reached the 1C branch. Localized to two points in `code-index-core`: the calls to `apply_schema_extensions` / `index_extras` existed only in the CLI `index` command (`cli.rs`) and were absent in `daemon_core/worker.rs`; and `mcp::call_tool` had a hard rejection for `is_local == false`. After a full verification cycle (235 unit tests + a smoke on 4 BSL repos locally and through federation on the VM) — the fix was rolled out as the v0.8.1 patch without any involvement of the external community.
+
+### Fixed
+
+- **The daemon now applies the processors' `schema_extensions` and `index_extras`.** In v0.8.0 these calls were only in the CLI `index <path>` command, while the daemon worker did not make them. The result: on any BSL repo indexed via `bsl-indexer.exe daemon run`, the BSL tools failed with `database error: no such table: metadata_objects`. Now the `daemon_core/worker.rs` worker resolves the processor itself using the rule "explicit `language` from `daemon.toml` → fallback `detect()`", applies `apply_schema_extensions` BEFORE `full_reindex` (creates empty tables — the DDL is idempotent), and calls `index_extras` BEFORE `flush_to_disk` (populates the tables from `Configuration.xml`). For repos without a `Configuration.xml` (e.g., old data-processor dumps) the tables are created empty — the tools respond with `[]` and no exception.
+- **Federation now forwards extension tools to remote nodes.** Previously any BSL-tool call on a remote repo (four production bases on the remote node) returned `extension tool '...' currently supports only local repos`. A universal route `POST /federate/extension` was introduced with the payload `{tool_name, args}` — a single route for all extension tools, extensible when new LanguageProcessors are added. On the source side `mcp::call_tool` forwards the call through `dispatcher::dispatch_remote_value`. Both federation nodes must be upgraded to 0.8.1 synchronously — an old node will return 404 on the new route.
+
+### Added
+
+- **`ProcessorRegistry::resolve(explicit_language, repo_root)`** — a two-step processor resolution: first by the explicit `language` from the config, then a fallback to `detect()` by root markers. Used in the daemon worker and in the CLI `index` command. It unifies "indexing" behavior regardless of how it was launched.
+- **The `mcp::ExtensionToolParams { tool_name, args }` struct** — the payload for the federation forward of extension tools.
+- **Universal handler `handle_extension_tool` in `federation::server`** — finds the tool in the `extension_tools` snapshot, builds a `ToolContext` for a local repo, and calls `IndexTool::execute`. If there is no such tool on the target node (e.g., it was launched without bsl-extension) — it returns a `federation_error` with a clear message.
+
+### Changed
+
+- **`run_worker` takes `processor_registry: Option<Arc<ProcessorRegistry>>`** (the last parameter). `None` = universal-only build (`code-index.exe`); `Some(reg)` = `bsl-indexer.exe`. Used to resolve the processor of the current repo.
+- **`runner::run` takes `processor_registry`** and threads it into `spawn_worker` (initial loop + `handle_reload`).
+- **`cli::handle_daemon` takes `processor_registry`** — passed to `runner::run` when the daemon starts.
+- **`Commands::Index` uses `resolve(None, root)`** instead of a direct `detect(root)` — identical behavior, but a single code path.
+
+### Compatibility
+
+The public API signature changes in `daemon_core::worker`/`runner`/`cli` are additive (new parameters at the end). The `bsl-indexer` 0.8.1 build is compatible with a v0.8.0 `daemon.toml` — no DB migration is needed (`apply_schema_extensions`'s DDL is idempotent).
+
+**Federation:** both nodes must be upgraded at the same time. A pre-0.8.1 node will return `404 Not Found` on `POST /federate/extension`, and the new node will surface this as `federation_error`.
+
+## [0.8.0] — 2026-05-05
+
+**Phase 2 "content for code files"** — closing the main limitation of Phase 1. Before v0.8.0, `read_file` for `.py`/`.bsl`/`.rs`/`.ts` and other code files returned `category="code"` with an empty `content`. Now the content is stored in a new `file_contents` table (zstd compression, migration v4) and served on every call. Additionally: a new `grep_code` tool for regex search directly over code-file content, and an oversize mechanism for files larger than a configurable limit.
+
+### Added
+
+- **`file_contents` table (migration v4).** DDL: `file_contents(file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE, content_blob BLOB, oversize INTEGER NOT NULL DEFAULT 0)`. Backfill is automatic — performed as part of `full_reindex` on the first run of v0.8.0 on an existing DB. Idempotent: a repeated call is safe (`INSERT OR REPLACE`). Estimate for UT (~15,665 `.bsl`, ~620 MB of sources): ~120 MB blob after zstd (~5×), a one-time backfill of ~1–2 minutes (pure I/O + zstd encode).
+
+- **`read_file` works fully for code files.** For `.py`, `.bsl`, `.rs`, `.ts` and other AST languages the decompressed content from `file_contents` is returned. `category="code"`. The old logic for reading text files via `text_files` is unchanged.
+
+- **Oversize mechanism.** Files larger than `max_code_file_size_bytes` (default **5 MB**) are stored with `oversize=1, content_blob=NULL`. AST parsing, FTS, and the call graph work fully for them. `read_file` for an oversize file returns a special response:
+  ```json
+  {
+    "category": "code",
+    "content": "",
+    "oversize": true,
+    "file_size": 8650240,
+    "size_limit": null,
+    "hint": "File is oversize: content is not stored in the index. Use get_function/get_class/grep_body."
+  }
+  ```
+
+- **`stat_file` reports `oversize`** for code files: an `Option<bool>` field was added to the response. For text files it is always `null`.
+
+- **The `max_code_file_size_bytes` limit configuration.** The hardcoded default is 5 MB (`DEFAULT_MAX_CODE_FILE_SIZE_BYTES` in `crate::daemon_core::config`). Overridden in `daemon.toml`:
+  ```toml
+  [indexer]
+  max_code_file_size_bytes = 5242880   # global override (5 MB)
+
+  [[paths]]
+  path = "C:/Repo1C"
+  max_code_file_size_bytes = 10485760  # for this repo — 10 MB
+  ```
+  Priority: per-path → the `[indexer]` section → the 5 MB default. The selection logic is the helper `PathEntry::effective_max_code_file_size(&IndexerSection)`.
+
+- **New MCP tool `grep_code` (Phase 2 bonus).** Regex search over code-file content — it closes the blind spot of `grep_body` (which searches only in function/class bodies). The data source is the `file_contents` table (zstd-decode on the fly in Rust; SQL does a pre-filter by path/language). The parameters are identical to `grep_text`: `regex`, `path_glob?`, `language?`, `limit?`, `context_lines?`. Files with `oversize=1` are skipped. Storage method: `Storage::grep_code_filtered(regex, path_glob, language, limit, context_lines, max_total_bytes) -> Vec<GrepTextMatch>`. The pub function signature: `pub async fn grep_code(entry, regex, path_glob, language, limit, context_lines)`.
+
+- **Federation route `/federate/grep_code`** — additive, does not break existing clients. A request to an old node (< 0.8.0) returns `404` — expected behavior; both nodes must be upgraded synchronously to use `grep_code` in federation.
+
+### Changed
+
+- **`Indexer::write_code_to_db`** — added a trailing parameter `raw_content: Option<&str>`. If set — the content is stored in `file_contents` (zstd encode). Internal API.
+- **`Storage::read_file_text`** — added a trailing parameter `size_limit_bytes: Option<i64>`. Used to fill the `size_limit` field in the oversize response. The MCP layer passes `None`.
+- **The `ParsedFile::Code` enum variant** — added a `raw_content: String` field.
+- **`worker::run_worker`** — added an `IndexerSection` parameter (last). Inside, the effective limit is computed and written into `IndexConfig.max_code_file_size_bytes`.
+- **`runner::spawn_worker`** — added an `IndexerSection` parameter, threaded into `run_worker`.
+
+### Security
+
+- **Protection against a zstd bomb.** All decompression calls in `read_file_content` and `grep_code_filtered` go through the private helper `Storage::decode_zstd_safe(blob) -> Result<Vec<u8>>`. It uses a streaming decoder with `io::Read::take(limit + 1)` — if the decompressed size exceeds `FILE_CONTENTS_MAX_DECOMPRESSED_BYTES` (256 MB), it returns an error and allocates no more RAM. 256 MB is well above any valid code file (5 MB default × ~5× zstd = ~25 MB; with headroom in case an operator raises `max_code_file_size_bytes`).
+
+### Fixed
+
+- **Backfill now works for all code files on a stable DB (a bug fix for the first preview build).** Previously the backfill was embedded in the processing of `metadata_updates` in `full_reindex` — a container of files with a changed mtime/file_size but the same content_hash. On a "stable" DB (nobody touched files since the last indexing) `metadata_updates` is empty, so the backfill **did not run for three of the four bases** — only repos with actually changed files were populated (the fourth got ~15 files out of 90K). Fix: moved into a **separate phase** `Stage 6` after removing stale entries, via the new Storage method `list_code_files_without_content() -> Vec<(file_id, path)>`. Now the backfill hits all code files that have no record in `file_contents` AND no record in `text_files`, regardless of whether the mtime changed. Real figures on the remote node after the fix: the Trade base 32599/32599 in 31.7 s, an Accounting base 37535/37535 in 37.9 s, the Payroll base 19066/19066 in 17.5 s, the second Accounting base likewise.
+- **Backfill in batches instead of one mega-transaction.** For a 90K-file repo, the whole phase inside a `BEGIN TRANSACTION` without a commit would bloat the WAL to many GB. An intermediate `commit_batch + begin_batch` every `batch_size.max(500)` files keeps the WAL within reasonable bounds.
+
+### Compatibility
+
+- **MCP API with no breaking changes.** All new response fields are `Option<...>` or `default false`; old clients will not break. The change to `read_file` for code files (returning real content instead of empty) is an improvement, not a breaking change.
+- **DB schema** — migration v4 is idempotent and safe on an existing v0.7.x DB. Rolling back to v0.7.x simply ignores the new table — both versions are compatible for reading old data.
+- **Storage API changed incompatibly** for direct users of the `code-index-core` crate: `Indexer::write_code_to_db`, `Storage::read_file_text`, `worker::run_worker`, `runner::spawn_worker` — new parameters. New public methods were also added: `Storage::upsert_file_content`, `read_file_content`, `has_file_content`, `delete_file_content`, `get_file_id_by_path`, `has_text_file`, `list_code_files_without_content`, `grep_code_filtered`. There are no external callers in the public API, but if there is private code with direct calls — update it.
+- **Federation** — the new route `/federate/grep_code` is additive. **Both federation nodes must be upgraded synchronously** to use `grep_code` in federation (otherwise the old node returns 404 on this route). The general `v0.7.0+` principle remains.
+- **`grep_code` skips oversize files** — this is a documented limitation, not a bug. For such files `get_function`/`get_class`/`grep_body` over AST data still work.
+
+## [0.7.3] — 2026-05-04
+
+**Bug fix**: extension tools (`get_object_structure`, `get_form_handlers`, and others provided via `LanguageProcessor::additional_tools()`) **were not registered in `tools/list`** when the server runs in federated mode (`serve.toml` present). For users in mono mode everything was correct.
+
+### Fixed
+
+- **`CodeIndexServer::from_federated`** now takes two extra parameters: `registry: Option<ProcessorRegistry>` and `local_languages: BTreeMap<String, String>`. The processor registry is stored in `Self.registry`, and right after building the repo map `extension_tools = collect_extension_tools(&active_languages, &reg)` is computed. Previously the federated constructor always initialized `extension_tools = Vec::new()` and `registry = None`, which zeroed out the conditional registration at serve start and on subsequent `reload_extensions` (`registry_opt = None` → `new_tools = Vec::new()`).
+- **`local_languages` for federation**: the `alias → language` map is collected from the local `daemon.toml` (`PathEntry::effective_alias()` + `PathEntry.language`) and set into `RepoEntry.language` for **local repos**. Without this, `collect_active_languages` did not find bsl/python/rust in the federation scenario (`federation::repos::merge` returns a `FederatedRepo` without the language field). Remote repos via federation still arrive without a language — for them extension tools are registered only if the same language is active on a local repo on this node.
+- **Behavioral consequence**: on the `bsl-indexer` build in federated mode, `tools/list` now returns 22 tools instead of 17 — `find_path`, `get_event_subscriptions`, `get_form_handlers`, `get_object_structure`, `search_terms` (the 5 BSL tools from `bsl-extension`) are added.
+
+### Compatibility
+
+- **MCP API unchanged** — the tool list changes only in the federated mode of the `bsl-indexer` build when there is at least one local repo with `language = "bsl"` in `daemon.toml`. The client sees this as a regular `notifications/tools/list_changed`.
+- **DB schema with no migrations.**
+- **Federation requires a synchronous upgrade of both nodes** — the general v0.7.0+ principle remains (the cross-node API did not change, but the useful effect is achieved only when both nodes are built at 0.7.3).
+- The `from_federated` signature changed incompatibly. There are no external calls in the public code-index API (it was used only from `cli::run`), but if you have private code with a direct call — update it.
+
+## [0.7.2] — 2026-04-29
+
+**Bug fix to v0.7.1**: the HTML parser was not picked up in repos with an explicit `language="..."` (python/rust/bsl, etc.) in `daemon.toml`. An attempt to index `.html` files produced the error `No parser for extension: html`.
+
+### Fixed
+
+- **`ParserRegistry::from_languages`** now registers the HTML parser **always**, in addition to the specified `language`. HTML is a universal asset (templates, generated docs, sphinx output, vue/svelte SFCs, etc.) that occurs in repos of any "primary language" and is not listed separately in `daemon.toml`. The `"html" => …` branch in the `match` is kept as an explicit no-op for documentation; the actual registration happens after the `match`, unconditionally.
+- This fixes the bug on `code-index index <repo> --force` for python/rust/bsl repos with html files.
+
+### Compatibility
+
+- MCP API unchanged.
+- DB schema unchanged.
+- A 0.7.1 binary without this fix may remain in production — html files simply will not get AST records until 0.7.2 + reindexing.
+
+## [0.7.1] — 2026-04-28
+
+**HTML parser** via tree-sitter — added **at a user's request**. Before 0.7.1, `.html` was indexed only as a text file (FTS+regex+read_file). Now it is a full AST with extraction of structural entities: elements with id, forms, input fields, links, inline scripts/styles, CSS classes. Backward compatibility is preserved: search_text/grep_text/read_file for html keep working via **dual indexing** (text_files + AST).
+
+### Added
+
+- **New parser** `crates/code-index-core/src/parser/html.rs` (~430 lines) based on `tree-sitter-html` 0.23. Supports `.html` and `.htm`. Registered in `ParserRegistry::new_all()` and `from_languages()`.
+- **HTML semantics → code-index tables mapping:**
+
+  | HTML construct | → | Table | Name |
+  |---|---|---|---|
+  | `<element id="X">…</element>` | `classes` | `X` (body=outerHTML, bases=tag_name) |
+  | `<form id|name="X">` | `classes` | `form_X` (bases="form") |
+  | `<form>` without id/name | `classes` | `form_<line>` |
+  | `<input/select/textarea name="Y">` | `variables` | `Y` (value=type/value attribute) |
+  | `<a href="URL">` | `imports` | `module=URL`, `kind="link"` |
+  | `<link href="URL" rel="X">` | `imports` | `module=URL`, `kind=X` (or "stylesheet") |
+  | `<script src="URL">` | `imports` | `module=URL`, `kind="script"` |
+  | `<img/iframe/video/audio/source/embed src="URL">` | `imports` | `module=URL`, `kind=tag_name` |
+  | `<script>…inline JS…</script>` | `functions` | `inline_script_<line>` (body=content) |
+  | `<style>…inline CSS…</style>` | `functions` | `inline_style_<line>` (body=content) |
+  | The `class="foo bar baz"` attribute | `variables` | `class:foo`, `class:bar`, `class:baz` (one record each) |
+
+- **Dual indexing**: for languages from `is_dual_indexed_language()` (in 0.7.1 — only `html`), a record in `text_files` is created in parallel during indexing. This keeps `search_text`/`grep_text`/`read_file` working for HTML files alongside the new structured queries (`get_class("cart")`, `find_symbol("submitOrder")`, `get_imports(module="bootstrap.css")`, etc.). Implemented via a new field `text_for_fts: Option<String>` in `ParsedFile::Code` + an extra parameter `text_for_fts: Option<&str>` in `Indexer::write_code_to_db`.
+- **File extensions**: `("html", "html")` and `("htm", "html")` moved from TEXT_EXTENSIONS to CODE_EXTENSIONS (`indexer/file_types.rs`). Added the public function `is_dual_indexed_language(language: &str) -> bool`.
+- **13 unit tests** for the html parser (`parser/html.rs::tests`): id element, a form with id/name/without both, input/select/textarea, link/script/img imports, inline script, inline style, the classes attribute, tolerance to Jinja templates, empty HTML, nested elements. Plus `file_types::html_is_code_with_dual_indexing` to check the categorization.
+- **Tolerance to templating engines**: `{{ … }}` and `{% … %}` are parsed as text content without crashing. Structural elements around them are extracted normally.
+
+### Changed
+
+- **`Indexer::write_code_to_db` signature**: added a trailing parameter `text_for_fts: Option<&str>`. An internal API, not MCP-visible. All known callers (worker.rs:380 for html, worker.rs:416 for xml_1c) are updated.
+
+### Compatibility
+
+- **MCP API unchanged** — no new tools, no new parameters. After reindexing, html files automatically become available to the existing tools: `get_class`, `find_symbol`, `search_function`, `get_imports`, `grep_body` + `search_text`, `grep_text`, `read_file`, `list_files`, `stat_file` keep working.
+- **DB schema with no migrations.** The existing files / functions / classes / imports / variables / text_files tables are used. The dual insert for html goes through the former `insert_text_file`.
+- **Federation with no new routes.** An internal mechanism; both nodes must be the same version (the 0.7.0 requirement still applies).
+- **Reindexing:** on the first run of v0.7.1, the daemon finds the mtime of html files unchanged relative to the last indexing and **will not** reindex them (the mtime pre-filter from v0.4.0). To get new structured records for already-indexed html, you need either an explicit re-index (`code-index index <repo>`) or a change to the file mtime. Recommended on the first upgrade to 0.7.1 — a one-time full re-index of repos with html files.
+
+## [0.7.0] — 2026-04-28
+
+**Phase 1 "read-only tools"** — closing gaps in code-index so that a remote repo over federation works "like a local one" for most reconnaissance and reading tasks. A read-only release: the DB schema is untouched, no reindexing is needed, backward compatibility is preserved.
+
+### Added
+
+- **`stat_file(repo, path)`** — metadata of a single file from the `files` table. Returns `{exists, path, language, size, mtime, lines_total, content_hash, indexed_at, category}`. `category` — `"text"` (content available via `read_file`) or `"code"` (Phase 1 does not store content for AST languages).
+- **`list_files(repo, pattern?, path_prefix?, language?, limit?)`** — a flat list of files with filtering. `pattern` — glob (`**/*.py`), `path_prefix` — a prefix (`src/auth/`). Returns `[{path, language, lines_total, size, mtime}]`. No separate `tree` endpoint — the structure is reconstructed from path strings.
+- **`read_file(repo, path, line_start?, line_end?)`** — the content of a **text file** (yaml/md/json/toml/xml/sh/INI/CSV/SQL, etc.) via the `text_files` table. `line_start`/`line_end` are 1-based, inclusive. Soft-cap **5000 lines OR 500 KB** (whichever comes first) with a `truncated=true` flag. Hard-cap **2 MB** even with a range (rejection). For code files — `category="code"` and an empty `content` (to be closed in Phase 2). Returns `{content, lines_returned, lines_total, truncated, indexed_at, category}`.
+- **`grep_text(repo, regex, path_glob?, language?, limit?, context_lines?)`** — regex search over text-file content via REGEXP. It closes the FTS5 gap with special characters (dots, parentheses, escapes). `path_glob` or `language` is desirable — otherwise it's a full scan, and the default limit is lowered to 100. `context_lines` — N lines before/after a match. A hard-cap on the total output size (1 MB).
+- **`path_glob` parameter** in `search_function`, `search_class`, `get_function`, `get_class`, `find_symbol`, `search_text`, `grep_body`. It narrows the output by file path. Implementation — a post-filter via the `globset` crate after the SQL fetch. The SQL LIMIT is increased up to 5× (but no more than 500) so the filter does not leave an empty result.
+- **`context_lines` parameter** in `grep_body` — N lines of context around the first up to 3 matches. Via the new `Storage::grep_body_with_options`. The existing `grep_body` without the context parameter works as before (backward compatibility for cli.rs/tests).
+- **A hard-cap on the total response size** in `grep_body` (with context_lines) and `grep_text` — 1 MB. Protection against overflowing the model context on a wide regex with a large context_lines.
+- **`Storage::get_path_by_file_id`** — a public method for the post-filter in the MCP layer.
+- **`storage::normalize_glob`** (pub(crate)) — `**` → `*` for compatibility with the usual glob syntax (SQLite GLOB and `globset` already understand `*` as multi-char + `/`).
+- **Federation routes:** `/federate/stat_file`, `/federate/list_files`, `/federate/read_file`, `/federate/grep_text`. Existing routes are extended with new parameters in the Params structs.
+- **20 new unit tests** for Phase 1: `normalize_glob`, `slice_with_caps` (4 cases), `stat_file_meta` (3 cases), `list_files_filtered` (3 cases), `read_file_text` (4 cases), `grep_text_filtered` (3 cases), `grep_body_with_options`, `get_path_by_file_id`.
+
+### Compatibility
+
+- **MCP API with no breaking changes.** All new parameters are `Option<...>`, optional. Old clients unaware of `path_glob`/`context_lines` work as before.
+- **Storage API with no breaking changes.** All existing methods (`search_functions`, `search_classes`, `search_text`, `grep_body`, `find_symbol`) kept their signature. New functionality is in new methods (`grep_body_with_options`) and in the post-filter in the MCP layer.
+- **DB schema unchanged.** No migrations, no reindexing required.
+- **Federation with no breaking changes.** New routes are additive. **Important:** both federation nodes (Windows and the VM) must be upgraded to 0.7.0 at the same time — otherwise calling new tools on an old node yields a 404.
+
+### Known limitations of Phase 1
+
+- **`read_file` for code files** (.py/.rs/.bsl/.ts/...) returns `category="code"` and an empty `content`. To be closed in Phase 2 with migration v4 + a zstd-compressed blob in the new `file_contents` table.
+- **Files without an extension** (Dockerfile, Makefile, Jenkinsfile, .gitignore, LICENSE) are not indexed by the walker — a blind spot for DevOps repos. A deliberate limitation.
+- **Binary 1C formats** (.epf, .erf, .cfe, .cf) are not indexed. Unpacking happens in an external pipeline.
+
+## [0.6.1] — 2026-04-26
+
+The rc7 technical debt is closed: a per-host port for the remote `code-index serve` used by federate forwarding. Up to and including 0.6.0 the remote node's port was hardcoded in `client.rs::DEFAULT_REMOTE_PORT = 8011`, and two serve nodes on the same machine inevitably overlapped in the connection pool — a pair was keyed only by IP. The change is fully backward compatible: a `serve.toml` without a `port` field works exactly as before (the default 8011 is used).
+
+### Added
+
+- **The `port: Option<u16>` field** in the `[[paths]]` section of `serve.toml` (`federation::config::ServePathEntry`). Optional, default — `DEFAULT_REMOTE_PORT` (8011). The `effective_port()` method returns the explicit value or the default. Validation forbids `port = 0` (reserved).
+- **The `port: u16` field** in `federation::repos::FederatedRepo` and `mcp::RepoEntry` — mandatory, filled from `ServePathEntry::effective_port()` at `merge`. For local records the value is informational (forwarding is not used for them).
+- **Tests:** `port_field_is_optional_and_defaults_to_remote_port`, `port_field_parses_when_explicit`, `zero_port_fails_validation` (config.rs), `port_defaults_when_not_set_and_propagates_when_set` (repos.rs), `pool_creates_separate_clients_for_different_ports_on_same_ip` (client.rs).
+
+### Changed
+
+- **`RemoteClientPool` keys clients by `(String, u16)`** instead of `String`. The signature is `get_or_create(&self, ip: &str, port: u16)`. The `default_port` field was removed: the pool itself does not fix a port; it is supplied per call from `RepoEntry::port`. `RemoteClientPool::new(timeout)` now takes only the timeout.
+- **`dispatcher::dispatch_remote` and `dispatch_remote_value` take `port: u16`** between `ip` and `tool`. All 13 tool handlers (`mcp/mod.rs`) and `tools::remote_stats` are updated — they thread `entry.port`.
+
+### Compatibility
+
+- **A `serve.toml` without a `port` field** parses as before; `DEFAULT_REMOTE_PORT` is used for all records. No migrations are required.
+- **The external MCP API is unchanged** — the `port` field does not appear in any tool call or tool result. It is a serve configuration detail and does not leave the process.
+- **The caching proxy (planned)** will read `serve.toml` to determine which `port` to use for each repo — now this is a single source of truth.
+
+## [0.6.0] — 2026-04-26
+
+A large release: a workspace refactor, the new `bsl-indexer` binary with full 1C specificity, multi-config processing of a single repo with base/ + extensions/, parsing of `ConfigDumpInfo.xml` for debug UUID identifiers, optional LLM enrichment of procedures via the `enrichment` cargo feature, and protection against model drift via `embedding_signature`. All of it was done on the `workspace-refactor` branch (24+ commits, 249 tests).
+
+### Added
+
+- **Cargo Workspace**. The single mono-crate is split into 4 crates with clear areas of responsibility:
+  - `code-index-core` (lib, publish=true) — the universal core: file scanner, tree-sitter parsers (Python/Rust/Go/Java/JS/TS/BSL), the SQLite schema, the MCP server, federation.
+  - `code-index` (bin, publish=true) — the public binary without 1C specifics.
+  - `bsl-extension` (lib, publish=false) — 1C specifics: XML parsers for the dump, the BSL call graph, the MCP tools `get_object_structure`/`get_form_handlers`/`get_event_subscriptions`/`find_path`/`search_terms`, optional LLM enrichment.
+  - `bsl-indexer` (bin, publish=false) — the private binary = core + bsl-extension. Used on the rag VM for indexing 1C configurations.
+
+- **Conditional MCP-tool registration**. At startup the MCP server reads `daemon.toml`, for each `[[paths]]` determines the `language` (explicitly or auto-detected by the repo root), collects the set of active languages, and registers ONLY the tools from matching `LanguageProcessor`s. If there is no BSL repository at all, the 1C tools do not appear in `tools/list` at all. A `notifications/tools/list_changed` notification is sent when `daemon.toml` is edited (file-watch with a 500ms debounce via `notify-debouncer-full`).
+
+- **`bsl-indexer` — a new separate binary** for 1C configurations. The release CI builds it for Windows/Linux/macOS (with the `enrichment` feature for production). Detailed instructions — in [docs/bsl-indexer.md](docs/bsl-indexer.md); deployment to the rag VM — [docs/deploy-vm-rag.md](docs/deploy-vm-rag.md).
+
+- **Multi-config layout** (`<repo>/base/Configuration.xml` + `<repo>/extensions/<EF_*>/Configuration.xml`). `BslLanguageProcessor::detects()` now recursively (depth ≤ 2) finds any `Configuration.xml`. `index_metadata_objects` traverses ALL configurations found in the tree and merges their objects into a single table (objects borrowed in extensions are skipped via `INSERT OR IGNORE`). `extension_name` is stored for each module — a filter between base and CFE is available via a query.
+
+- **The `metadata_modules` table** with the UUID triple for the 1C platform debugger (`dbgs-debug` setBreakpoint):
+  - `object_id` — the object/form UUID from the `uuid` attribute of the root element in its XML.
+  - `property_id` — the UUID of the module type (Module/ManagerModule/FormModule/...) — a platform constant; the dictionary is in `module_constants.rs`.
+  - `config_version` — a hash of the version from `ConfigDumpInfo.xml` (a separate parser). It changes on every configuration change.
+
+  This triple lets agents set breakpoints by a human-readable module name without touching a live infobase. On the UT scale ~8K modules, on BP configurations ~10K.
+
+- **MCP tool `search_terms`** — the third semantic search channel (after `search_function` and the future `semantic_search`). It uses FTS5 on the `procedure_enrichment.terms` column populated by LLM enrichment. Supports FTS syntax (AND, OR, NOT, "exact phrase", prefix*). NULL records (non-enriched procedures) are simply not found — this is progressive enhancement, not a bug.
+
+- **The `bsl-indexer enrich [--path P] [--limit N] [--reenrich]` subcommand** under the `enrichment` cargo feature. An HTTP client to an OpenAI-compatible chat-completions endpoint (OpenRouter / Ollama / any compatible). Parallel processing via `tokio::task::JoinSet` with a configurable `batch_size`. Protection against model drift via `embedding_meta.enrichment_signature` — when the model in the config changes, a warning is printed suggesting `--reenrich`.
+
+- **The `[enrichment]` section in `daemon.toml`** — provider, endpoint URL, model name, the name of the API-key env variable, batch size, the prompt template. Off by default (the feature is optional).
+
+- **Language auto-detect with a write-back into `daemon.toml`** via `toml_edit` (preserves comments). Algorithm: `Configuration.xml` → bsl, `pyproject.toml`/`setup.py` → python, `Cargo.toml` → rust, `package.json` → javascript/typescript, otherwise by the prevailing extension. If the heuristic does not fire — a warning to the log and a skip (no silent fallback).
+
+- **`Storage::apply_schema_extensions(extensions: &[&str])`** — the point of applying additional DDL from LanguageProcessors. Called once on the first open of a repo's DB for a language that needs specific tables.
+
+- **`LanguageProcessor::index_extras(repo_root, &mut storage)`** — a hook for specific post-processing after the main indexing (e.g., parsing XML and populating the `metadata_*` tables). The default implementation is a no-op.
+
+### Changed
+
+- **A parallel run of 4 repos on the rag VM (8-core Intel Xeon)** — the total time of a full indexing of UT + BP_1 + BP_2 + ZUP dropped from ~8m30s (sequential) to **3m11s** (×2.7 speedup). The bottleneck is the single-thread SQLite FTS rebuild in each process; the disk (NVMe) does not block, and the cold↔warm cache difference is only ~5 s.
+
+- **Protection against cascade transaction errors**. In each `index_*` function and in `build_call_graph` an idempotent `ROLLBACK` before `BEGIN` was added — if the previous function left an open transaction, the next one correctly closes it instead of crashing with "cannot start a transaction within a transaction".
+
+- **`config_watch::run_watch` — an initial seeding of active_languages at startup**. Before the fix, a client connecting BEFORE the first file change saw only core tools (because in mono mode `RepoEntry.language=None` when loaded via `cli::run`). After the fix — the first `tools/list` immediately contains the correct set for the current `daemon.toml`.
+
+- **CI setup**. `.github/workflows/release.yml` now builds 6 artifacts per tag: `code-index` × {Windows, Linux, macOS} + `bsl-indexer` × {Windows, Linux, macOS} (with `--features enrichment`). The cargo registry/git/target cache is keyed by `${{ runner.os }}-${{ matrix.target }}-${{ matrix.crate }}`.
+
+### Security
+
+- **`.mcp.json` excluded from tracking** via `.gitignore` + `git rm --cached`. The file is a local configuration; it contains SSH paths and URLs of a specific host and has no place in the repo.
+
+- **Internal IPs replaced with RFC 5737 doc-IP** (`192.0.2.0/24`) in all federation tests, comments, and config examples. The specific rag VM addresses in the deployment instructions — with the placeholder `<vm-rag-ip>`.
+
+### Empirical production verification (stages 7–8)
+
+- **Conditional registration on Claude Code 2.1.120** — `tools/list` correctly contains 18 tools (5 BSL + 13 core) when there is a BSL repo in `daemon.toml`, and 13 tools (core only) without one.
+- **`notifications/tools/list_changed` is IGNORED by Claude Code on 2.1.120** — the bug [anthropics/claude-code#13646](https://github.com/anthropics/claude-code/issues/13646) is confirmed empirically. The workaround is a manual `/mcp Reconnect`. Reconnect (issue #33779) on 2.1.120 already re-reads `tools/list` correctly.
+- **The rag VM (Linux, 8 cores, NVMe)** — Repo1C 53.6 s cold cache, 57.7 s warm, a 5 s difference = the disk is not the bottleneck. A parallel indexing of all 4 repos in 3m11s on 8 cores × ~2 rayon cores per process.
+
+### Documentation
+
+- **[docs/bsl-indexer.md](docs/bsl-indexer.md)** — the user guide for `bsl-indexer`: what it can do, how to build with/without the `enrichment` feature, how to set up enrichment with OpenRouter / Ollama, and the MCP-client limitations with a workaround.
+- **[docs/bsl-indexer-architecture.md](docs/bsl-indexer-architecture.md)** — the full architectural spec of the workspace refactor with the rationale for decisions.
+- **[docs/deploy-vm-rag.md](docs/deploy-vm-rag.md)** — a step-by-step deployment guide for the VM (installing the Rust toolchain, copying the sources, configuring daemon.toml, the systemd unit, the A/B protocol for comparison with pg_indexer).
+- **[deploy/systemd/bsl-indexer-daemon.service](deploy/systemd/bsl-indexer-daemon.service)** — a ready systemd unit with resource limits and protection against writing outside the allowed directories.
+
+## [0.5.0-rc6] — 2026-04-25
+
+### Added
+
+- **Federated `code-index serve` architecture** (modeled on `1c-router`/`mcp__1c__`). A single serve process serves a registry of repositories from several machines: for each tool call with `repo=X` the local serve looks at the ip — if it matches `[me].ip`, it reads the local SQLite, otherwise it makes an HTTP call to the remote serve. The source of truth for each repo is on a single machine (this is a proxy, not replication).
+
+  **New config** [`serve.toml`](src/federation/config.rs) — global, identical on all nodes (rolled out via a shared git repo `code-index-config`):
+
+  ```toml
+  [me]
+  ip = "192.0.2.10"
+  # token = "..."   # optional, not validated in rc6 (a stub for rc7)
+
+  [[paths]]
+  alias = "ut"
+  ip = "192.0.2.50"
+
+  [[paths]]
+  alias = "dev"
+  ip = "192.0.2.10"
+  ```
+
+  `daemon.toml` stays local (only this machine's paths, no schema changes).
+
+- **An internal endpoint `POST /federate/<tool_name>`** ([`src/federation/server.rs`](src/federation/server.rs)) — the receiving side of forwarding. The request body is JSON matching our `*Params` structs exactly. The response is whatever the local tool handler would have returned. `/federate` lives on the same axum router as `/mcp` and is protected by a shared whitelist middleware.
+
+- **IP whitelist middleware** ([`src/federation/whitelist.rs`](src/federation/whitelist.rs)). serve binds to `[me].ip` (not to `127.0.0.1`, not to `0.0.0.0`) — the port is active only on one interface. The allowed peer IPs are from `{all [[paths]].ip} ∪ {127.0.0.1, ::1}`. A foreign peer → `403 {"error":"forbidden","peer":"..."}`.
+
+- **A parallel fan-out in `get_stats(repo=None)`** ([`src/mcp/tools.rs`](src/mcp/tools.rs)) via `tokio::task::JoinSet`. Each remote repo is polled with a 5 s timeout; unreachable ones are returned as `{"repo":"...","status":"unreachable","error":"..."}` without blocking the rest.
+
+- **The `--serve-config <FILE>` flag on `code-index serve`**. If the flag is not set — `$CODE_INDEX_HOME/serve.toml` is searched. If there is no file — serve works as rc5 (mono mode, bind 127.0.0.1, no whitelist). With `transport=stdio` or an explicit `--path`, federation is not activated.
+
+  ```bash
+  # Federated mode (rc6+):
+  code-index serve --transport http --port 8011
+
+  # Compatible rc5 mode (mono):
+  code-index serve --transport http --port 8011 --path ut=C:/Repo1C
+  ```
+
+- **A pool of reusable HTTP clients** ([`src/federation/client.rs`](src/federation/client.rs)) — one `reqwest::Client` per remote IP, lazy init via `RemoteClientPool::get_or_create`. Timeout 5 s; idle pool 60 s.
+
+### Changed
+
+- **`RepoEntry` now stores `ip` and `is_local`**, and the `root_path` and `storage` fields are wrapped in `Option` (`None` for remote). The old constructors `open_readonly_multi` / `open_readonly` / `with_storage` set `is_local=true`, `ip="127.0.0.1"` — backward compatibility for tests and mono mode.
+
+- **`serve_http` takes optional `federate_router` and `whitelist`**. If passed — `Router::merge` for `/federate/*` and `axum::middleware::from_fn_with_state` for the whitelist. The listener now uses `into_make_service_with_connect_info::<SocketAddr>()` — without it the peer IP is not extracted in the middleware.
+
+- **`--host` became `Option<String>`**. If set — CLI takes priority; otherwise, if serve.toml is present — `[me].ip`, otherwise `127.0.0.1` (the rc5 default).
+
+### Loop protection
+
+- **No headers** like `X-Forwarded-Already`. Protection is static, via the config: each node knows its own `[me].ip` and forwards only if `repo.ip != own_ip`. On a config mismatch (`A: X→B`, `B: X→A`) the request fails by the 5s timeout with a clear error.
+- The `/federate/get_stats` receiver without `repo` limits the fan-out to its own local repos (it does not recursively traverse to others) to exclude a loop between nodes.
+
+### Roadmap (outside rc6)
+
+- Creating the `code-index-config` git repo with a `serve.toml` template — an operational task.
+- A Linux binary + a systemd unit for deployment to VM 200.
+- `[me].token` authorization — a Bearer header in `/federate/*`, checked in the whitelist middleware. The field is already parsed in the serve.toml schema.
+- A HEAD ping to the remote nodes in `health` — a low-priority feature.
+- Hot-reload of `serve.toml` without a restart (`POST /reload` for serve).
+
+## [0.5.0-rc5] — 2026-04-22
+
+### Added
+
+- **HTTP transport on `code-index serve`** via rmcp's `StreamableHttpService`. A single process serves all repositories under `mcp-supervisor`; clients connect to a shared URL without copying `--path` into each `.mcp.json`.
+
+  ```bash
+  # stdio (per-session, as before)
+  code-index serve --path ut=C:/Repo1C --path bp=C:/Repo1C-2
+
+  # http (shared process)
+  code-index serve --transport http --port 8011 --config C:/tools/code-index/daemon.toml
+  ```
+
+  The client `.mcp.json`:
+  ```json
+  "code-index": { "type": "http", "url": "http://127.0.0.1:8011/mcp" }
+  ```
+
+  Implementation — [`src/main.rs`](src/main.rs) `serve_http`: `StreamableHttpService::new(factory, LocalSessionManager, StreamableHttpServerConfig::default())`, mounted into `axum::Router::nest_service("/mcp", svc)`. The factory clones the already-built `CodeIndexServer` (it is `Clone`), so all sessions share a common set of open SQLite databases.
+
+- **Multi-repo in a single serve process**. `--path` now takes `alias=dir` and may be specified multiple times — each tool call passes a `repo=<alias>` parameter to select the repository. Without `=` — the old `alias=default` contract. The tool parameters got a `repo: String` field; the internal `RepoEntry` struct holds an open read-only `Storage` and `root_path` per repo.
+
+- **The `alias` field in `[[paths]]` of daemon.toml** — [`src/daemon_core/config.rs`](src/daemon_core/config.rs) `PathEntry::alias: Option<String>`. If not set — the alias is computed via `PathEntry::effective_alias()` from the last path segment (lowercase, spaces → `_`). The daemon ignores the field; only `code-index serve --config ...` uses it when building the repo list. Old configs without `alias` keep working (`#[serde(default)]`).
+
+- **The `--host`, `--port`, `--config` flags on `serve`**. `--config` points at `daemon.toml` — the list of repos and aliases is taken from there. CLI `--path` takes priority over the config. The default port is 8011 (the next free one in the mcp-supervisor range: 8001/8002/8007/8010).
+
+### Dependencies
+
+- Enabled the `rmcp/transport-streamable-http-server` feature (it pulled in `transport-streamable-http-server-session`, `server-side-http`, and transitively — `uuid`, `sse-stream`). `axum` and `tower` were already in deps for the daemon's health endpoint.
+
+## [0.5.0-rc4] — 2026-04-17
+
+### Fixed
+
+- **The daemon crashed when the console was closed on Windows**. `code-index` is built as a console-subsystem application: when launched in a user session (a Scheduled Task with `LogonType=Interactive`, a manual call from `cmd`/PowerShell), the process gets a console window and becomes its child. Closing the window sends `CTRL_CLOSE_EVENT`, and the daemon dies with it. For the standard installation via `scripts/install-daemon-autostart.ps1` this meant the console window popped up at logon, and closing it stopped the indexing.
+
+  **Fix**: in [`src/main.rs`](src/main.rs), `handle_daemon` for `daemon run` on Windows performs a self-detach — it restarts itself with the `DETACHED_PROCESS | CREATE_NO_WINDOW` flags, sets the environment variable `CODE_INDEX_DAEMON_DETACHED=1`, and terminates the parent process. The detached clone runs without a console and survives the closing of any parent session. On Unix the self-detach is not performed — daemonization is managed by `systemd`/`launchd`.
+
+  The implementation uses only `std::os::windows::process::CommandExt::creation_flags` and adds no new dependencies.
+
+## [0.5.0-rc3] — 2026-04-17
+
+### Fixed
+
+- **A race condition on editors' atomic save**. Editors (VS Code, IDEs, `git`) save files atomically: first they write to a temporary `<name>.tmp.<pid>.<ts>`, then rename it to the target file. The watcher via `ReadDirectoryChangesW` managed to see a `Create` event on the `.tmp` file, but by the time `hasher::file_hash()` was called the file had already been renamed. A wall of errors poured into the logs of the form `file_hash \\?\...\.mcp.json.tmp.10296.1776427368309: The system cannot find the file specified. (os error 2)`.
+
+  **Fix**: in [`daemon_core/worker.rs`](src/daemon_core/worker.rs), `apply_event` on `io::ErrorKind::NotFound` from `file_hash` now silently exits the handler. Only real errors are logged (permission denied, read error, etc.).
+
+### Added
+
+- **The `exclude_file_patterns` field in `.code-index/config.json`** — glob patterns of file names to exclude from indexing. It complements the existing `exclude_dirs`:
+
+  ```json
+  {
+    "exclude_dirs": [".vscode", "experimental"],
+    "exclude_file_patterns": ["*.tmp.*", "*.bak", "*.orig", "*.swp"]
+  }
+  ```
+
+  Patterns are matched by **basename** (the file name without the path). They are applied:
+  - in [`watcher.rs`](src/watcher.rs) — events from files matching a pattern are discarded before the `file_hash` call;
+  - in [`indexer/mod.rs`](src/indexer/mod.rs) `collect_candidates` / `collect_candidates_standalone` — the file is excluded from the WalkDir traversal before categorization.
+
+  The glob syntax is via the `globset` crate. Invalid patterns are logged and skipped (they do not break the startup).
+
+### Dependencies
+
+- Added `globset = "0.4"`.
+
+## [0.5.0-rc2] — 2026-04-17
+
+### Fixed
+
+- **WAL files grew to tens of GB in production**. After a day of work on our stand with 13 indexed folders (5 large 1C repos + 8 MCP modules) the WAL files took ~43 GB while the total size of the main DBs was ~16 GB:
+
+  | Repo | `index.db` | `index.db-wal` (before the fix) |
+  |------|-----------|---------------------------|
+  | Repo1C-3 | 4.7 GB | **19 GB** |
+  | Repo1C | 2.1 GB | **17 GB** |
+  | Repo1C-4 | 5.1 GB | 5.1 GB |
+  | dbgs-debug | 1.4 GB | 1.4 GB |
+
+  Free space on the system drive shrank by ~45 GB in a day.
+
+  **The cause**, found by code analysis:
+  1. `PRAGMA wal_autocheckpoint=500` (added in v0.5.0-rc1) moves pages from the WAL into the main DB, but **does not reduce the physical WAL file** — only an explicit `PRAGMA wal_checkpoint(TRUNCATE)` does that.
+  2. Under a bulk load (the initial reindex of 90K files, frequent watcher batches) the checkpoint does not keep up with the write rate.
+  3. The worker called `Storage::flush_to_disk()` via `Connection::backup()` after every batch — in disk mode (and the worker is always in it after a reopen) this is a useless copy of the DB onto itself, and the WAL does not shrink.
+
+  **Fix**:
+  - Added a `Storage::checkpoint_truncate()` method — a wrapper over `PRAGMA wal_checkpoint(TRUNCATE)` that actually collapses the WAL.
+  - In `worker.rs` after the initial reindex (when the worker is guaranteed to be in disk mode) — a mandatory `checkpoint_truncate`. This is the "fattest" source of WAL.
+  - In the watcher loop after `commit_batch` — `flush_to_disk` replaced with `checkpoint_truncate`. On graceful shutdown — the same.
+
+  **The result of the check on the same 13 folders**: the WAL stays at **0 bytes** after the initial reindex and after file edits through the watcher. ~48 GB freed.
+
+## [0.5.0-rc1] — 2026-04-17
+
+A major rework of the architecture: splitting into a **background writer daemon** and **MCP readers**.
+
+### Breaking changes
+
+- **`code-index serve` is now read-only**. It no longer indexes and does not hold a watcher — it only connects to the DB maintained by a separate daemon. If the daemon is not running or the folder is not in its config, a tool call returns a structured response `{"status": "daemon_offline" | "not_started" | "indexing", ...}` rather than crashing.
+- **The per-project PID lock was removed** (the `.code-index/serve.pid` file is no longer created). Any number of MCP processes can connect to a single `.code-index/index.db` in parallel.
+- **The `--no-watch`, `--flush-interval` flags** on `serve` were removed — they were specific to the former writer role and are inapplicable to read-only.
+
+### Added
+
+- **The `daemon` subcommand**: `code-index daemon run/start/stop/status/reload`. `run` — foreground (for a Scheduled Task / systemd), `start`/`stop`/`status`/`reload` — an HTTP client to a running daemon.
+- **The `CODE_INDEX_HOME` environment variable** — a single point of configuration. It contains `daemon.toml`, and the runtime files `daemon.pid`, `daemon.json`, `daemon.log` are placed there too. Works both via a system variable (`setx`) and via an `"env"` block in `.mcp.json`.
+- **The `daemon.toml` config** with the list of watched folders and parameters:
+  - `max_concurrent_initial` — how many folders are in the initial-reindex phase at once (default `1`, protection against a RAM spike).
+  - Per-folder `debounce_ms` / `batch_ms` — overriding the watcher delay per project.
+- **HTTP health IPC on loopback**: `GET /health`, `GET /path-status?path=...`, `POST /reload`, `POST /stop`. The port is chosen automatically and written into `daemon.json`.
+- **A per-folder lifecycle**: `not_started → initial_indexing → ready ⇄ reindexing_batch | error`. Visible in `daemon status`.
+- **A PowerShell script** `scripts/install-daemon-autostart.ps1` to install a Scheduled Task (the trigger is the user logon; it automatically runs `setx CODE_INDEX_HOME`).
+
+### Changed
+
+- **Memory**: only one in-memory SQLite storage at a time. After the initial reindex the worker flushes → reopens the same file in disk mode (WAL) → releases the semaphore permit. Peak RAM does not sum across folders.
+- **Repeated startup**: if `.code-index/index.db` already exists, the worker opens it directly in disk mode (skipping the backup disk→memory→disk). On 2 1C repos of ~90K files each, a repeated start takes **~12 s** (previously ~600 s with the same code before the fix).
+- **SQLite**: added `PRAGMA wal_autocheckpoint=500` and `PRAGMA journal_size_limit=67108864` — the WAL file does not bloat over long transactions and is truncated to 64 MB after a checkpoint.
+- **The MCP server** checks the folder status at the daemon before each tool call. If the folder is not `ready` — it returns a structured JSON with progress/a hint rather than an empirical result from a stale index.
+
+### Removed
+
+- The legacy modules `src/daemon.rs` and `src/pidlock.rs`.
+
+### Measurements (1C repos, 2 folders of 88–92K files, 80% XML)
+
+| Scenario | Time |
+|----------|-------|
+| Initial reindex from scratch, both folders sequentially (`max_concurrent_initial=1`) | ~10 min, RAM peak ~6 GB |
+| Repeated start on an existing DB | ~12 s |
+| Watcher: from a file edit to its appearance in the index | ~1.6 s (of which 1.5 s is the debounce — configurable) |
+| Graceful shutdown (`daemon stop`) | DB on disk without `-wal`/`-shm` files |
+
+### Technical debt
+
+- A `0/0` progress in `daemon status` during the initial reindex (cosmetic — it is not updated from the blocking phase).
+- Linux / macOS are not verified live — there is only theoretical cross-platform support via the `dirs` and `notify` crates. Feedback on the first non-Windows runs is appreciated.
+- There are no integration tests for daemon_core — only unit tests for `config`, `ipc`, `state`.
+
+## [0.4.0] — 2026-03-30
+
+- An `mtime`+`file_size` pre-filter for the initial reindex: 93K files are re-checked in ~4 s instead of ~163 s (SHA-256 only for changed files).
+- The `migrate_v3` migration — adds the `mtime`, `file_size` columns to the `files` table.
+- A per-project PID lock (`.code-index/serve.pid`) — protection against running two `serve` instances on one project simultaneously.
+
+## [0.3.0] — 2026-03-...
+
+- Parallel read+hash via rayon.
+- `hash_ast` without `to_sexp` (faster).
+- Removal of `max_file_size` for code — large BSL/XML files are now indexed in full.
+- Tuning of `mmap_size`, `batch_size` for the initial indexation.

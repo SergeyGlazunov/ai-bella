@@ -1,0 +1,55 @@
+{
+  "name": "ai-contour-kit",
+  "date": "2026-09-20",
+  "live_cutover": false,
+  "present": [
+    "controller/",
+    "systemd/ai-sync.service",
+    "systemd/ai-sync.timer",
+    "bootstrap.sh",
+    "contour.example.yaml",
+    "requirements.lock",
+    "secrets.example.yaml",
+    "USER.md",
+    "AGENT.md",
+    "DEVELOPMENT.md",
+    "compose/ai-stack/docker-compose.yml",
+    "compose/ai-stack/.env.example",
+    "compose/mcp_for_1c/",
+    "compose/mcp_for_1c/1c-mcp-suite/",
+    "compose/bsl-indexer/",
+    "compose/bsl-indexer/crates/",
+    "compose/bsl-indexer/deploy/docker/Dockerfile",
+    "integrations/idle_bsl.sh",
+    "integrations/skills/webui/",
+    "integrations/skills/cursor/",
+    "checks/"
+  ],
+  "missing": [
+    {
+      "id": "ubd_git_contents",
+      "why": "recipient clones their own remote onto /srv/ai/ubd"
+    },
+    {
+      "id": "filled_secrets",
+      "why": "recipient fills .env and /srv/ai/secrets; live .env was not copied"
+    },
+    {
+      "id": "open_webui_skill_json_exports",
+      "why": "live JSON exports contained user ids; markdown copies are under integrations/skills"
+    },
+    {
+      "id": "platform_help_data",
+      "why": "proprietary 1C platform help dump; optional MCP, not required for UBD graph/BSL"
+    },
+    {
+      "id": "kit_archive_checksum",
+      "why": "no tarball packed yet; run sha256sum after tar as in USER.md"
+    }
+  ],
+  "do_not_copy_from_live": [
+    "C:\\\\MCP",
+    "C:\\\\ai-stack",
+    "C:\\\\instructions-main-system_analytics"
+  ]
+}

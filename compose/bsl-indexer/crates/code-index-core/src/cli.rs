@@ -1,0 +1,1675 @@
+// Точка входа CLI — общая для бинарей `code-index` (публичный) и
+// `bsl-indexer` (приватный, с BSL-расширением). Каждый бинарь зовёт
+// `run(registry)`, передавая свой `ProcessorRegistry`: code-index —
+// только встроенные процессоры, bsl-indexer — те же плюс
+// `BslLanguageProcessor` из crate'а bsl-extension.
+
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::extension::ProcessorRegistry;
+use crate::indexer::config::IndexConfig;
+use crate::indexer::Indexer;
+use crate::storage::memory::StorageConfig;
+use crate::storage::Storage;
+
+#[derive(Parser)]
+#[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Запустить MCP-сервер (read-only). Индексацию ведёт отдельный демон;
+    /// этот режим используется Claude Code и другими клиентами как MCP-транспорт.
+    ///
+    /// Multi-repo: --path можно указать несколько раз в формате `alias=dir`,
+    /// тогда в каждом tool-call LLM передаёт параметр `repo=<alias>` для выбора репо.
+    /// Без `=` — одиночный репо под alias `default` (старый контракт).
+    ///
+    /// Примеры:
+    ///   code-index serve --path C:\Repo1C                          # single, alias=default
+    ///   code-index serve --path ut=C:\Repo1C --path bp=C:\Repo1C-2   # multi, alias=ut/bp
+    Serve {
+        /// Корневые директории проектов. Формат: `alias=dir` или просто `dir` (alias="default").
+        /// Можно указать несколько раз. Если не указан ни `--path`, ни `--config` —
+        /// берётся текущая директория с alias=default.
+        #[arg(short, long, value_name = "ALIAS=DIR")]
+        path: Vec<String>,
+
+        /// Транспорт: `stdio` (per-session) или `http` (shared process под mcp-supervisor).
+        #[arg(short, long, default_value = "stdio")]
+        transport: String,
+
+        /// HTTP: адрес биндинга. Если не задан и есть `serve.toml` —
+        /// берётся `[me].ip`. Иначе по умолчанию `127.0.0.1`.
+        #[arg(long)]
+        host: Option<String>,
+
+        /// HTTP: порт биндинга (используется только при `--transport http`).
+        /// По умолчанию 8011 — следующий свободный после 8001/8002/8007/8010.
+        #[arg(long, default_value_t = 8011)]
+        port: u16,
+
+        /// Путь к `daemon.toml` — подтянуть список репо и их алиасов из секции `[[paths]]`.
+        /// Если указан и `--path` — CLI-пути имеют приоритет и конфиг игнорируется.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+
+        /// Путь к глобальному `serve.toml` (rc6+). Если не задан, ищется
+        /// `$CODE_INDEX_HOME/serve.toml`. Если файл существует — включает
+        /// федеративный режим: bind на `[me].ip`, IP-whitelist, форвард
+        /// tool-call для удалённых репо.
+        #[arg(long, value_name = "FILE")]
+        serve_config: Option<PathBuf>,
+    },
+
+    /// Проиндексировать директорию (однократно)
+    Index {
+        /// Путь к директории (позиционно). Соседние команды принимают путь как
+        /// `--path`, поэтому здесь работают ОБЕ формы: `index C:\Repo` и
+        /// `index --path C:\Repo`.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+
+        /// Путь к директории — именованная форма, как у `stats`/`clean`/`query`.
+        #[arg(short, long = "path", value_name = "PATH", conflicts_with = "path")]
+        path_named: Option<String>,
+
+        /// Принудительная полная переиндексация (игнорировать хеши)
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Показать статистику базы данных
+    Stats {
+        /// Путь к корню проекта
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Вывод в JSON вместо текста
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Быстрый поиск символа (функции, классы, переменные, импорты по точному имени)
+    Query {
+        /// Имя символа для поиска
+        symbol: String,
+
+        /// Путь к корню проекта
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Вывод в JSON вместо текста
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Создать конфигурацию .code-index/config.json с настройками по умолчанию
+    Init {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+
+    /// Удалить из индекса файлы, которых нет на диске
+    Clean {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+
+    /// Полнотекстовый поиск функций по имени/телу (FTS)
+    SearchFunction {
+        /// Поисковый запрос
+        query: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Полнотекстовый поиск классов по имени/телу (FTS)
+    SearchClass {
+        /// Поисковый запрос
+        query: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Получить функцию по точному имени
+    GetFunction {
+        /// Имя функции
+        name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку (не используется при точном поиске, для совместимости)
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Получить класс по точному имени
+    GetClass {
+        /// Имя класса
+        name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку (не используется при точном поиске, для совместимости)
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Кто вызывает данную функцию (callers)
+    GetCallers {
+        /// Имя функции
+        function_name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Что вызывает данная функция (callees)
+    GetCallees {
+        /// Имя функции
+        function_name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Получить импорты файла или модуля
+    GetImports {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// ID файла в индексе
+        #[arg(long)]
+        file_id: Option<i64>,
+
+        /// Имя модуля
+        #[arg(short, long)]
+        module: Option<String>,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Карта файла: все функции, классы, импорты, переменные
+    GetFileSummary {
+        /// Путь к файлу (как в индексе)
+        file: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+
+    /// Полнотекстовый поиск по текстовым файлам
+    SearchText {
+        /// Поисковый запрос
+        query: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Поиск подстроки или regex в телах функций и классов (в отличие от FTS, поддерживает точки и спецсимволы)
+    GrepBody {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Буквальная подстрока для поиска (LIKE). Поддерживает точки и спецсимволы.
+        #[arg(long)]
+        pattern: Option<String>,
+
+        /// Регулярное выражение для поиска (REGEXP). Альтернатива --pattern.
+        #[arg(long)]
+        regex: Option<String>,
+
+        /// Фильтр по языку (bsl, python, rust, java, go, javascript, typescript)
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+
+    /// Управление фоновым демоном индексации
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Запустить демон в foreground (вызывается Scheduled Task / systemd / launchd)
+    Run,
+
+    /// Показать статус демона (GET /health)
+    Status {
+        /// Вывод в JSON вместо человекочитаемого текста
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Попросить демон перечитать конфиг (POST /reload)
+    Reload,
+
+    /// Остановить демон (POST /stop)
+    Stop,
+}
+
+/// Получить путь к БД для проекта
+fn get_db_path(project_path: &str) -> PathBuf {
+    let root = Path::new(project_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(project_path));
+    root.join(".code-index").join("index.db")
+}
+
+/// Собрать список (alias, root, db_path) для MCP-сервера.
+///
+/// Порядок источников:
+/// 1. Если передан `--path` — используем CLI-аргументы (старый контракт).
+/// 2. Иначе если указан `--config` — берём секцию `[[paths]]` из daemon.toml,
+///    алиас вычисляется через [`PathEntry::effective_alias`].
+/// 3. Иначе — текущая директория под alias=default.
+///
+/// Параллельно создаём пустую `.code-index/index.db` со схемой, чтобы MCP-сервер
+/// мог открыть read-only до того, как демон проиндексирует путь.
+fn build_repo_entries(
+    cli_paths: Vec<String>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Vec<(String, PathBuf, PathBuf)>> {
+    // (alias, dir)
+    let pairs: Vec<(String, String)> = if !cli_paths.is_empty() {
+        let mut out = Vec::with_capacity(cli_paths.len());
+        for raw in cli_paths {
+            if let Some(eq_idx) = raw.find('=') {
+                let alias = raw[..eq_idx].trim().to_string();
+                let dir = raw[eq_idx + 1..].to_string();
+                if alias.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Пустой alias в --path '{}'. Формат: alias=dir.",
+                        raw
+                    ));
+                }
+                out.push((alias, dir));
+            } else {
+                out.push(("default".to_string(), raw));
+            }
+        }
+        out
+    } else if let Some(cfg_path) = config_path {
+        let cfg = crate::daemon_core::config::load_from(cfg_path)?;
+        if cfg.paths.is_empty() {
+            return Err(anyhow::anyhow!(
+                "В {} нет ни одной секции [[paths]] — укажите --path или добавьте пути в конфиг.",
+                cfg_path.display()
+            ));
+        }
+        cfg.paths
+            .iter()
+            .map(|p| (p.effective_alias(), p.path.to_string_lossy().into_owned()))
+            .collect()
+    } else {
+        vec![("default".to_string(), ".".to_string())]
+    };
+
+    let mut entries: Vec<(String, PathBuf, PathBuf)> = Vec::with_capacity(pairs.len());
+    let mut seen_aliases = std::collections::HashSet::new();
+    for (alias, dir) in pairs {
+        if !seen_aliases.insert(alias.clone()) {
+            return Err(anyhow::anyhow!(
+                "Алиас репо '{}' указан дважды — алиасы должны быть уникальны.",
+                alias
+            ));
+        }
+
+        let root = Path::new(&dir)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&dir));
+        let db_path = root.join(".code-index").join("index.db");
+
+        // Если БД ещё нет — создаём пустую со схемой, чтобы сервер мог стартовать.
+        // Данные появятся, когда демон проиндексирует путь.
+        if !db_path.exists() {
+            std::fs::create_dir_all(db_path.parent().unwrap())?;
+            let storage = Storage::open_file(&db_path)?;
+            drop(storage);
+        }
+
+        tracing::info!("MCP repo: {} -> {}", alias, root.display());
+        entries.push((alias, root, db_path));
+    }
+
+    Ok(entries)
+}
+
+/// Язык записи одиночного режима. Записи взяты из `[[paths]]` конфигурации —
+/// язык оттуда (явный или автоопределённый, см. `path_languages`); записи
+/// из `--path` — автоопределение по корню, как у команды `index`.
+fn mono_repo_language(
+    alias: &str,
+    root: &Path,
+    config_languages: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    match config_languages {
+        Some(map) => map.get(alias).cloned(),
+        None => crate::daemon_core::language_detect::detect_language(root).map(str::to_string),
+    }
+}
+
+/// Запуск MCP-сервера по HTTP (Streamable HTTP) на `host:port`.
+///
+/// Роут `/mcp` — точка подключения MCP-клиента (url из `.mcp.json`).
+/// При федеративном режиме (`federate_router = Some(...)`) добавляется
+/// `/federate/<tool>` и оба роута оборачиваются IP-whitelist middleware.
+/// `LocalSessionManager` держит сессии in-memory. На каждую сессию фабрика
+/// клонирует уже собранный `CodeIndexServer` (он реализует `Clone`), так что
+/// все сессии разделяют общий набор открытых SQLite-баз.
+async fn serve_http(
+    server: crate::mcp::CodeIndexServer,
+    host: &str,
+    port: u16,
+    federate_router: Option<axum::Router>,
+    whitelist: Option<
+        std::sync::Arc<arc_swap::ArcSwap<std::collections::HashSet<std::net::IpAddr>>>,
+    >,
+    config_reloader: Option<crate::federation::reload::ServeConfigReloader>,
+) -> anyhow::Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let svc_server = server.clone();
+    let http_service = StreamableHttpService::new(
+        move || Ok(svc_server.clone()),
+        session_manager,
+        StreamableHttpServerConfig::default(),
+    );
+
+    let mut app = axum::Router::new().nest_service("/mcp", http_service);
+    // Роуты per-file свежести кэша serve (сигналы от демона при переиндексации):
+    //   POST /mark-dirty {repo, files:[{path,mtime}]} — пометить файлы грязными (до commit);
+    //   POST /invalidate {repo, file_paths:[...]}      — снять пометки + снести зависящие ключи.
+    // Совместимы по форме с прокси mcp-cache-ci (демон шлёт те же payload'ы).
+    let cache_routes = axum::Router::new()
+        .route("/mark-dirty", axum::routing::post(mark_dirty_route))
+        .route("/invalidate", axum::routing::post(invalidate_route))
+        .route("/dedup-reset", axum::routing::post(dedup_reset_route))
+        .route("/cache-stats", axum::routing::get(cache_stats_route))
+        .with_state(server.clone());
+    app = app.merge(cache_routes);
+    if let Some(fr) = federate_router {
+        app = app.merge(fr);
+    }
+    if let Some(reloader) = config_reloader {
+        let reload_routes = axum::Router::new()
+            .route("/reload", axum::routing::post(reload_config_route))
+            .with_state(reloader);
+        app = app.merge(reload_routes);
+    }
+    if let Some(allowed) = whitelist {
+        let count = allowed.load().len();
+        app = app.layer(axum::middleware::from_fn_with_state(
+            allowed,
+            crate::federation::whitelist::middleware,
+        ));
+        tracing::info!("IP-whitelist активен ({} адресов, включая loopback).", count);
+    }
+
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Некорректный host:port '{}:{}': {}", host, port, e))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Не удалось привязаться к {}: {}", addr, e))?;
+
+    tracing::info!("MCP HTTP слушает http://{}/mcp", addr);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("axum serve error: {}", e))?;
+    Ok(())
+}
+
+async fn reload_config_route(
+    axum::extract::State(reloader): axum::extract::State<
+        crate::federation::reload::ServeConfigReloader,
+    >,
+) -> axum::Json<crate::federation::reload::ReloadResult> {
+    axum::Json(reloader.reload().await)
+}
+
+/// `GET /cache-stats` — наблюдаемость кэша serve (для смоука и /health-обвязки):
+/// enabled + entries/hits/misses/invalidations.
+async fn cache_stats_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+) -> axum::Json<serde_json::Value> {
+    let (entries, hits, misses, invalidations) = server.cache.stats();
+    let (dedup_sessions, dedup_elided) = server.dedup.stats();
+    axum::Json(serde_json::json!({
+        "enabled": server.cache.enabled(),
+        "entries": entries,
+        "hits": hits,
+        "misses": misses,
+        "invalidations": invalidations,
+        "dirty_files": server.cache.dirty_count(),
+        "dedup_enabled": server.dedup.enabled(),
+        "dedup_sessions": dedup_sessions,
+        "dedup_elided_rows": dedup_elided,
+    }))
+}
+
+/// `POST /mark-dirty {repo|base, files:[{path, mtime}]}` — ранний сигнал от
+/// демона: файлы изменены на диске (observed-mtime), индекс ещё не догнал.
+/// Помечаем КАЖДЫЙ файл «грязным» с его observed-mtime → serve по файлу не
+/// кэширует/не отдаёт ответы, опирающиеся на не догнавший индекс (без огрубления
+/// на весь репо). Форма payload — как у прокси mcp-cache-ci (тот же объект).
+async fn mark_dirty_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let repo = body
+        .get("repo")
+        .or_else(|| body.get("base"))
+        .and_then(|v| v.as_str());
+    let files: Vec<(String, i64)> = body
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|it| {
+                    let path = it.get("path").and_then(|v| v.as_str())?;
+                    let mtime = it.get("mtime").and_then(|v| v.as_i64())?;
+                    Some((path.to_string(), mtime))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let marked = files.len();
+    if let Some(repo) = repo {
+        server.cache.mark_dirty(repo, &files);
+    }
+    axum::Json(serde_json::json!({ "ok": true, "repo": repo, "marked": marked }))
+}
+
+/// `POST /invalidate {repo|base, file_paths:[...]}` — post-commit: индекс догнал
+/// диск. Per-file: снимаем «грязные» пометки указанных файлов и сносим из кэша
+/// ТОЛЬКО ключи, зависящие от них (обратный индекс) — без огрубления на репо.
+/// `all=true` → полный сброс. `repo` без `file_paths` → репо-сброс
+/// (force-reindex/совместимость).
+async fn invalidate_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    if body.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let removed = server.cache.invalidate_all();
+        return axum::Json(serde_json::json!({ "removed": removed, "all": true }));
+    }
+    let repo = body
+        .get("repo")
+        .or_else(|| body.get("base"))
+        .and_then(|v| v.as_str());
+    let paths: Vec<String> = body
+        .get("file_paths")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let removed = match repo {
+        // Per-file: снести только ключи, зависящие от изменённых файлов.
+        Some(r) if !paths.is_empty() => server.cache.invalidate_files(r, &paths),
+        // Без списка файлов — репо-сброс (force-reindex/совместимость).
+        Some(r) => server.cache.invalidate_scope(r),
+        None => 0,
+    };
+    axum::Json(serde_json::json!({ "removed": removed, "repo": repo, "files": paths.len() }))
+}
+
+/// `POST /dedup-reset` — забыть, что уже отдавалось в сессиях (`serve_dedup`).
+/// Нужна, когда модель потеряла часть контекста (сжатие истории на стороне
+/// клиента): изнутри MCP это событие не наблюдаемо ни у одного клиента, поэтому
+/// сигнал приходит снаружи. Доступна любому клиенту; в Claude Code ручку удобно
+/// дёргать хуком `PostCompact`. Сброс идёт по всем сессиям сразу —
+/// `mcp-session-id` вызывающему неизвестен; цена — разовая повторная отдача
+/// строк, корректность не страдает.
+async fn dedup_reset_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+) -> axum::Json<serde_json::Value> {
+    let sessions = server.dedup.reset_all();
+    tracing::info!(
+        "POST /dedup-reset — память сессионного отсева сброшена ({} сессий)",
+        sessions
+    );
+    axum::Json(serde_json::json!({ "ok": true, "sessions_reset": sessions }))
+}
+
+/// Точка входа для бинарных wrapper'ов. Принимает уже собранный реестр
+/// `LanguageProcessor`-ов: каждый bin собирает его сам (`code-index` —
+/// только встроенные, `bsl-indexer` — встроенные + BSL).
+///
+/// Регистрируется логирование, парсятся CLI-аргументы и происходит
+/// выполнение соответствующей подкоманды. Не возвращает Ok пока
+/// демон/сервер живут — это long-running процесс.
+pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // Инициализация журнала. Долгоживущие процессы пишут ещё и в файл — их
+    // вывод некому смотреть в момент сбоя, а пользователю нужно что-то
+    // приложить к обращению. Короткие команды работают на глазах у человека,
+    // им хватает stderr.
+    //
+    // `daemon run` здесь намеренно пропущен: на Windows процесс сначала
+    // перезапускает себя отвязанным от консоли, и открывать файл журнала
+    // должен именно отвязанный клон (см. handle_daemon).
+    match &cli.command {
+        Commands::Daemon { action: DaemonAction::Run } => {}
+        Commands::Serve { .. } => {
+            match crate::daemon_core::paths::serve_log_file() {
+                Ok(p) => {
+                    crate::logging::init_with_file(&p, crate::logging::DEFAULT_LEVEL);
+                }
+                // Без CODE_INDEX_HOME писать журнал некуда — это не повод
+                // не запускать сервер выдачи.
+                Err(_) => crate::logging::init_stderr(),
+            }
+        }
+        _ => crate::logging::init_stderr(),
+    }
+
+    // На текущем этапе registry приходит только в Serve через
+    // `with_repos_and_registry` или `from_federated`. Остальные команды
+    // (Index/Stats/...) её не используют. Чтобы не плодить копии,
+    // сохраняем в локальной переменной и тащим в Serve. `mut` нужен,
+    // чтобы федеративная ветка могла забрать registry через `take()`,
+    // не ломая компиляцию `match registry` в моно-ветке.
+    let mut registry = Some(registry);
+
+    match cli.command {
+        Commands::Serve { path, transport, host, port, config, serve_config } => {
+            cmd_serve(path, transport, host, port, config, serve_config, registry).await?;
+        }
+
+        Commands::Index { path, path_named, force } => {
+            // Обе формы равноправны; не задана ни одна — текущий каталог,
+            // как у соседних команд.
+            let path = path_named.or(path).unwrap_or_else(|| ".".to_string());
+            cmd_index(path, force, registry)?;
+        }
+
+        Commands::Stats { path, json } => {
+            cmd_stats(path, json)?;
+        }
+
+        Commands::Query { symbol, path, language, json } => {
+            cmd_query(symbol, path, language, json)?;
+        }
+
+        Commands::Clean { path } => {
+            cmd_clean(path)?;
+        }
+
+        Commands::Init { path } => {
+            cmd_init(path)?;
+        }
+
+        // ── Новые команды: JSON-вывод ─────────────────────────────────────────
+
+        Commands::SearchFunction { query, path, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.search_functions(&query, limit, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::SearchClass { query, path, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.search_classes(&query, limit, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetFunction { name, path, language: _ } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.get_function_by_name(&name)?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetClass { name, path, language: _ } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.get_class_by_name(&name)?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetCallers { function_name, path, language } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.get_callers(&function_name, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetCallees { function_name, path, language } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.get_callees(&function_name, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetImports { path, file_id, module, language } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+
+            // Приоритет: file_id > module; если ничего не указано — ошибка
+            let results = if let Some(fid) = file_id {
+                storage.get_imports_by_file(fid)?
+            } else if let Some(mod_name) = &module {
+                storage.get_imports_by_module(mod_name, language.as_deref())?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Укажите --file-id <ID> или --module <имя_модуля>"
+                ));
+            };
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetFileSummary { file, path } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let result = storage.get_file_summary(&file)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        Commands::SearchText { query, path, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.search_text(&query, limit, language.as_deref())?;
+
+            // Результат — Vec<(String, String)>: путь + сниппет
+            // Преобразуем в удобный JSON-массив объектов
+            let json_results: Vec<serde_json::Value> = results
+                .into_iter()
+                .map(|(file_path, snippet)| {
+                    serde_json::json!({
+                        "path": file_path,
+                        "snippet": snippet
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json_results)?);
+        }
+
+        Commands::GrepBody { path, pattern, regex, language, limit } => {
+            if pattern.is_none() && regex.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Укажите --pattern <подстрока> или --regex <выражение>"
+                ));
+            }
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let results = storage.grep_body(
+                pattern.as_deref(),
+                regex.as_deref(),
+                language.as_deref(),
+                limit,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::Daemon { action } => {
+            // Передаём registry в handle_daemon, чтобы daemon-режим мог
+            // применять schema_extensions / index_extras для BSL и других
+            // языков-расширений. registry.take() — чтобы не клонировать
+            // и сохранить совместимость с веткой Serve выше.
+            let reg = registry.take().map(Arc::new);
+            handle_daemon(action, reg).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Ветка `serve`: поднять MCP-сервер. Выделена из `run` — в моно- и
+/// федеративном режимах это два разных пути сборки сервера.
+async fn cmd_serve(
+    path: Vec<String>,
+    transport: String,
+    host: Option<String>,
+    port: u16,
+    config: Option<PathBuf>,
+    serve_config: Option<PathBuf>,
+    mut registry: Option<ProcessorRegistry>,
+) -> anyhow::Result<()> {
+    use crate::federation;
+    use crate::mcp::CodeIndexServer;
+
+    // Решаем, активен ли федеративный режим. Условия:
+    //   * transport == http (stdio не имеет адреса для bind/whitelist);
+    //   * --serve-config указан явно ИЛИ существует $CODE_INDEX_HOME/serve.toml;
+    //   * --path не передан (CLI-приоритет — это моно-режим, явный override).
+    let serve_cfg_path: Option<PathBuf> = if transport == "http" && path.is_empty() {
+        if let Some(p) = serve_config.clone() {
+            if !p.exists() {
+                return Err(anyhow::anyhow!(
+                    "--serve-config={} не существует.",
+                    p.display()
+                ));
+            }
+            Some(p)
+        } else {
+            let p = federation::config::default_path()?;
+            if p.exists() { Some(p) } else { None }
+        }
+    } else {
+        None
+    };
+
+    if let Some(serve_cfg_path) = serve_cfg_path {
+        tracing::info!(
+            "Федеративный режим: serve.toml={}",
+            serve_cfg_path.display()
+        );
+        let serve_cfg = federation::config::load_from(&serve_cfg_path)?;
+        let daemon_cfg_path = match config.as_deref() {
+            Some(path) => path.to_path_buf(),
+            None => crate::daemon_core::paths::config_path()?,
+        };
+        let daemon_cfg = match config.as_deref() {
+            Some(p) => crate::daemon_core::config::load_from(p)?,
+            None => crate::daemon_core::config::load_or_default()?,
+        };
+
+        // Создать пустые БД для local-репо, чтобы сервер мог открыть
+        // их read-only до индексации демоном.
+        for daemon_entry in &daemon_cfg.paths {
+            let root = daemon_entry
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| daemon_entry.path.clone());
+            let db_path = root.join(".code-index").join("index.db");
+            if !db_path.exists() {
+                std::fs::create_dir_all(db_path.parent().unwrap())?;
+                let storage = Storage::open_file(&db_path)?;
+                drop(storage);
+            }
+        }
+
+        let repos = federation::repos::merge(&serve_cfg, &daemon_cfg)?;
+        let aliases: Vec<&str> =
+            repos.iter().map(|r| r.alias.as_str()).collect();
+        let local_count = repos.iter().filter(|r| r.is_local).count();
+        tracing::info!(
+            "Реестр федерации: {} репо ({} local, {} remote): {:?}",
+            repos.len(),
+            local_count,
+            repos.len() - local_count,
+            aliases
+        );
+
+        // Этап 2.1: federation-конструктор принимает registry и
+        // мапу alias → language для local-репо из daemon.toml,
+        // чтобы extension-tools (`get_object_structure` и др.)
+        // регистрировались в `tools/list` сразу при старте,
+        // а не только после первого file-watch-события.
+        // Язык берётся явный из `[[paths]]` или автоопределённый по корню
+        // (см. `path_languages`): запись без `language` тоже получает
+        // инструменты языка и привязанный процессор.
+        // remote-репо приходят без языка — для них tools
+        // зарегистрированы только если такой же язык уже активен
+        // у local-репо на этой ноде (что естественно для
+        // 1С-конфигураций, где BSL-репо есть и тут, и там).
+        let local_languages = crate::mcp::config_watch::path_languages(&daemon_cfg);
+        // Whitelist tools из daemon.toml [tools].enabled применяется
+        // прямо в chain'е после конструктора. Логи и warning о
+        // неизвестных именах — внутри `apply_tools_whitelist`.
+        let server = CodeIndexServer::from_federated(
+            repos,
+            serve_cfg.me.ip.clone(),
+            registry.take(),
+            local_languages,
+            serve_cfg.pool.resolve(),
+        )?
+        .apply_tools_whitelist(&daemon_cfg.tools.enabled)
+        .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools)
+        .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled);
+        crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
+        crate::mcp::cap::set_response_cap_hard(daemon_cfg.cap.max_response_bytes_hard);
+        crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
+        crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
+        crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
+        let federate_router = federation::server::federate_router(server.clone());
+        let allowed = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            federation::whitelist::build(&serve_cfg),
+        ));
+        let config_reloader = federation::reload::ServeConfigReloader::new(
+            server.clone(),
+            allowed.clone(),
+            serve_cfg_path.clone(),
+            daemon_cfg_path.clone(),
+            serve_cfg.me.ip.clone(),
+            serve_cfg.pool.resolve(),
+        )?;
+
+        // Языки из daemon.toml применяем ДО старта транспорта: клиент,
+        // спросивший перечень инструментов первым же запросом, обязан
+        // увидеть инструменты языка, а не гоняться с фоновой задачей.
+        if let Some(cfg_path) = config.as_deref() {
+            if let Err(e) =
+                crate::mcp::config_watch::apply_languages_from_config(&server, cfg_path).await
+            {
+                tracing::warn!(
+                    "не удалось собрать активные языки из {}: {}",
+                    cfg_path.display(),
+                    e
+                );
+            }
+        }
+
+        // Один watcher следит за согласованной парой файлов. Он запускается
+        // всегда, в том числе при использовании default daemon.toml.
+        let _config_watch = crate::mcp::config_watch::spawn_federated_watch(
+            config_reloader.clone(),
+        );
+
+        // Bind: --host имеет приоритет, иначе [me].ip.
+        let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
+        serve_http(
+            server,
+            &bind_host,
+            port,
+            Some(federate_router),
+            Some(allowed.clone()),
+            Some(config_reloader),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Моно-режим (rc5-совместимый): нет serve.toml или явно указан --path.
+    // Источник записей запоминаем до вызова: `path` перемещается в
+    // `build_repo_entries`.
+    let entries_from_config = path.is_empty();
+    let entries = build_repo_entries(path, config.as_deref())?;
+    let aliases: Vec<&str> = entries.iter().map(|(a, _, _)| a.as_str()).collect();
+    tracing::info!("MCP read-only ({}), репо: {:?}", transport, aliases);
+
+    // Настройки из daemon.toml: перечень разрешённых инструментов, массовый
+    // режим, отсев повторной выдачи и четыре параметра стража размера ответа.
+    //
+    // Конфигурация читается ОДИН раз, и ошибка разбора наружу, а не в дефолт.
+    // Раньше её тянули восемь отдельных функций, каждая своим чтением файла и
+    // каждая молча подставляла свой дефолт при ошибке: с `--path` разбор
+    // конфигурации больше никто не проверял, и сервер поднимался на полных
+    // дефолтах — заданный перечень инструментов и лимиты ответа не действовали,
+    // а в журнале об этом не было ни слова (C-1). Без `--config` дефолты
+    // остаются штатным поведением.
+    let daemon_cfg = match config.as_deref() {
+        Some(p) => Some(
+            crate::daemon_core::config::load_from(p)
+                .map_err(|e| anyhow::anyhow!("чтение конфигурации {}: {}", p.display(), e))?,
+        ),
+        None => None,
+    };
+    // Записи из `[[paths]]` получают язык оттуда; записи из `--path` —
+    // автоопределением по корню (см. `mono_repo_language`).
+    let config_languages = match (&daemon_cfg, entries_from_config) {
+        (Some(cfg), true) => Some(crate::mcp::config_watch::path_languages(cfg)),
+        _ => None,
+    };
+    // Язык каждой записи определяется сразу. Без него к записи не
+    // привязывается процессор языка, и инструменты, которым он нужен
+    // (привязки форм, вызовы с квалификатором в `get_callers`),
+    // в одиночном режиме отдают неполный ответ.
+    let server = match registry {
+        Some(reg) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (alias, root_path, db_path) in entries {
+                let language =
+                    mono_repo_language(&alias, &root_path, config_languages.as_ref());
+                let storage = crate::storage::StoragePool::open_file_readonly(
+                    &db_path,
+                    crate::storage::PoolConfig::default(),
+                )?;
+                map.insert(alias, crate::mcp::RepoEntry {
+                    root_path: Some(root_path),
+                    storage: Some(storage),
+                    ip: "127.0.0.1".to_string(),
+                    port: crate::federation::client::DEFAULT_REMOTE_PORT,
+                    is_local: true,
+                    language,
+                    processor: None,
+                });
+            }
+            CodeIndexServer::with_repos_and_registry(map, reg)
+        }
+        None => CodeIndexServer::open_readonly_multi(entries)?,
+    };
+    let server = match &daemon_cfg {
+        Some(cfg) => server
+            .apply_tools_whitelist(&cfg.tools.enabled)
+            .apply_mass_mode_tools(&cfg.mcp.mass_mode_tools)
+            .apply_dedup_enabled(cfg.mcp.dedup_enabled),
+        None => server,
+    };
+    if let Some(cfg) = &daemon_cfg {
+        crate::mcp::cap::set_response_cap(cfg.cap.max_response_bytes);
+        crate::mcp::cap::set_response_cap_hard(cfg.cap.max_response_bytes_hard);
+        crate::mcp::cap::set_function_body_cap(cfg.cap.max_function_body_chars);
+        crate::mcp::cap::set_cap_tools(Some(cfg.cap.cap_tools.clone()));
+        crate::mcp::cap::set_cap_enabled(cfg.cap.cap_enabled);
+    }
+    let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Если запуск с --config — подписываемся на изменения daemon.toml,
+    // чтобы реактивно пересобирать active_languages/extension_tools
+    // при правке оператором (этап 1.7). Без --config нет файла,
+    // за которым наблюдать — режим --path даёт фиксированный набор
+    // репо, в нём перезагрузка не нужна.
+    //
+    // Сбор языков — синхронно до старта транспорта (см. федеративную ветку):
+    // иначе первый же запрос перечня инструментов мог обогнать фоновую задачу
+    // и получить набор без инструментов языка.
+    if let Some(cfg_path) = config.as_deref() {
+        if let Err(e) =
+            crate::mcp::config_watch::apply_languages_from_config(&server, cfg_path).await
+        {
+            tracing::warn!(
+                "не удалось собрать активные языки из {}: {}",
+                cfg_path.display(),
+                e
+            );
+        }
+    }
+
+    let _config_watch = if let Some(cfg_path) = config.as_deref() {
+        Some(crate::mcp::config_watch::spawn_watch(
+            server.clone(),
+            cfg_path.to_path_buf(),
+        ))
+    } else {
+        None
+    };
+
+    match transport.as_str() {
+        "stdio" => {
+            use rmcp::ServiceExt;
+            let service = server
+                .serve(rmcp::transport::io::stdio())
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
+            service
+                .waiting()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
+        }
+        "http" => {
+            serve_http(server, &bind_host, port, None, None, None).await?;
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Транспорт '{}' не поддерживается. Используйте 'stdio' или 'http'.",
+                other
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ветка `index`: однократная индексация каталога.
+fn cmd_index(
+    path: String,
+    force: bool,
+    registry: Option<ProcessorRegistry>,
+) -> anyhow::Result<()> {
+    tracing::info!("Индексация: path={}, force={}", path, force);
+
+    // 1. Разрешить путь до абсолютного
+    let abs_path = Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&path));
+
+    // 2. Создать директорию .code-index/ внутри проекта
+    let db_dir = abs_path.join(".code-index");
+    std::fs::create_dir_all(&db_dir)
+        .map_err(|e| anyhow::anyhow!("Не удалось создать директорию {:?}: {}", db_dir, e))?;
+
+    // 3. Загрузить конфигурацию проекта
+    let db_path = db_dir.join("index.db");
+    let mut config = IndexConfig::load(&abs_path)?;
+    // Язык репозитория нужен для неоднозначных расширений (`.h` —
+    // заголовок C или C++). У демона он берётся из `[[paths]] language`;
+    // здесь конфига демона нет, поэтому определяем сами — тем же
+    // способом, каким демон заполняет это поле на старте. Так результат
+    // не зависит от того, кто индексировал: демон или эта команда.
+    if config.repo_language.is_none() {
+        config.repo_language = crate::daemon_core::language_detect::detect_language(&abs_path)
+            .map(|s| s.to_string());
+    }
+
+    // A2: PID-lock на целевую БД — два `index --force` по одному пути
+    // не должны драться за SQLite. RAII, держится до конца команды.
+    let _index_lock = crate::daemon_core::lock::acquire_at(
+        db_dir.join("index.lock"),
+        "Индексация пути",
+    )?;
+
+    // A1: при --force пересоздаём БД с нуля. full_reindex(force) поверх
+    // большой существующей index.db патологически медленный (грузит всю
+    // БД в RAM + upsert каждого файла). Удаление превращает force в
+    // быстрый fresh-путь — тот же итог (полная переиндексация) без деградации.
+    if force {
+        for p in [
+            db_path.clone(),
+            db_path.with_extension("db-wal"),
+            db_path.with_extension("db-shm"),
+        ] {
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    tracing::warn!("A1: не удалось удалить {:?}: {}", p, e);
+                }
+            }
+        }
+    }
+
+    // 4. Открыть Storage с автоопределением режима. Папку взвешиваем тем же
+    //    способом, что и демон: у новой базы размер файла нулевой, и без
+    //    оценки по исходникам решение о памяти принимать не на чем.
+    let storage_config = StorageConfig {
+        mode: config.storage_mode.clone(),
+        memory_max_percent: config.memory_max_percent,
+        expected_bytes: config
+            .memory_estimate_bytes(crate::indexer::estimate_source_bytes(&abs_path, &config)),
+    };
+    let mut storage = Storage::open_auto(&db_path, &storage_config)?;
+
+    // 4a. Если язык репо известен и в реестре есть процессор для
+    // него — применить его schema_extensions. Это создаст
+    // специфичные таблицы (для BSL — metadata_objects, metadata_forms,
+    // event_subscriptions). DDL идемпотентен (CREATE IF NOT EXISTS),
+    // повторный вызов безвреден.
+    //
+    // Resolve через `ProcessorRegistry::resolve(None, root)` —
+    // CLI-команда `index` не знает явный `language` из daemon.toml
+    // (это standalone разовая индексация), поэтому работает только
+    // auto-detect по маркерам. Логика идентична daemon-режиму, что
+    // даёт единый контракт «индексация» независимо от запуска.
+    if let Some(reg) = registry.as_ref() {
+        if let Some(proc) = reg.resolve(None, &abs_path) {
+            if let Err(e) = proc.migrate_schema(storage.conn()) {
+                tracing::warn!(
+                    "migrate_schema процессора '{}' упал: {}",
+                    proc.name(),
+                    e
+                );
+            }
+            let exts = proc.schema_extensions();
+            if !exts.is_empty() {
+                storage.apply_schema_extensions(exts)?;
+                tracing::info!(
+                    "Применены schema_extensions процессора '{}' ({} DDL-statement'ов)",
+                    proc.name(),
+                    exts.len(),
+                );
+            }
+        }
+    }
+
+    // 5. Создать Indexer с конфигом. Сборщик extras (bsl-indexer)
+    //    берём заранее — он владеет собой, storage не занимает.
+    let parse_collector = registry
+        .as_ref()
+        .and_then(|reg| reg.resolve(None, &abs_path))
+        .and_then(|proc| proc.parse_collector());
+    let mut indexer = Indexer::with_config(&mut storage, config);
+
+    // 6. Запустить индексацию
+    let result =
+        indexer.full_reindex_with_collector(&abs_path, force, parse_collector.as_deref())?;
+
+    // 6a. Hook расширения: для BSL-репо здесь происходит
+    // парсинг XML-метаданных и заполнение специфичных таблиц
+    // (metadata_objects/metadata_forms/event_subscriptions/proc_call_graph).
+    // Для универсальных языков `index_extras` — no-op (default-impl).
+    //
+    // ВАЖНО: вызывается ДО flush_to_disk. В in-memory режиме
+    // flush_to_disk копирует текущее SQLite-соединение в файл —
+    // если бы мы дописали в conn после flush, записи остались бы
+    // только в памяти и пропали бы при выходе.
+    let extras_start = std::time::Instant::now();
+    if let Some(reg) = registry.as_ref() {
+        if let Some(proc) = reg.resolve(None, &abs_path) {
+            if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
+                tracing::warn!(
+                    "index_extras процессора '{}' завершился с ошибкой: {}. \
+                     Базовая индексация при этом сохранена.",
+                    proc.name(),
+                    e
+                );
+            }
+        }
+    }
+    let extras_ms = extras_start.elapsed().as_millis();
+
+    // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
+    // Должно идти ПОСЛЕ index_extras, иначе записи расширения
+    // попадут только в in-memory копию.
+    // Базу, которая и так лежит на диске, сбрасывать некуда: копирование файла
+    // самого в себя стоило на типовой торговой конфигурации 21,8 с, 8 ГБ записи
+    // и журнала, разросшегося до 4,3 ГБ. Демон эту развилку уже делает.
+    let flush_start = std::time::Instant::now();
+    if storage.is_in_memory() {
+        storage.flush_to_disk(&db_path)?;
+    }
+    let flush_ms = flush_start.elapsed().as_millis();
+
+    // 7a. Схлопнуть журнал WAL целевого файла. Демон это делает после каждой
+    // первичной индексации, а разовая команда — не делала: рядом с базой мог
+    // остаться журнал в гигабайты, а сама база выглядеть почти пустой. Данные
+    // при этом целы, но со стороны это неотличимо от провалившейся индексации,
+    // и любой следующий читатель платит за проигрывание журнала.
+    // Соединение открываем отдельное: `storage` мог работать в памяти, и его
+    // журнал к файлу отношения не имеет.
+    let wal_start = std::time::Instant::now();
+    match Storage::open_file(&db_path).and_then(|s| s.checkpoint_truncate()) {
+        Ok((busy, log_pages, _)) if busy == 0 => {
+            tracing::info!(
+                "журнал WAL схлопнут за {} мс (вытеснено страниц {})",
+                wal_start.elapsed().as_millis(),
+                log_pages
+            );
+        }
+        Ok((busy, _, _)) => {
+            tracing::warn!(
+                "журнал WAL схлопнут частично (занято читателями: {}) — \
+                 рядом с базой останется файл index.db-wal",
+                busy
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "не удалось схлопнуть журнал WAL: {} — рядом с базой останется \
+                 файл index.db-wal, данные при этом целы",
+                e
+            );
+        }
+    }
+
+    // 8. Вывести результат.
+    // `result.elapsed_ms` — только ядро (обход, парсинг, запись символов).
+    // На 1С-репо сопоставимое время уходит на extras (метаданные, формы,
+    // граф вызовов процедур), поэтому печатаем полное время и разбивку —
+    // иначе половина работы не видна ни в логе, ни в замерах.
+    // Раскладка по этапам — та же, что печатает демон в итоге по папке. Без неё
+    // разовый прогон отдаёт одно число на всю надстройку, и на чём именно стоит
+    // время (граф вызовов, термины, слой метаданных) не видно.
+    for line in crate::logging::stages_block(&crate::logging::stages_take()) {
+        println!("{}", line);
+    }
+    println!(
+        "Индексация завершена за {} мс (ядро {} + extras {} + сброс на диск {})",
+        result.elapsed_ms as u128 + extras_ms + flush_ms,
+        result.elapsed_ms,
+        extras_ms,
+        flush_ms
+    );
+    println!("  Найдено файлов:        {}", result.files_scanned);
+    println!("  Проиндексировано:      {}", result.files_indexed);
+    println!("  Без изменений:         {}", result.files_skipped);
+    println!("  Не индексируется:      {}", result.files_not_indexable);
+    println!("  Удалено из индекса:    {}", result.files_deleted);
+
+    if !result.errors.is_empty() {
+        println!("  Ошибок:                {}", result.errors.len());
+        for (file, err) in &result.errors {
+            println!("    [ERR] {}: {}", file, err);
+        }
+    }
+    Ok(())
+}
+
+/// Ветка `stats`: статистика базы индекса.
+fn cmd_stats(path: String, json: bool) -> anyhow::Result<()> {
+    tracing::info!("Статистика: path={}", path);
+
+    // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
+    let db_path = get_db_path(&path);
+    let storage = Storage::open_file_readonly(&db_path)?;
+
+    // 2. Получить статистику
+    let stats = storage.get_stats()?;
+
+    if json {
+        // JSON-формат для программного использования
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        // Текстовый формат для человека
+        println!("Статистика индекса: {}", db_path.display());
+        println!("─────────────────────────────────────");
+        println!("  Файлов:        {}", stats.total_files);
+        println!("  Функций:       {}", stats.total_functions);
+        println!("  Классов:       {}", stats.total_classes);
+        println!("  Импортов:      {}", stats.total_imports);
+        println!("  Вызовов:       {}", stats.total_calls);
+        println!("  Переменных:    {}", stats.total_variables);
+        println!("  Текст. файлов: {}", stats.total_text_files);
+    }
+    Ok(())
+}
+
+/// Ветка `query`: быстрый поиск символа по точному имени.
+fn cmd_query(
+    symbol: String,
+    path: String,
+    language: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    tracing::info!("Поиск символа '{}': path={}", symbol, path);
+
+    // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
+    let db_path = get_db_path(&path);
+    let storage = Storage::open_file_readonly(&db_path)?;
+
+    // 2. Поиск символа
+    let result = storage.find_symbol(&symbol, language.as_deref())?;
+
+    if json {
+        // JSON-формат для программного использования
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let total = result.functions.len()
+        + result.classes.len()
+        + result.variables.len()
+        + result.imports.len();
+
+    if total == 0 {
+        println!("Символ '{}' не найден в индексе.", symbol);
+        return Ok(());
+    }
+
+    println!("Результаты поиска символа '{}':", symbol);
+
+    // 3. Функции
+    if !result.functions.is_empty() {
+        println!("\n  Функции ({}):", result.functions.len());
+        for f in &result.functions {
+            let qname = f.qualified_name.as_deref().unwrap_or(&f.name);
+            let async_mark = if f.is_async { " [async]" } else { "" };
+            let args = f.args.as_deref().unwrap_or("()");
+            println!(
+                "    {}{}  {}  строки {}-{}  (file_id={})",
+                qname, async_mark, args, f.line_start, f.line_end, f.file_id
+            );
+        }
+    }
+
+    // 4. Классы
+    if !result.classes.is_empty() {
+        println!("\n  Классы ({}):", result.classes.len());
+        for c in &result.classes {
+            let bases = c.bases.as_deref().unwrap_or("");
+            let bases_str = if bases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", bases)
+            };
+            println!(
+                "    {}{}  строки {}-{}  (file_id={})",
+                c.name, bases_str, c.line_start, c.line_end, c.file_id
+            );
+        }
+    }
+
+    // 5. Переменные
+    if !result.variables.is_empty() {
+        println!("\n  Переменные ({}):", result.variables.len());
+        for v in &result.variables {
+            let val = v.value.as_deref().unwrap_or("<нет значения>");
+            println!(
+                "    {}  =  {}  строка {}  (file_id={})",
+                v.name, val, v.line, v.file_id
+            );
+        }
+    }
+
+    // 6. Импорты
+    if !result.imports.is_empty() {
+        println!("\n  Импорты ({}):", result.imports.len());
+        for i in &result.imports {
+            let module = i.module.as_deref().unwrap_or("?");
+            let name = i.name.as_deref().unwrap_or("*");
+            let alias_str = match &i.alias {
+                Some(a) => format!(" as {}", a),
+                None => String::new(),
+            };
+            println!(
+                "    {} from {}{}  строка {}  (file_id={})",
+                name, module, alias_str, i.line, i.file_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Ветка `clean`: удалить из индекса файлы, которых нет на диске.
+fn cmd_clean(path: String) -> anyhow::Result<()> {
+    tracing::info!("Очистка индекса: path={}", path);
+
+    // 1. Открыть БД
+    let db_path = get_db_path(&path);
+    let storage = Storage::open_file(&db_path)?;
+
+    // 2. Разрешить корневой путь проекта
+    let project_root = std::path::Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+
+    // 3. Получить все файлы из индекса
+    let files = storage.get_all_files()?;
+    let total = files.len();
+    let mut deleted = 0usize;
+    let mut unreachable = 0usize;
+
+    // 4. Для каждого файла проверить существование на диске.
+    //    Удаляем ТОЛЬКО при явном «нет такого файла». Обычная проверка
+    //    существования отвечает «нет» на любую ошибку — в том числе «доступ
+    //    запрещён», «файл занят другим процессом», «том отвалился», — и тогда
+    //    очистка выбрасывает из индекса живые записи, а вернутся они лишь
+    //    полной переиндексацией. Тот же разбор ошибки, что у наблюдателя
+    //    файлов (S-5): единый ответ на один вопрос.
+    for file in files {
+        // Путь в индексе может быть абсолютным или относительным от корня проекта
+        let on_disk = if std::path::Path::new(&file.path).is_absolute() {
+            std::path::PathBuf::from(&file.path)
+        } else {
+            project_root.join(&file.path)
+        };
+
+        let err = std::fs::symlink_metadata(&on_disk).err();
+        if err.is_none() {
+            continue; // файл на месте
+        }
+        if !crate::watcher::is_real_deletion(err.as_ref()) {
+            unreachable += 1;
+            tracing::warn!(
+                "clean: {} недоступен ({}) — запись оставлена в индексе",
+                file.path,
+                err.as_ref().map(|e| e.to_string()).unwrap_or_default()
+            );
+            continue;
+        }
+        if let Some(id) = file.id {
+            storage.delete_file(id)?;
+            deleted += 1;
+            println!("  Удалён: {}", file.path);
+        }
+    }
+
+    // 5. Итог. Про недоступные файлы говорим прямо: молчание здесь читалось бы
+    //    как «проверено всё», а проверить их как раз не удалось.
+    println!(
+        "Очистка завершена: проверено {} файлов, удалено {} записей.",
+        total, deleted
+    );
+    if unreachable > 0 {
+        println!(
+            "  Не удалось проверить {} файл(ов) (нет доступа, файл занят или том недоступен) — \
+             их записи оставлены. Повторите очистку, когда путь снова будет доступен.",
+            unreachable
+        );
+    }
+    Ok(())
+}
+
+/// Ветка `init`: создать конфигурацию по умолчанию.
+fn cmd_init(path: String) -> anyhow::Result<()> {
+    // 1. Разрешить путь до абсолютного
+    let abs_path = Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&path));
+
+    let config_path = abs_path.join(".code-index").join("config.json");
+
+    if config_path.exists() {
+        println!("Конфигурация уже существует: {}", config_path.display());
+        println!("Для перезаписи удалите файл вручную.");
+        return Ok(());
+    }
+
+    // 2. Создать конфиг по умолчанию
+    let config = IndexConfig::default();
+    config.save(&abs_path)?;
+
+    println!("Создан файл конфигурации: {}", config_path.display());
+    println!("Отредактируйте его при необходимости:");
+    println!("  exclude_dirs          — дополнительные директории для исключения");
+    println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
+    println!("  max_file_size         — макс. размер текстового файла в байтах (по умолчанию 1 МБ, не влияет на код)");
+    println!("  max_files             — лимит файлов (0 = без лимита)");
+    Ok(())
+}
+
+
+/// На Windows Rust собирается как console-subsystem приложение. При запуске
+/// в пользовательской сессии (Scheduled Task LogonType=Interactive, ручной
+/// вызов в cmd/powershell) процесс получает консольное окно и становится
+/// привязанным к нему: закрытие окна шлёт CTRL_CLOSE_EVENT и убивает демон.
+///
+/// Чтобы демон переживал любой способ запуска, при `daemon run` смотрим
+/// переменную окружения `CODE_INDEX_DAEMON_DETACHED`. Если её нет —
+/// перезапускаем себя с флагами DETACHED_PROCESS | CREATE_NO_WINDOW
+/// и немедленно выходим; detached-клон живёт без консоли до явного
+/// `daemon stop` / `daemon reload`.
+///
+/// На Unix self-detach не нужен — демонизацией управляет systemd/launchd.
+#[cfg(windows)]
+fn detach_from_console_if_needed() -> anyhow::Result<bool> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const ENV_FLAG: &str = "CODE_INDEX_DAEMON_DETACHED";
+
+    if std::env::var_os(ENV_FLAG).is_some() {
+        return Ok(false);
+    }
+
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .arg("run")
+        .env(ENV_FLAG, "1")
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn detach_from_console_if_needed() -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+async fn handle_daemon(
+    action: DaemonAction,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
+) -> anyhow::Result<()> {
+    use crate::daemon_core::{client, paths, runner};
+
+    match action {
+        DaemonAction::Run => {
+            if detach_from_console_if_needed()? {
+                return Ok(());
+            }
+            // Журнал открывает уже отвязанный от консоли процесс — у него
+            // stderr некуда девать, и файл остаётся единственным следом.
+            // Уровень: RUST_LOG сильнее `[daemon] log_level` из daemon.toml.
+            let level = crate::daemon_core::config::load_or_default()
+                .map(|c| c.daemon.log_level)
+                .unwrap_or_else(|_| crate::logging::DEFAULT_LEVEL.to_string());
+            let log_path = match paths::log_file() {
+                Ok(p) => crate::logging::init_with_file(&p, &level),
+                Err(_) => {
+                    crate::logging::init_stderr();
+                    None
+                }
+            };
+            tracing::info!(
+                "Запуск фонового демона code-index {} (PID {}), уровень журнала «{}»",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                level
+            );
+            // Паспорт машины — первым делом. Присланный журнал без него
+            // нечитаем: времена есть, а соотнести их не с чем.
+            tracing::info!("машина: {}", crate::logging::machine_note());
+            match log_path {
+                Some(p) => tracing::info!("журнал демона: {}", p.display()),
+                None => tracing::warn!(
+                    "файл журнала не ведётся — вывод только в stderr; \
+                     проверьте переменную окружения CODE_INDEX_HOME"
+                ),
+            }
+            runner::run(processor_registry).await?;
+        }
+        DaemonAction::Status { json } => match client::health().await {
+            Ok(h) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&h)?);
+                } else {
+                    print_status_text(&h);
+                }
+            }
+            Err(e) => {
+                eprintln!("Демон недоступен: {}", e);
+                std::process::exit(1);
+            }
+        },
+        DaemonAction::Reload => {
+            let r = client::reload().await?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+        DaemonAction::Stop => {
+            let r = client::stop().await?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+    }
+    Ok(())
+}
+
+fn print_status_text(h: &crate::daemon_core::ipc::HealthResponse) {
+    println!("Демон code-index");
+    println!("  статус:    {}", h.status);
+    println!("  версия:    {}", h.version);
+    println!("  PID:       {}", h.pid);
+    println!("  старт:     {}", h.started_at);
+    println!("  uptime:    {}с", h.uptime_sec);
+    println!("  папок:     {}", h.paths.len());
+    for p in &h.paths {
+        let status_s = serde_json::to_string(&p.status)
+            .unwrap_or_else(|_| "\"?\"".into());
+        let status_s = status_s.trim_matches('"');
+        let progress_s = match &p.progress {
+            Some(pr) => match pr.percent {
+                Some(pct) => format!(" {}/{} ({}%)", pr.files_done, pr.files_total, pct),
+                None => format!(" {}/{}", pr.files_done, pr.files_total),
+            },
+            None => String::new(),
+        };
+        let err_s = p.error.as_ref().map(|e| format!(" err: {}", e)).unwrap_or_default();
+        println!("    - [{}] {}{}{}", status_s, p.path.display(), progress_s, err_s);
+    }
+}
+
+#[cfg(test)]
+mod mono_language_tests {
+    use super::*;
+
+    /// Язык записи одиночного режима: из конфигурации (если она есть) либо
+    /// автоопределением по корню, как у команды `index`.
+    #[test]
+    fn язык_записи_одиночного_режима() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::File::create(root.join("Configuration.xml")).unwrap();
+
+        assert_eq!(
+            mono_repo_language("a", &root, None),
+            Some("bsl".to_string())
+        );
+
+        // Язык из конфигурации важнее признаков корня.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("a".to_string(), "python".to_string());
+        assert_eq!(
+            mono_repo_language("a", &root, Some(&map)),
+            Some("python".to_string())
+        );
+
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(mono_repo_language("a", &root, Some(&empty)), None);
+    }
+}

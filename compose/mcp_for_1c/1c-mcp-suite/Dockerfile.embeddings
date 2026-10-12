@@ -1,0 +1,77 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Системные зависимости
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python зависимости (включая qdrant-client и fastembed для гибридного поиска)
+COPY requirements-embeddings.txt requirements-embeddings.lock.txt ./
+# TR-2: ставим из лок-файла, если он заполнен, иначе — по границам.
+# Пустой лок-файл не должен ломать сборку: он всего лишь означает, что
+# лок ещё не собирали (`make lock`, на Windows — `.\scripts\gen_lockfiles.ps1`).
+# Предупреждение в логе сборки видно сразу.
+RUN if grep -qE '^[a-zA-Z]' requirements-embeddings.lock.txt; then \
+        echo "TR-2: ставим из requirements-embeddings.lock.txt"; \
+        pip install --no-cache-dir -r requirements-embeddings.lock.txt; \
+    else \
+        echo "TR-2: requirements-embeddings.lock.txt пуст — ставим по границам из requirements-embeddings.txt."; \
+        echo "      Пересборка может дать другие версии. Запустите:"; \
+        echo "        Linux/WSL:   make lock"; \
+        echo "        PowerShell:  .\\scripts\\gen_lockfiles.ps1"; \
+        pip install --no-cache-dir -r requirements-embeddings.txt; \
+    fi
+
+# Предзагружаем dense-модель (чтобы не качать при каждом запуске)
+ARG EMBEDDING_MODEL=intfloat/multilingual-e5-base
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}')"
+
+# Предзагружаем sparse BM25-модель fastembed (для гибридного поиска ИТС)
+ARG BM25_MODEL=Qdrant/bm25
+RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='${BM25_MODEL}')"
+
+# Точка входа и общие модули
+COPY start.py                              /app/start.py
+COPY mcp_pagination.py                     /app/mcp_pagination.py
+COPY mcp_metrics.py                        /app/mcp_metrics.py
+COPY mcp_cache.py                          /app/mcp_cache.py
+COPY mcp_auth.py                           /app/mcp_auth.py
+# TR-1: общая точка входа Streamable HTTP (её импортирует start.py)
+COPY mcp_http.py                           /app/mcp_http.py
+# TOOL-1/TOOL-2: фильтр набора инструментов (её импортирует start.py)
+COPY mcp_tool_filter.py                    /app/mcp_tool_filter.py
+# A-2: сверка «вход против выхода». Импортируется из hbk_reader и
+# hbk_indexer. Второй экземпляр строки — в Dockerfile.python; расхождение
+# между ними ловит tests_shortfall.py.
+COPY shortfall.py                          /app/shortfall.py
+# OBS-1: единый словарь отказа (answerable / degraded / meaning).
+# Импортируется серверами metadata-graph, query-builder, platform-help и
+# bsl-checker. Копируется в ТРИ образа; расхождение ловит tests_refusal.py.
+COPY refusal.py                            /app/refusal.py
+# TOOL-1: счётчик вызовов инструментов (поле usage в *_stats).
+# Импортируется серверами metadata-graph, platform-help и bsl-checker;
+# копируется в ТРИ образа — расхождение ловит tests_delivery.py.
+COPY tool_usage.py                            /app/tool_usage.py
+# EVAL-7: журнал вызовов инструментов (трасса ручного прогона).
+# Выключен, пока не задан MCP_TOOL_JOURNAL; импортируется теми же
+# серверами, что и tool_usage.py, — расхождение ловит tests_delivery.py.
+COPY tool_journal.py                          /app/tool_journal.py
+
+# Справка платформы: сервер
+COPY mcp-platform-help/server.py           /app/mcp_platform_help.py
+COPY mcp-platform-help/help_ranking.py     /app/help_ranking.py
+# PERF-6: реестр моделей и замер их загрузки. Четвёртая подряд строка COPY,
+# которую назвал tests_delivery.py, а не память.
+COPY mcp-platform-help/model_warmup.py    /app/model_warmup.py
+
+# Справка платформы: новый hybrid-индексатор (задача 4.7, поддержка .hbk 8.3.22+)
+COPY mcp-platform-help-embeddings/hbk_reader.py    /app/hbk_reader.py
+COPY mcp-platform-help-embeddings/hbk_parser.py    /app/hbk_parser.py
+COPY mcp-platform-help-embeddings/hbk_chunker.py   /app/hbk_chunker.py
+COPY mcp-platform-help-embeddings/hbk_indexer.py   /app/indexer.py
+
+RUN mkdir -p /data/1c-platform /data/platform-help /workspace
+
+EXPOSE 8003

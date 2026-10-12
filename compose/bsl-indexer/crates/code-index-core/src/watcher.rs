@@ -1,0 +1,626 @@
+/// Модуль файлового наблюдателя — отслеживает изменения в проекте
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Событие относится к одному из конфигурационных файлов и может менять его
+/// содержимое. События чтения отбрасываются: на Linux они иначе зацикливают
+/// watcher на собственном перечитывании конфига.
+pub(crate) fn is_config_change(
+    kind: &notify::EventKind,
+    paths: &[PathBuf],
+    targets: &[PathBuf],
+) -> bool {
+    !matches!(kind, notify::EventKind::Access(_))
+        && paths.iter().any(|path| targets.iter().any(|target| path == target))
+}
+
+/// Событие файловой системы
+#[derive(Debug, Clone)]
+pub enum FileEvent {
+    /// Файл создан
+    Created(PathBuf),
+    /// Файл изменён
+    Modified(PathBuf),
+    /// Файл удалён
+    Deleted(PathBuf),
+}
+
+/// Конфигурация watcher
+pub struct WatcherConfig {
+    /// Задержка debounce в миллисекундах (по умолчанию 1500 мс)
+    pub debounce_ms: u64,
+    /// Максимальное время ожидания батча в миллисекундах (по умолчанию 2000 мс)
+    pub batch_ms: u64,
+    /// Дополнительные директории для исключения
+    pub exclude_dirs: Vec<String>,
+    /// Glob-паттерны имён файлов для исключения (например "*.tmp.*", "*.bak")
+    pub exclude_file_patterns: Vec<String>,
+    /// Преобладающий язык репозитория — нужен категоризации (`.h` в C++-проекте).
+    pub repo_language: Option<String>,
+    /// Дополнительные текстовые расширения из настроек проекта.
+    pub extra_text_extensions: Vec<String>,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            debounce_ms: 1500,
+            batch_ms: 2000,
+            exclude_dirs: vec![],
+            exclude_file_patterns: vec![],
+            repo_language: None,
+            extra_text_extensions: vec![],
+        }
+    }
+}
+
+fn build_file_matcher(patterns: &[String]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(g) = Glob::new(pat) {
+            builder.add(g);
+        } else {
+            eprintln!("[watcher] некорректный exclude_file_pattern '{}'", pat);
+        }
+    }
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
+}
+
+/// Классифицировать notify-событие в `FileEvent`.
+///
+/// Каталоги игнорируются (`None` — индексируем только файлы). `Create`/`Modify`
+/// на пути, которого уже нет на диске, трактуются как `Deleted`: при
+/// переименовании файла в новое имя notify присылает на старое имя
+/// `Modify(Name(RenameMode::From))` уже после того, как путь исчез. Без этого
+/// строка старого имени осталась бы фантомом в индексе до полного reindex.
+/// Настоящее ли это удаление, если путь не виден как файл.
+///
+/// `None` — метаданные прочитались, путь на месте (обычная проверка не увидела
+/// его из-за гонки). `NotFound` — файла действительно нет. Прочие ошибки
+/// (доступ запрещён, файл занят другим процессом, том отвалился) означают, что
+/// файл, скорее всего, жив: считать их удалением — значит выбросить живую
+/// запись из индекса, а нового события не придёт, и вернётся она лишь при
+/// полном проходе (S-5). Фантомная запись, наоборот, уходит при ближайшем
+/// полном проходе, поэтому в спорном случае выбираем её.
+///
+/// Вынесено отдельной функцией ради модульного теста: реальную временную
+/// недоступность (проверка антивирусом, момент перемещения) в тесте не
+/// воспроизвести.
+///
+/// Видна всему крейту: тем же вопросом задаётся ветка очистки индекса
+/// (`cli::cmd_clean`), и ответ обязан быть одинаковым — иначе одна часть
+/// программы бережёт живую запись, а другая её выбрасывает.
+pub(crate) fn is_real_deletion(err: Option<&std::io::Error>) -> bool {
+    match err {
+        None => false,
+        Some(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn classify_event(kind: &notify::EventKind, path: &Path) -> Option<FileEvent> {
+    // Каталог на месте. Обычные события на папке (запись внутрь) пропускаем —
+    // файлы пришлют свои события сами. НО создание и переименование каталога ОС
+    // отдаёт ОДНИМ событием на саму папку, без событий на файлы внутри. Такой
+    // каталог надо раскрыть обходом, иначе его содержимое не попадёт в индекс
+    // до перезапуска демона. Проверено на стенде: `rename` папки давал сразу два
+    // расхождения — фантомы по старому пути и полную слепоту к новому.
+    if path.is_dir() {
+        return match kind {
+            notify::EventKind::Create(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                Some(FileEvent::Created(path.to_path_buf()))
+            }
+            _ => None,
+        };
+    }
+    match kind {
+        notify::EventKind::Create(_) if path.is_file() => {
+            Some(FileEvent::Created(path.to_path_buf()))
+        }
+        notify::EventKind::Modify(_) if path.is_file() => {
+            Some(FileEvent::Modified(path.to_path_buf()))
+        }
+        // Путь не виден как файл. Удалением считаем ТОЛЬКО явное отсутствие:
+        // временная недоступность (проверка антивирусом, файл занят другим
+        // процессом, момент перемещения) тоже даёт `is_file() == false`, и
+        // трактовать её как удаление — значит выбросить живой файл из индекса,
+        // причём нового события не последует и вернётся он лишь при полном
+        // проходе (S-5).
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
+            if is_real_deletion(std::fs::symlink_metadata(path).err().as_ref()) {
+                Some(FileEvent::Deleted(path.to_path_buf()))
+            } else {
+                Some(FileEvent::Modified(path.to_path_buf()))
+            }
+        }
+        notify::EventKind::Remove(_) => Some(FileEvent::Deleted(path.to_path_buf())),
+        _ => None,
+    }
+}
+
+/// Может ли событие по этому пути вообще что-то изменить в индексе.
+///
+/// Наблюдатель раньше отсеивал только исключённые каталоги и образцы имён, а
+/// категорию файла не смотрел. В итоге рабочие файлы соседних процессов —
+/// журнал приложения, база очереди и её служебный журнал — будили демон
+/// каждые пару секунд: он открывал транзакцию, обновлял надстройку, схлопывал
+/// журнал WAL и писал три строки в свой журнал. Работы ноль: такие файлы в
+/// индекс не попадают. Замер на рабочей установке: 3 051 пакет из 3 093 —
+/// пустые, 77 % строк журнала — их след, и полезное вытеснялось ротацией.
+///
+/// Пропускаем дальше:
+/// * каталоги — по ним раскрывается содержимое созданной или переименованной
+///   папки;
+/// * пути без расширения — это может быть удалённый каталог, отличить его от
+///   файла после удаления уже нельзя;
+/// * файлы, которые категоризация считает кодом или текстом.
+///
+/// Отсеиваем только то, что заведомо не индексируется: файл с расширением,
+/// признанный двоичным (с учётом языка репозитория и дополнительных текстовых
+/// расширений из настроек).
+pub fn event_can_change_index(
+    path: &Path,
+    repo_language: Option<&str>,
+    extra_text: &[String],
+) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    if path.extension().is_none() {
+        return true;
+    }
+    !matches!(
+        crate::indexer::file_types::categorize_file_in_repo(path, repo_language, extra_text),
+        crate::indexer::file_types::FileCategory::Binary
+    )
+}
+
+/// Создать watcher и вернуть receiver для событий файловой системы.
+///
+/// Watcher работает в фоновом потоке notify. Возвращает кортеж
+/// (watcher, receiver). Watcher нужно хранить — при дропе останавливается.
+pub fn create_watcher(
+    root: &Path,
+    config: &WatcherConfig,
+) -> anyhow::Result<(RecommendedWatcher, mpsc::Receiver<FileEvent>)> {
+    let (tx, rx) = mpsc::channel();
+    let exclude_dirs = config.exclude_dirs.clone();
+    let file_matcher = build_file_matcher(&config.exclude_file_patterns);
+    let root_path = root.to_path_buf();
+    let repo_language = config.repo_language.clone();
+    let extra_text = config.extra_text_extensions.clone();
+
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                for path in &event.paths {
+                    // Вычисляем относительный путь для проверки исключений
+                    let rel = path.strip_prefix(&root_path).unwrap_or(path);
+
+                    // Проверяем, не попадает ли файл в исключённую директорию
+                    let is_excluded = rel.components().any(|c| {
+                        let s = c.as_os_str().to_string_lossy();
+                        exclude_dirs.contains(&s.to_string())
+                            || crate::indexer::file_types::EXCLUDE_DIRS
+                                .contains(&s.as_ref())
+                    });
+                    if is_excluded {
+                        continue;
+                    }
+
+                    // Проверяем exclude_file_patterns по имени файла
+                    if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+                        if file_matcher.is_match(fname) {
+                            continue;
+                        }
+                    }
+
+                    // Файл заведомо не попадёт в индекс — будить обработку
+                    // пакета незачем.
+                    if !event_can_change_index(path, repo_language.as_deref(), &extra_text) {
+                        continue;
+                    }
+
+                    let file_event = match classify_event(&event.kind, path) {
+                        Some(ev) => ev,
+                        None => continue,
+                    };
+
+                    let _ = tx.send(file_event);
+                }
+            }
+        })?;
+
+    watcher.watch(root, RecursiveMode::Recursive)?;
+
+    Ok((watcher, rx))
+}
+
+/// Собрать батч событий с debounce.
+///
+/// Блокирует поток до первого события, затем ждёт `debounce_ms` тишины.
+/// Максимальное время накопления батча ограничено `batch_ms`.
+/// Возвращает дедуплицированный список событий (одно событие на файл).
+pub fn collect_batch(
+    rx: &mpsc::Receiver<FileEvent>,
+    debounce_ms: u64,
+    batch_ms: u64,
+) -> Vec<FileEvent> {
+    // Дедупликация: для каждого пути — только последнее событие
+    let mut pending: HashMap<PathBuf, FileEvent> = HashMap::new();
+    let debounce = Duration::from_millis(debounce_ms);
+    let batch_timeout = Duration::from_millis(batch_ms);
+
+    // Ждём первое событие (блокирующе)
+    match rx.recv() {
+        Ok(event) => {
+            let path = event_path(&event).clone();
+            pending.insert(path, event);
+        }
+        Err(_) => return vec![], // канал закрыт
+    }
+
+    let batch_start = Instant::now();
+    let mut last_event = Instant::now();
+
+    // Собираем дополнительные события пока есть «тишина» < debounce_ms
+    loop {
+        // Прерываем если суммарное время накопления превысило batch_ms
+        if batch_start.elapsed() >= batch_timeout {
+            break;
+        }
+
+        let elapsed_since_last = last_event.elapsed();
+        if elapsed_since_last >= debounce {
+            // Тишина — батч готов
+            break;
+        }
+
+        let wait = debounce.saturating_sub(elapsed_since_last);
+        match rx.recv_timeout(wait) {
+            Ok(event) => {
+                let path = event_path(&event).clone();
+                pending.insert(path, event);
+                last_event = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break, // тишина — батч готов
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    pending.into_values().collect()
+}
+
+/// Порция изменений, собранная наблюдателем, вместе с ответом на вопрос
+/// «это всё?».
+///
+/// Различать важно: три файла и три тысячи выглядят одинаково — просто список.
+/// Отличается то, чем закончился сбор. Дождались тишины — список полон, число
+/// файлов точное, сколько бы их ни было. Упёрлись в потолок времени — поток
+/// событий продолжается, и в очереди осталось ещё, то есть число неполное.
+/// Каким путём обрабатывать (пофайлово или полным проходом), решают уже по
+/// самому числу, но только после того, как оно стало точным.
+#[derive(Debug)]
+pub struct Batch {
+    pub events: Vec<FileEvent>,
+    /// `true` — сбор закончился тишиной, список полон.
+    pub settled: bool,
+}
+
+/// Вспомогательная функция: извлечь путь из события
+pub(crate) fn event_path(event: &FileEvent) -> &PathBuf {
+    match event {
+        FileEvent::Created(p) | FileEvent::Modified(p) | FileEvent::Deleted(p) => p,
+    }
+}
+
+/// Вариант `collect_batch` с idle-таймаутом: если в течение `idle_ms` не
+/// приходит ни одного события — возвращается `Ok(None)`. Это позволяет
+/// потребителю периодически проверять внешние флаги (например, shutdown).
+///
+/// Если событие пришло — дальше работает как `collect_batch`: накапливает
+/// последующие события с debounce/batch лимитами и отдаёт дедуплицированный
+/// список.
+///
+/// `Err` возвращается только при закрытом канале (watcher умер).
+pub fn poll_batch(
+    rx: &mpsc::Receiver<FileEvent>,
+    idle_ms: u64,
+    debounce_ms: u64,
+    batch_ms: u64,
+) -> Result<Option<Batch>, mpsc::RecvError> {
+    let mut pending: HashMap<PathBuf, FileEvent> = HashMap::new();
+    let debounce = Duration::from_millis(debounce_ms);
+    let batch_timeout = Duration::from_millis(batch_ms);
+
+    // Ждём первое событие с ограничением по времени.
+    match rx.recv_timeout(Duration::from_millis(idle_ms)) {
+        Ok(event) => {
+            let path = event_path(&event).clone();
+            pending.insert(path, event);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+    }
+
+    let batch_start = Instant::now();
+    let mut last_event = Instant::now();
+    // Дождались тишины (список полон) или упёрлись в потолок времени
+    // (поток событий продолжается, и часть изменений осталась в очереди).
+    let mut settled = true;
+
+    loop {
+        if batch_start.elapsed() >= batch_timeout {
+            settled = false;
+            break;
+        }
+        let elapsed_since_last = last_event.elapsed();
+        if elapsed_since_last >= debounce {
+            break;
+        }
+        let wait = debounce.saturating_sub(elapsed_since_last);
+        match rx.recv_timeout(wait) {
+            Ok(event) => {
+                let path = event_path(&event).clone();
+                pending.insert(path, event);
+                last_event = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Ok(Some(Batch {
+        events: pending.into_values().collect(),
+        settled,
+    }))
+}
+
+#[cfg(test)]
+mod otsev_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Рабочие файлы соседних процессов (журнал приложения, база очереди и её
+    /// служебный журнал) в индекс не попадают — и будить обработку пакета
+    /// не должны. Это они давали 98 % пустых пакетов и три четверти строк
+    /// журнала на рабочей установке.
+    #[test]
+    fn двоичные_файлы_не_будят_обработку() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["poller.log", "queue.db", "queue.db-journal", "photo.png"] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            assert!(
+                !event_can_change_index(&p, None, &[]),
+                "{} не индексируется — событие по нему обязано отсеиваться",
+                name
+            );
+        }
+    }
+
+    /// Всё, что действительно попадает в индекс, обязано проходить дальше.
+    #[test]
+    fn код_и_текст_проходят_дальше() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["Module.bsl", "main.rs", "readme.md", "Configuration.xml"] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            assert!(
+                event_can_change_index(&p, None, &[]),
+                "{} индексируется — событие по нему нельзя терять",
+                name
+            );
+        }
+    }
+
+    /// Каталог и путь без расширения проходят всегда: по каталогу
+    /// раскрывается содержимое, а удалённый каталог от файла уже не отличить.
+    #[test]
+    fn каталоги_и_пути_без_расширения_проходят() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Ext");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(event_can_change_index(&dir, None, &[]));
+
+        // Путь уже удалён — на диске его нет, расширения нет.
+        let ghost = tmp.path().join("УдалённыйКаталог");
+        assert!(event_can_change_index(&ghost, None, &[]));
+    }
+
+    /// Расширение из настроек проекта делает файл текстовым — значит событие
+    /// по нему отсеивать нельзя.
+    #[test]
+    fn дополнительные_расширения_снимают_отсев() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("service.log");
+        std::fs::write(&p, b"x").unwrap();
+
+        assert!(!event_can_change_index(&p, None, &[]));
+        assert!(event_can_change_index(&p, None, &["log".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// S-5: удалением считается только явное отсутствие пути. Временная
+    /// недоступность (доступ запрещён, файл занят, том отвалился) — не повод
+    /// выбрасывать живую запись из индекса.
+    #[test]
+    fn test_is_real_deletion_only_on_not_found() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(
+            !is_real_deletion(None),
+            "путь на месте — это не удаление"
+        );
+        assert!(
+            is_real_deletion(Some(&Error::new(ErrorKind::NotFound, "нет такого файла"))),
+            "явное отсутствие — удаление"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_real_deletion(Some(&Error::new(kind, "временная недоступность"))),
+                "{kind:?} не должен трактоваться как удаление"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_event_rename_from_becomes_delete() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+        use notify::EventKind;
+
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.bsl");
+        fs::write(&file, "x").unwrap();
+        let missing = tmp.path().join("gone.bsl");
+        let dir = tmp.path().join("sub");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Существующий файл: Create → Created, Modify → Modified.
+        assert!(matches!(
+            classify_event(&EventKind::Create(CreateKind::File), &file),
+            Some(FileEvent::Created(_))
+        ));
+        assert!(matches!(
+            classify_event(&EventKind::Modify(ModifyKind::Any), &file),
+            Some(FileEvent::Modified(_))
+        ));
+
+        // Ключевой случай: rename старого имени приходит как Modify(Name(From))
+        // на уже исчезнувшем пути → должно стать Deleted (иначе фантом).
+        assert!(matches!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &missing
+            ),
+            Some(FileEvent::Deleted(_))
+        ));
+        // Create на исчезнувшем пути тоже трактуется как удаление.
+        assert!(matches!(
+            classify_event(&EventKind::Create(CreateKind::Any), &missing),
+            Some(FileEvent::Deleted(_))
+        ));
+
+        // Явное удаление → Deleted.
+        assert!(matches!(
+            classify_event(&EventKind::Remove(RemoveKind::File), &missing),
+            Some(FileEvent::Deleted(_))
+        ));
+
+        // Каталог: создание и переименование папки ОС отдаёт одним событием на
+        // саму папку, без событий на файлы внутри — раскрываем такой каталог
+        // обходом (Created). Иначе его содержимое не попадёт в индекс.
+        assert!(matches!(
+            classify_event(&EventKind::Create(CreateKind::Folder), &dir),
+            Some(FileEvent::Created(_))
+        ));
+        assert!(matches!(
+            classify_event(&EventKind::Modify(ModifyKind::Name(RenameMode::To)), &dir),
+            Some(FileEvent::Created(_))
+        ));
+        // Прочие события на существующей папке игнорируем: запись внутрь неё
+        // порождает собственные события на файлах.
+        assert!(classify_event(&EventKind::Modify(ModifyKind::Any), &dir).is_none());
+    }
+
+    #[test]
+    fn test_watcher_detects_file_creation() {
+        let tmp = TempDir::new().unwrap();
+        let config = WatcherConfig::default();
+        let (_watcher, rx) = create_watcher(tmp.path(), &config).unwrap();
+
+        // Небольшая пауза для инициализации watcher
+        std::thread::sleep(Duration::from_millis(100));
+        fs::write(tmp.path().join("test.py"), "def foo(): pass").unwrap();
+
+        // Ждём события создания файла
+        let event = rx.recv_timeout(Duration::from_secs(3));
+        assert!(event.is_ok(), "Должно быть событие создания файла");
+    }
+
+    #[test]
+    fn test_watcher_excludes_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+
+        let config = WatcherConfig::default();
+        let (_watcher, rx) = create_watcher(tmp.path(), &config).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Файл в .git — НЕ должен генерировать событие (стандартная исключённая директория)
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+
+        // Файл в корне — должен генерировать событие
+        fs::write(tmp.path().join("main.py"), "print('hello')").unwrap();
+
+        let mut events = vec![];
+        // Собираем все события в течение 2 секунд
+        while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
+            events.push(e);
+        }
+
+        // Должно быть событие только для main.py, не для .git/HEAD
+        let has_main = events.iter().any(|e| match e {
+            FileEvent::Created(p) | FileEvent::Modified(p) => p.ends_with("main.py"),
+            _ => false,
+        });
+        let has_git = events.iter().any(|e| match e {
+            FileEvent::Created(p) | FileEvent::Modified(p) => {
+                p.to_str().unwrap_or("").contains(".git")
+            }
+            _ => false,
+        });
+
+        assert!(has_main, "Должно быть событие для main.py");
+        assert!(!has_git, "НЕ должно быть событий для .git");
+    }
+
+    #[test]
+    fn test_collect_batch_deduplication() {
+        let (tx, rx) = mpsc::channel();
+
+        // Отправляем два события для одного файла — должно прийти одно
+        let path = PathBuf::from("/tmp/test.py");
+        tx.send(FileEvent::Created(path.clone())).unwrap();
+        tx.send(FileEvent::Modified(path.clone())).unwrap();
+
+        // Закрываем отправитель
+        drop(tx);
+
+        // Собираем с минимальным debounce
+        let batch = collect_batch(&rx, 50, 200);
+
+        // Дедупликация: одно событие на файл (последнее — Modified)
+        assert_eq!(batch.len(), 1, "Должно быть одно событие (дедупликация)");
+        assert!(
+            matches!(&batch[0], FileEvent::Modified(p) if p == &path),
+            "Событие должно быть Modified"
+        );
+    }
+
+    #[test]
+    fn test_collect_batch_empty_on_closed_channel() {
+        let (tx, rx) = mpsc::channel::<FileEvent>();
+        drop(tx); // Закрываем канал немедленно
+
+        let batch = collect_batch(&rx, 100, 200);
+        assert!(batch.is_empty(), "Пустой батч при закрытом канале");
+    }
+}

@@ -1,0 +1,76 @@
+services:
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    container_name: ai2-omniroute
+    restart: unless-stopped
+    stop_grace_period: 40s
+    ports:
+      - "20129:20128"
+    volumes:
+      - omniroute-data:/app/data
+    environment:
+      PORT: "20128"
+      INITIAL_PASSWORD: ${OMNIROUTE_INITIAL_PASSWORD}
+      OMNIROUTE_MEMORY_MB: ${OMNIROUTE_MEMORY_MB:-1024}
+      OMNIROUTE_CHAT_ADMISSION_QUEUE_MS: ${OMNIROUTE_CHAT_ADMISSION_QUEUE_MS:-15000}
+      OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT: ${OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT:-3}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:20128').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  open-webui:
+    # Pinned for controlled upgrades (do not float on :main without an explicit decision).
+    image: ghcr.io/open-webui/open-webui:v0.11.4
+    container_name: ai2-open-webui
+    restart: unless-stopped
+    ports:
+      # Live cutover uses host :3000; keep 3100 only if standing up a parallel contour.
+      - "3000:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: ${CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS:-40}
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://omniroute:20128/v1
+      OPENAI_API_KEY: ${OPENWEBUI_OMNIROUTE_KEY}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_AUTH: "true"
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
+      DEFAULT_MODELS: "ds/deepseek-flash"
+    depends_on:
+      - omniroute
+
+  mdd-mcp:
+    image: mdd-mcp:latest
+    container_name: ai2-mdd-mcp
+    restart: unless-stopped
+    ports:
+      - "8180:8080"
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8080"
+      MDD_BASE_URL: "https://mdd.dns-shop.ru/dns_mdd_service"
+      MDD_USERNAME_FILE: /run/secrets/mdd_username
+      MDD_PASSWORD_FILE: /run/secrets/mdd_password
+      MCP_API_KEY_FILE: /run/secrets/mcp_api_key
+    secrets:
+      - mdd_username
+      - mdd_password
+      - mcp_api_key
+
+volumes:
+  omniroute-data:
+  open-webui-data:
+
+secrets:
+  mdd_username:
+    file: C:/MCP/MCP_MDD/secrets/mdd_username
+  mdd_password:
+    file: C:/MCP/MCP_MDD/secrets/mdd_password
+  mcp_api_key:
+    file: C:/MCP/MCP_MDD/secrets/mcp_api_key

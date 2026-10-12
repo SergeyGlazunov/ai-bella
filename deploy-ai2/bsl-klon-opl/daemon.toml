@@ -1,0 +1,9 @@
+[daemon]
+http_host = "127.0.0.1"
+http_port = 0
+log_level = "info"
+
+[[paths]]
+path = "/repos/SRC"
+alias = "klon_opl"
+language = "bsl"

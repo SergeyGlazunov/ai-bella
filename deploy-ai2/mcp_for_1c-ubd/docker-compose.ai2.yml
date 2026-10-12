@@ -1,0 +1,37 @@
+# Isolation overlay: ai2 graph + query for UBD only.
+# compose -p ai2-mcp-ubd -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.ai2.yml \
+#   up -d neo4j mcp-metadata-graph mcp-query-builder
+services:
+  neo4j:
+    container_name: ai2-neo4j-ubd
+    image: neo4j:5-community
+    ports: !override
+      - "127.0.0.1:7574:7474"
+      - "127.0.0.1:7787:7687"
+
+  mcp-metadata-graph:
+    container_name: ai2-mcp-graph-ubd
+    image: ai2-mcp-metadata-graph:latest
+    ports: !override
+      - "0.0.0.0:${MCP_PORT:-8101}:8001"
+      - "127.0.0.1:9100:9000"
+    networks:
+      - default
+
+  metadata-indexer:
+    container_name: ai2-metadata-indexer-ubd
+    image: ai2-metadata-indexer:latest
+
+  mcp-query-builder:
+    container_name: ai2-mcp-query-builder-ubd
+    # Same Dockerfile.python as metadata-graph — reuse the retagged image.
+    image: ai2-mcp-metadata-graph:latest
+    ports: !override
+      - "0.0.0.0:${QUERY_PORT:-8109}:8009"
+    networks:
+      - default
+
+networks:
+  default:
+    name: ai2-mcp-ubd_net
+    external: true

@@ -1,0 +1,12 @@
+[Unit]
+Description=AI-Contour nightly sync (contour update)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ai-sync
+ExecStart=/opt/ai-sync/venv/bin/contour update
+
+[Install]
+WantedBy=multi-user.target

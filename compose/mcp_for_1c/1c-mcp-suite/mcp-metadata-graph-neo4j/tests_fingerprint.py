@@ -1,0 +1,882 @@
+"""
+Тесты блока A Захода 4: PERF-3 (fingerprint) и PERF-4 (запись рёбер).
+======================================================================
+
+Почему отдельный файл, а не дополнение к tests_graph_writer.py:
+tests_graph_writer требует живой Neo4j (или testcontainers) и скипается
+целиком, когда базы нет. Логика, которую правил блок A, к базе не
+привязана — её можно и нужно проверять офлайн, в том же прогоне, что
+парсер и резолвер.
+
+Neo4j подменён стабом `FakeNeo4j`, который запоминает пары
+(cypher, parameters). Это ровно та граница, которая нас интересует:
+PERF-4 — про то, КАКОЙ Cypher уходит в базу и с какими строками, а не
+про то, что база с ним сделает. Проверка «а действительно ли теперь
+используется индекс» живёт на боевом прогоне и в его таймингах.
+
+Запуск:
+    python tests_fingerprint.py -v
+"""
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from graph_writer import (
+    CODE_LAYER_LABELS, DELETE_BATCH_DEFAULT, FP_MODE_CONTENT, FP_MODE_STAT,
+    META_LAYER_LABELS,
+    EDGE_QUERIES, _infer_src_label, clear_code_layer, clear_metadata_layer,
+    fingerprint_matches, fingerprint_workspace,
+    fingerprint_workspace_files, fingerprint_workspace_multi,
+    write_edges,
+)
+
+
+# ─── Стаб Neo4j ───────────────────────────────────────────────────────
+
+
+class FakeNeo4j:
+    """Запоминает всё, что в него писали. Ничего не исполняет."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def query(self, cypher, parameters=None):
+        self.calls.append((cypher, parameters or {}))
+        return {"results": [{"columns": [], "data": []}], "errors": []}
+
+    def rows(self, cypher, parameters=None):
+        self.calls.append((cypher, parameters or {}))
+        if "count(*) AS written" in cypher:
+            # FIX-15: писатели спрашивают, сколько строк реально легло.
+            # Базовый стаб отвечает «все» — недостачу моделирует
+            # FakeNeo4jPartialWrite ниже.
+            return [{"written": len((parameters or {}).get("rows", []))}]
+        return []
+
+
+class FakeNeo4jWithNodes(FakeNeo4j):
+    """
+    Стаб с учётом «сколько узлов осталось» — для проверки FIX-13.
+
+    Отвечает на порционный DELETE так же, как ответила бы Neo4j: отдаёт
+    min(остаток, batch) и уменьшает остаток. Позволяет проверить, что цикл
+    доедает всё и корректно останавливается.
+    """
+
+    def __init__(self, counts: dict):
+        super().__init__()
+        self.counts = dict(counts)
+
+    def rows(self, cypher, parameters=None):
+        self.calls.append((cypher, parameters or {}))
+        m = re.search(r"MATCH \(n:(\w+)\)", cypher)
+        if not m or "DETACH DELETE" not in cypher:
+            return []
+        label = m.group(1)
+        batch = (parameters or {}).get("batch", 0)
+        left = self.counts.get(label, 0)
+        take = min(left, batch)
+        self.counts[label] = left - take
+        return [{"deleted": take}]
+
+
+class FakeNeo4jPartialWrite(FakeNeo4j):
+    """
+    Стаб, у которого часть строк «не находит узлов», — для проверки FIX-15.
+
+    Именно так вела себя боевая база на :HAS_METHOD: MATCH не находил
+    владельца, MERGE не срабатывал, ошибки не было, и потеря 158 961 ребра
+    осталась незамеченной до ручной сверки счётчиков.
+    """
+
+    def __init__(self, write_fraction: float = 0.5):
+        super().__init__()
+        self.write_fraction = write_fraction
+
+    def rows(self, cypher, parameters=None):
+        self.calls.append((cypher, parameters or {}))
+        if "count(*) AS written" in cypher:
+            sent = len((parameters or {}).get("rows", []))
+            return [{"written": int(sent * self.write_fraction)}]
+        return []
+
+
+def _mkfile(root: Path, rel: str, content: str = "x") -> Path:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+# ─── PERF-3: fingerprint ──────────────────────────────────────────────
+
+
+class TestFingerprintModes(unittest.TestCase):
+    """Оба режима должны отвечать на один вопрос: менялось ли что-нибудь."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _mkfile(self.root, "Catalogs/Контрагенты.xml", "<a/>")
+        _mkfile(self.root, "Catalogs/Контрагенты/Ext/ObjectModule.bsl", "Процедура П() КонецПроцедуры")
+        _mkfile(self.root, "CommonModules/Общий/Ext/Module.bsl", "Функция Ф() Возврат 1; КонецФункции")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    # ─ Базовое поведение ─
+
+    def test_stat_mode_is_default(self):
+        _, meta = fingerprint_workspace_multi(self.root)
+        self.assertEqual(meta["mode"], FP_MODE_STAT)
+
+    def test_strict_mode_reports_content(self):
+        _, meta = fingerprint_workspace_multi(self.root, strict=True)
+        self.assertEqual(meta["mode"], FP_MODE_CONTENT)
+
+    def test_separate_digests_per_suffix(self):
+        digests, meta = fingerprint_workspace_multi(self.root, (".xml", ".bsl"))
+        self.assertEqual(set(digests), {".xml", ".bsl"})
+        self.assertNotEqual(digests[".xml"], digests[".bsl"])
+        self.assertEqual(meta["by_suffix"][".xml"], 1)
+        self.assertEqual(meta["by_suffix"][".bsl"], 2)
+        self.assertEqual(meta["files"], 3)
+
+    def test_stable_across_runs(self):
+        d1, _ = fingerprint_workspace_multi(self.root)
+        d2, _ = fingerprint_workspace_multi(self.root)
+        self.assertEqual(d1, d2)
+
+    def test_empty_tree_gives_stable_digest(self):
+        with tempfile.TemporaryDirectory() as empty:
+            d1, _ = fingerprint_workspace_multi(Path(empty))
+            d2, _ = fingerprint_workspace_multi(Path(empty))
+            self.assertEqual(d1[".xml"], d2[".xml"])
+
+    # ─ Главное свойство: изменение файла видно ─
+
+    def test_content_change_detected_in_stat_mode(self):
+        """
+        Правка меняет и размер, и mtime — режим stat её видит.
+        Это основной сценарий: разработчик поправил модуль.
+        """
+        before, _ = fingerprint_workspace_multi(self.root)
+        p = self.root / "CommonModules/Общий/Ext/Module.bsl"
+        p.write_text("Функция Ф() Возврат 2; КонецФункции // дописали", encoding="utf-8")
+        after, _ = fingerprint_workspace_multi(self.root)
+        self.assertNotEqual(before[".bsl"], after[".bsl"])
+        self.assertEqual(before[".xml"], after[".xml"], "чужое расширение не должно шевелиться")
+
+    def test_same_size_but_new_mtime_detected(self):
+        """
+        Правка, не изменившая размер (заменили символ на символ). Ловится
+        по mtime — ради этого в кортеже и лежит st_mtime_ns, а не только
+        размер.
+        """
+        p = self.root / "CommonModules/Общий/Ext/Module.bsl"
+        before, _ = fingerprint_workspace_multi(self.root)
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text.replace("1", "2"), encoding="utf-8")
+        self.assertEqual(len(text), len(p.read_text(encoding="utf-8")))
+        after, _ = fingerprint_workspace_multi(self.root)
+        self.assertNotEqual(before[".bsl"], after[".bsl"])
+
+    def test_new_file_detected(self):
+        before, _ = fingerprint_workspace_multi(self.root)
+        _mkfile(self.root, "Documents/Заказ.xml", "<d/>")
+        after, _ = fingerprint_workspace_multi(self.root)
+        self.assertNotEqual(before[".xml"], after[".xml"])
+
+    def test_deleted_file_detected(self):
+        before, _ = fingerprint_workspace_multi(self.root)
+        (self.root / "Catalogs/Контрагенты.xml").unlink()
+        after, _ = fingerprint_workspace_multi(self.root)
+        self.assertNotEqual(before[".xml"], after[".xml"])
+
+    def test_renamed_file_detected(self):
+        """Переименование не меняет ни размер, ни mtime — ловится по пути."""
+        before, _ = fingerprint_workspace_multi(self.root)
+        src = self.root / "Catalogs/Контрагенты.xml"
+        src.rename(self.root / "Catalogs/Партнёры.xml")
+        after, _ = fingerprint_workspace_multi(self.root)
+        self.assertNotEqual(before[".xml"], after[".xml"])
+
+    # ─ Известное ограничение режима stat ─
+
+    def test_known_blind_spot_same_size_same_mtime(self):
+        """
+        Документируем границу честно: если содержимое подменили, а размер и
+        mtime восстановили (так делает копирование выгрузки утилитой,
+        сохраняющей время), режим stat изменения НЕ увидит, а строгий —
+        увидит. Ровно за этим и оставлен METADATA_FINGERPRINT_STRICT.
+
+        Тест на ограничение, а не на дефект: он падает, если ограничение
+        случайно исчезнет — и тогда комментарий в .env.example надо будет
+        переписать.
+        """
+        p = self.root / "CommonModules/Общий/Ext/Module.bsl"
+        st = os.stat(p)
+        stat_before, _ = fingerprint_workspace_multi(self.root)
+        strict_before, _ = fingerprint_workspace_multi(self.root, strict=True)
+
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text.replace("1", "9"), encoding="utf-8")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        stat_after, _ = fingerprint_workspace_multi(self.root)
+        strict_after, _ = fingerprint_workspace_multi(self.root, strict=True)
+
+        self.assertEqual(stat_before[".bsl"], stat_after[".bsl"],
+                         "режим stat такую подмену не видит — это известная граница")
+        self.assertNotEqual(strict_before[".bsl"], strict_after[".bsl"],
+                            "строгий режим обязан её видеть, иначе он бесполезен")
+
+    # ─ Прочее ─
+
+    def test_meta_counts_bytes_and_newest_mtime(self):
+        _, meta = fingerprint_workspace_multi(self.root)
+        self.assertGreater(meta["bytes"], 0)
+        self.assertGreater(meta["newest_mtime"], 0)
+        self.assertLessEqual(meta["newest_mtime"], time.time() + 5)
+        self.assertGreaterEqual(meta["elapsed_sec"], 0.0)
+
+    def test_suffix_matching_is_case_insensitive(self):
+        """В выгрузках встречается .XML — он должен попадать в тот же набор."""
+        _mkfile(self.root, "Reports/Отчёт.XML", "<r/>")
+        digests, meta = fingerprint_workspace_multi(self.root, (".xml",))
+        self.assertEqual(meta["by_suffix"][".xml"], 2)
+        self.assertTrue(digests[".xml"])
+
+    def test_nested_dirs_are_walked(self):
+        _mkfile(self.root, "a/b/c/d/e/Глубоко.xml", "<x/>")
+        _, meta = fingerprint_workspace_multi(self.root, (".xml",))
+        self.assertEqual(meta["by_suffix"][".xml"], 2)
+
+    def test_single_suffix_wrapper_matches_multi(self):
+        digests, _ = fingerprint_workspace_multi(self.root, (".xml",))
+        self.assertEqual(fingerprint_workspace_files(self.root, ".xml"), digests[".xml"])
+        self.assertEqual(fingerprint_workspace_files(self.root, "xml"), digests[".xml"])
+        self.assertEqual(fingerprint_workspace(self.root), digests[".xml"])
+
+    def test_multi_walk_equals_two_single_walks(self):
+        """
+        Обход стал один на оба расширения. Значения обязаны совпасть с тем,
+        что дают раздельные обходы, иначе экономия куплена сменой семантики.
+        """
+        digests, _ = fingerprint_workspace_multi(self.root, (".xml", ".bsl"))
+        self.assertEqual(digests[".xml"], fingerprint_workspace_files(self.root, ".xml"))
+        self.assertEqual(digests[".bsl"], fingerprint_workspace_files(self.root, ".bsl"))
+
+    def test_missing_root_does_not_raise(self):
+        """
+        Индексер сам проверяет существование каталога, но fingerprint не
+        должен падать раньше этой проверки — иначе сообщение об ошибке
+        будет про scandir, а не про отсутствующую выгрузку.
+        """
+        digests, meta = fingerprint_workspace_multi(self.root / "нет-такого")
+        self.assertEqual(meta["files"], 0)
+        self.assertTrue(digests[".xml"])
+
+
+class TestFingerprintMatches(unittest.TestCase):
+    """Сравнение сохранённого и свежего fingerprint'а."""
+
+    def test_first_run(self):
+        same, why = fingerprint_matches(None, "abc", FP_MODE_STAT)
+        self.assertFalse(same)
+        self.assertIn("отсутствует", why)
+
+    def test_equal(self):
+        old = {"value": "abc", "mode": FP_MODE_STAT}
+        same, why = fingerprint_matches(old, "abc", FP_MODE_STAT)
+        self.assertTrue(same)
+        self.assertIn("совпал", why)
+
+    def test_changed(self):
+        old = {"value": "abc123", "mode": FP_MODE_STAT}
+        same, why = fingerprint_matches(old, "def456", FP_MODE_STAT)
+        self.assertFalse(same)
+        self.assertIn("изменился", why)
+
+    def test_mode_switch_is_not_reported_as_change(self):
+        """
+        Сумма по содержимому и сумма по (размер, mtime) — разные величины.
+        Их несовпадение не значит, что файлы менялись, и лог не должен так
+        говорить: иначе после включения STRICT человек пойдёт искать
+        несуществующую правку.
+        """
+        old = {"value": "abc", "mode": FP_MODE_CONTENT}
+        same, why = fingerprint_matches(old, "abc", FP_MODE_STAT)
+        self.assertFalse(same)
+        self.assertIn("способ подсчёта", why)
+        self.assertNotIn("изменился", why)
+
+    def test_legacy_node_without_mode_treated_as_content(self):
+        """
+        Узлы :Fingerprint, записанные до PERF-3, свойства `mode` не имеют.
+        Считать их посчитанными по содержимому — единственно верно: так и
+        было. Следствие — одна переиндексация после обновления.
+        """
+        old = {"value": "abc", "mode": FP_MODE_CONTENT}   # то, что вернёт _get_meta
+        same, _ = fingerprint_matches(old, "abc", FP_MODE_CONTENT)
+        self.assertTrue(same)
+
+
+# ─── PERF-4: запись рёбер ─────────────────────────────────────────────
+
+
+class TestEdgeQueriesUseLabels(unittest.TestCase):
+    """
+    Инвариант схемы: обе стороны MATCH обязаны быть с меткой.
+
+    Именно его нарушение стоило 28 минут на записи слоя 1: все констрейнты
+    привязаны к меткам, поэтому матч без метки не может воспользоваться
+    индексом и вырождается в полный перебор на каждую строку UNWIND.
+    """
+
+    def _all_queries(self):
+        for rel, q in EDGE_QUERIES.items():
+            if isinstance(q, dict):
+                for label, cypher in q.items():
+                    yield f"{rel}:{label}", cypher
+            else:
+                yield rel, q
+
+    def test_no_unlabeled_match(self):
+        for name, cypher in self._all_queries():
+            with self.subTest(edge=name):
+                self.assertNotIn("MATCH (a {id:", cypher,
+                                 f"{name}: источник без метки — индекс не будет использован")
+                self.assertNotIn("(b {id:", cypher,
+                                 f"{name}: приёмник без метки — индекс не будет использован")
+
+    def test_every_match_operand_has_label(self):
+        import re
+        for name, cypher in self._all_queries():
+            with self.subTest(edge=name):
+                # Все шаблоны вида `(x ... {id: r.src})` должны иметь `:Метка`.
+                for operand in re.findall(r"\((\w+)([^)]*)\{id:", cypher):
+                    var, mid = operand
+                    self.assertIn(":", mid,
+                                  f"{name}: переменная {var} матчится по id без метки")
+
+    def test_has_attribute_split_by_source_label(self):
+        q = EDGE_QUERIES["HAS_ATTRIBUTE"]
+        self.assertIsInstance(q, dict)
+        self.assertEqual(set(q), {"MetadataObject", "TabularSection"})
+        self.assertIn("(a:MetadataObject {id: r.src})", q["MetadataObject"])
+        self.assertIn("(a:TabularSection {id: r.src})", q["TabularSection"])
+
+
+class TestWriteEdgesGrouping(unittest.TestCase):
+    """Группировка по паре (тип ребра, метка источника)."""
+
+    def test_split_into_two_queries(self):
+        neo = FakeNeo4j()
+        edges = [
+            {"rel": "HAS_ATTRIBUTE", "src": "Catalog.К", "dst": "Catalog.К.Attr.А",
+             "src_label": "MetadataObject", "props": {"role": "attribute"}},
+            {"rel": "HAS_ATTRIBUTE", "src": "Catalog.К.TS.Т", "dst": "Catalog.К.TS.Т.Attr.Б",
+             "src_label": "TabularSection", "props": {"role": "attribute"}},
+        ]
+        counters = write_edges(neo, edges, log_progress=False)
+
+        self.assertEqual(counters["HAS_ATTRIBUTE"], 2, "счётчик сводится к типу ребра")
+        self.assertEqual(len(neo.calls), 2, "две метки — два запроса")
+        used = {c[0] for c in neo.calls}
+        self.assertTrue(any("(a:MetadataObject {id: r.src})" in c for c in used))
+        self.assertTrue(any("(a:TabularSection {id: r.src})" in c for c in used))
+
+    def test_src_label_not_written_as_edge_property(self):
+        """
+        `src_label` — служебное поле writer'а, не свойство ребра. Если бы оно
+        попало в props, в графе появилось бы бессмысленное свойство на
+        42 тысячах рёбер.
+        """
+        neo = FakeNeo4j()
+        write_edges(neo, [
+            {"rel": "HAS_ATTRIBUTE", "src": "Catalog.К", "dst": "d",
+             "src_label": "MetadataObject", "props": {"role": "attribute"}},
+        ], log_progress=False)
+        rows = neo.calls[0][1]["rows"]
+        self.assertEqual(set(rows[0]), {"src", "dst", "role"})
+
+    def test_label_inferred_when_absent(self):
+        """
+        Старый вызывающий код метку не проставляет. Вывод по id должен
+        работать, иначе рёбра ТЧ пойдут запросом для :MetadataObject и
+        просто не запишутся — молча, потому что MATCH ничего не найдёт.
+        """
+        neo = FakeNeo4j()
+        write_edges(neo, [
+            {"rel": "HAS_ATTRIBUTE", "src": "Catalog.К.TS.Т", "dst": "d",
+             "props": {"role": "attribute"}},
+        ], log_progress=False)
+        self.assertIn("(a:TabularSection {id: r.src})", neo.calls[0][0])
+
+    def test_infer_src_label_rules(self):
+        variants = EDGE_QUERIES["HAS_ATTRIBUTE"]
+        self.assertEqual(
+            _infer_src_label("HAS_ATTRIBUTE", "Catalog.К.TS.Товары", variants),
+            "TabularSection")
+        self.assertEqual(
+            _infer_src_label("HAS_ATTRIBUTE", "Catalog.К", variants),
+            "MetadataObject")
+        # Объект со словом TS в имени, но без разделителя ".TS." — не ТЧ.
+        self.assertEqual(
+            _infer_src_label("HAS_ATTRIBUTE", "Catalog.TSКонтрагенты", variants),
+            "MetadataObject")
+
+    def test_bad_label_falls_back_to_inference(self):
+        """Мусорная метка не должна ронять запись — только приводить к выводу."""
+        neo = FakeNeo4j()
+        write_edges(neo, [
+            {"rel": "HAS_ATTRIBUTE", "src": "Catalog.К.TS.Т", "dst": "d",
+             "src_label": "Ерунда", "props": {"role": "attribute"}},
+        ], log_progress=False)
+        self.assertIn("(a:TabularSection {id: r.src})", neo.calls[0][0])
+
+    def test_batching(self):
+        neo = FakeNeo4j()
+        edges = [{"rel": "CONTAINS", "src": f"s{i}", "dst": f"d{i}", "props": {}}
+                 for i in range(1200)]
+        counters = write_edges(neo, edges, batch=500, log_progress=False)
+        self.assertEqual(counters["CONTAINS"], 1200)
+        self.assertEqual(len(neo.calls), 3)
+        self.assertEqual([len(c[1]["rows"]) for c in neo.calls], [500, 500, 200])
+
+    def test_unknown_rel_skipped_without_raising(self):
+        neo = FakeNeo4j()
+        counters = write_edges(neo, [
+            {"rel": "НЕТ_ТАКОГО", "src": "a", "dst": "b", "props": {}},
+            {"rel": "CONTAINS", "src": "a", "dst": "b", "props": {}},
+        ], log_progress=False)
+        self.assertNotIn("НЕТ_ТАКОГО", counters)
+        self.assertEqual(counters["CONTAINS"], 1)
+        self.assertEqual(len(neo.calls), 1)
+
+    def test_empty_input(self):
+        neo = FakeNeo4j()
+        self.assertEqual(write_edges(neo, [], log_progress=False), {})
+        self.assertEqual(neo.calls, [])
+
+    def test_counters_sum_across_labels(self):
+        neo = FakeNeo4j()
+        edges = (
+            [{"rel": "HAS_ATTRIBUTE", "src": f"Catalog.К{i}", "dst": f"d{i}",
+              "src_label": "MetadataObject", "props": {"role": "attribute"}}
+             for i in range(7)]
+            + [{"rel": "HAS_ATTRIBUTE", "src": f"Catalog.К.TS.Т{i}", "dst": f"e{i}",
+                "src_label": "TabularSection", "props": {"role": "attribute"}}
+               for i in range(3)]
+        )
+        counters = write_edges(neo, edges, log_progress=False)
+        self.assertEqual(counters, {"HAS_ATTRIBUTE": 10})
+
+
+class TestBuildGraphMarksSourceLabel(unittest.TestCase):
+    """build_graph обязан проставлять метку — вывод по id это только страховка."""
+
+    def test_labels_present_on_has_attribute(self):
+        from metadata_xml import (
+            Attribute, MetaObject, TabularSection, TypeRef, build_graph,
+        )
+        obj = MetaObject(
+            name="К", kind_eng="Catalog", kind_ru="Справочник",
+            kind_ru_plural="Справочники",
+            attributes=[Attribute(name="А", types=[TypeRef(kind="String")])],
+            tabular_sections=[TabularSection(
+                name="Т", attributes=[Attribute(name="Б", types=[TypeRef(kind="Number")])],
+            )],
+        )
+        graph = build_graph([obj])
+        ha = [e for e in graph["edges"] if e["rel"] == "HAS_ATTRIBUTE"]
+        self.assertEqual(len(ha), 2)
+        labels = {e["src"]: e.get("src_label") for e in ha}
+        self.assertEqual(labels["Catalog.К"], "MetadataObject")
+        self.assertEqual(labels["Catalog.К.TS.Т"], "TabularSection")
+
+    def test_other_edges_have_no_label(self):
+        """Лишнее поле на рёбрах, у которых источник однозначен, не нужно."""
+        from metadata_xml import MetaObject, TabularSection, build_graph
+        obj = MetaObject(
+            name="К", kind_eng="Catalog", kind_ru="Справочник",
+            kind_ru_plural="Справочники",
+            tabular_sections=[TabularSection(name="Т")],
+        )
+        graph = build_graph([obj])
+        for e in graph["edges"]:
+            if e["rel"] != "HAS_ATTRIBUTE":
+                self.assertNotIn("src_label", e, f"{e['rel']} не нуждается в метке")
+
+
+# ─── FIX-13: порционное удаление слоя ─────────────────────────────────
+
+
+class TestBatchedDelete(unittest.TestCase):
+    """
+    Удаление слоя порциями.
+
+    Дефект, который эти тесты закрывают: обе очистки делали DETACH DELETE
+    одним запросом. На боевой конфигурации транзакция вышла на 1,3 млн
+    узлов и 2,29 млн рёбер, Neo4j ответил MemoryPoolOutOfMemoryError, и
+    5,3 часа сборки графа вызовов были выброшены на последнем шаге.
+    """
+
+    def test_deletes_everything_in_batches(self):
+        neo = FakeNeo4jWithNodes({"Callable": 23000, "CallSite": 7000})
+        result = clear_code_layer(neo, batch=10000)
+        self.assertEqual(result["deleted_nodes"], 30000)
+        self.assertEqual(sum(neo.counts.values()), 0, "остаток должен быть выбран")
+
+    def test_batch_size_is_respected(self):
+        """Ни одна порция не должна превышать заданный размер."""
+        neo = FakeNeo4jWithNodes({"Callable": 25000})
+        clear_code_layer(neo, batch=10000)
+        for cypher, params in neo.calls:
+            self.assertEqual(params["batch"], 10000)
+        self.assertIn("LIMIT $batch", neo.calls[0][0])
+
+    def test_no_single_unbounded_delete(self):
+        """
+        Главный инвариант: в базу не должен уходить DELETE без LIMIT.
+        Именно его отсутствие и стоило прогона.
+        """
+        neo = FakeNeo4jWithNodes({"Callable": 5})
+        clear_code_layer(neo, batch=10000)
+        for cypher, _ in neo.calls:
+            if "DETACH DELETE" in cypher:
+                self.assertIn("LIMIT $batch", cypher,
+                              "DETACH DELETE без LIMIT — это тот самый дефект")
+
+    def test_stops_when_empty(self):
+        """
+        Пустая метка — ровно один запрос: спросили, получили ноль, вышли.
+        Бесконечного цикла быть не должно.
+        """
+        neo = FakeNeo4jWithNodes({})
+        result = clear_code_layer(neo, batch=10000)
+        self.assertEqual(result["deleted_nodes"], 0)
+        self.assertEqual(len(neo.calls), len(CODE_LAYER_LABELS))
+
+    def test_uses_label_scan_not_full_scan(self):
+        """
+        `MATCH (n:Метка)` использует сканирование по метке; прежний
+        `WHERE 'Метка' IN labels(n)` перебирал все узлы базы — на каждую
+        из сотни порций.
+        """
+        neo = FakeNeo4jWithNodes({"Callable": 1})
+        clear_code_layer(neo, batch=100)
+        for cypher, _ in neo.calls:
+            self.assertNotIn("IN labels(n)", cypher)
+            self.assertRegex(cypher, r"MATCH \(n:\w+\)")
+
+    def test_covers_all_code_labels(self):
+        neo = FakeNeo4jWithNodes({})
+        clear_code_layer(neo, batch=100)
+        asked = {re.search(r"MATCH \(n:(\w+)\)", c).group(1) for c, _ in neo.calls}
+        self.assertEqual(asked, set(CODE_LAYER_LABELS))
+
+    def test_metadata_layer_covers_its_own_labels(self):
+        neo = FakeNeo4jWithNodes({})
+        clear_metadata_layer(neo, batch=100)
+        asked = {re.search(r"MATCH \(n:(\w+)\)", c).group(1) for c, _ in neo.calls}
+        self.assertEqual(asked, set(META_LAYER_LABELS))
+
+    def test_layers_do_not_overlap(self):
+        """
+        Очистка слоя 2 не должна трогать метки слоя 1 и наоборот — иначе
+        переиндексация кода снесёт метаданные.
+        """
+        self.assertEqual(set(CODE_LAYER_LABELS) & set(META_LAYER_LABELS), set())
+
+    def test_default_batch_is_sane(self):
+        self.assertGreaterEqual(DELETE_BATCH_DEFAULT, 1000)
+        self.assertLessEqual(DELETE_BATCH_DEFAULT, 100000)
+
+
+# ─── PERF-7: ранний останов фикс-пойнта ───────────────────────────────
+
+
+class TestFixpointEarlyStop(unittest.TestCase):
+    """
+    Критерий останова смотрит на прирост результата, а не на рост реестров.
+
+    Числа в сценарии — из боевого прогона 11 августа 2026, где 8 итераций
+    заняли 5,3 часа, а resolved замер на третьей.
+    """
+
+    def _run(self, per_iteration, **kwargs):
+        """
+        Гоняет build_call_graph с подменённым _resolve_pass, который отдаёт
+        заранее заданные результаты по итерациям. Возвращает stats.
+        """
+        import bsl_resolver as R
+        from bsl_parser import ParsedModule
+
+        state = {"i": 0}
+
+        def fake_pass(modules, index, params_by_callable,
+                      param_types, return_types, progress=None):
+            i = state["i"]
+            state["i"] += 1
+            spec = per_iteration[min(i, len(per_iteration) - 1)]
+            # Каждая итерация приносит новый факт — реестры растут всегда,
+            # то есть естественный фикс-пойнт не наступит никогда. Ровно эта
+            # ситуация и наблюдалась на боевой.
+            return {
+                "callsite_nodes":   [{"id": f"cs{n}"} for n in range(spec["callsites"])],
+                "edges":            [],
+                "stats_resolved":   spec["resolved"],
+                "stats_unresolved": 0,
+                "stats_skipped":    0,
+                "stats_non_config": 0,
+                "reason_counts":    {},
+                "param_facts":      [(f"p{i}", R.TypeRef(kind="String", target=None))],
+                "return_facts":     [],
+            }
+
+        orig = R._resolve_pass
+        R._resolve_pass = fake_pass
+        try:
+            mod = ParsedModule(
+                module_id="CommonModule.М", module_kind="CommonModule",
+                parent_metadata_id=None, source_path="CommonModules/М/Ext/Module.bsl",
+                is_server=True, is_client=False, procedures=[],
+            )
+            return R.build_call_graph([mod], R.Index(), **kwargs)["stats"]
+        finally:
+            R._resolve_pass = orig
+            state["i"] = 0
+
+    # Профиль боевого прогона: resolved замирает, callsites тают.
+    PROD = [
+        {"resolved": 428902, "callsites": 747984},
+        {"resolved": 428914, "callsites": 727104},
+        {"resolved": 428918, "callsites": 722258},
+        {"resolved": 428918, "callsites": 721103},
+        {"resolved": 428918, "callsites": 720838},
+        {"resolved": 428918, "callsites": 720754},
+    ]
+
+    def test_stops_early_on_production_profile(self):
+        """
+        На боевом профиле цикл обязан остановиться сильно раньше восьми
+        итераций. Без раннего останова он прошёл бы все восемь — итерации
+        4-8 дали ноль новых разрешённых вызовов за 3,5 часа.
+        """
+        stats = self._run(self.PROD, max_iterations=8, min_gain_pct=1.0)
+        self.assertLessEqual(stats["fixpoint_iterations"], 4)
+        self.assertGreaterEqual(stats["fixpoint_iterations"], 2,
+                                "вторая итерация даёт реальный прирост — её нельзя терять")
+        self.assertIn("ниже порога", stats["fixpoint_stop_reason"])
+
+    def test_second_iteration_is_never_skipped(self):
+        """
+        Первая итерация не проверяется на прирост: сравнивать не с чем.
+        Иначе цикл вырождался бы в один проход и терял inter-procedural
+        распространение типов, ради которого фикс-пойнт и заводился.
+        """
+        stats = self._run(self.PROD, max_iterations=8, min_gain_pct=99.0)
+        self.assertEqual(stats["fixpoint_iterations"], 2)
+
+    def test_zero_threshold_runs_to_the_limit(self):
+        """Порог 0 — старое поведение: до предела, раз реестры всё растут."""
+        stats = self._run(self.PROD, max_iterations=5, min_gain_pct=0.0)
+        self.assertEqual(stats["fixpoint_iterations"], 5)
+        self.assertIn("предел", stats["fixpoint_stop_reason"])
+
+    def test_growing_gain_is_not_stopped(self):
+        """Пока прирост существенный — останавливаться нельзя."""
+        growing = [
+            {"resolved": 1000, "callsites": 5000},
+            {"resolved": 2000, "callsites": 4000},
+            {"resolved": 3000, "callsites": 3000},
+        ]
+        stats = self._run(growing, max_iterations=3, min_gain_pct=1.0)
+        self.assertEqual(stats["fixpoint_iterations"], 3)
+
+    def test_max_iterations_floor(self):
+        """Ноль или отрицательное значение не должны давать пустой цикл."""
+        stats = self._run(self.PROD, max_iterations=0, min_gain_pct=1.0)
+        self.assertGreaterEqual(stats["fixpoint_iterations"], 1)
+
+    def test_env_overrides_defaults(self):
+        import bsl_resolver as R
+        os.environ["METADATA_MAX_ITERATIONS"] = "2"
+        os.environ["METADATA_FIXPOINT_MIN_GAIN_PCT"] = "0"
+        try:
+            stats = self._run(self.PROD)
+            self.assertEqual(stats["fixpoint_iterations"], 2)
+        finally:
+            del os.environ["METADATA_MAX_ITERATIONS"]
+            del os.environ["METADATA_FIXPOINT_MIN_GAIN_PCT"]
+
+    def test_bad_env_falls_back_to_default(self):
+        import bsl_resolver as R
+        os.environ["METADATA_FIXPOINT_MIN_GAIN_PCT"] = "не-число"
+        try:
+            self.assertEqual(
+                R._env_float("METADATA_FIXPOINT_MIN_GAIN_PCT", 1.0), 1.0)
+        finally:
+            del os.environ["METADATA_FIXPOINT_MIN_GAIN_PCT"]
+
+    def test_comma_decimal_accepted(self):
+        """В .env легко написать 0,5 — это не повод падать."""
+        import bsl_resolver as R
+        os.environ["METADATA_FIXPOINT_MIN_GAIN_PCT"] = "0,5"
+        try:
+            self.assertAlmostEqual(
+                R._env_float("METADATA_FIXPOINT_MIN_GAIN_PCT", 1.0), 0.5)
+        finally:
+            del os.environ["METADATA_FIXPOINT_MIN_GAIN_PCT"]
+
+
+# ─── FIX-14: HAS_METHOD и метки модулей ───────────────────────────────
+
+
+class TestHasMethodSourceLabels(unittest.TestCase):
+    """
+    Модуль формы — это :Form, а не :MetadataObject.
+
+    Дефект, который эти тесты закрывают: HAS_METHOD искал владельца одним
+    запросом `MATCH (m:MetadataObject {id: r.src})`. Модули форм создаются
+    write_form_nodes как `MERGE (n:Form {id: r.id})` — без :MetadataObject,
+    фаза 2 лишь дописывает им :Module. Под этот MATCH они не подходят
+    никогда, и на боевой конфигурации записалось 72 152 ребра из 231 114:
+    все 158 961 процедура модулей форм осталась без владельца.
+    """
+
+    def test_split_by_owner_label(self):
+        q = EDGE_QUERIES["HAS_METHOD"]
+        self.assertIsInstance(q, dict, "HAS_METHOD должен различать метки владельца")
+        self.assertEqual(set(q), {"MetadataObject", "Form"})
+        self.assertIn("(m:Form {id: r.src})", q["Form"])
+        self.assertIn("(m:MetadataObject {id: r.src})", q["MetadataObject"])
+
+    def test_form_module_routed_to_form_query(self):
+        neo = FakeNeo4j()
+        write_edges(neo, [
+            {"rel": "HAS_METHOD", "src": "DataProcessor.Консоль.Form.Форма",
+             "dst": "DataProcessor.Консоль.Form.Форма.ПриОткрытии",
+             "src_label": "Form", "props": {"kind": "procedure"}},
+        ], log_progress=False)
+        self.assertIn("(m:Form {id: r.src})", neo.calls[0][0])
+
+    def test_common_module_routed_to_metadata_query(self):
+        neo = FakeNeo4j()
+        write_edges(neo, [
+            {"rel": "HAS_METHOD", "src": "CommonModule.Общий",
+             "dst": "CommonModule.Общий.Сделать",
+             "src_label": "MetadataObject", "props": {"kind": "procedure"}},
+        ], log_progress=False)
+        self.assertIn("(m:MetadataObject {id: r.src})", neo.calls[0][0])
+
+    def test_label_inferred_from_form_id(self):
+        """Вызов без метки — метка выводится из id, а не гадается."""
+        variants = EDGE_QUERIES["HAS_METHOD"]
+        self.assertEqual(
+            _infer_src_label("HAS_METHOD", "Catalog.Контрагенты.Form.ФормаЭлемента",
+                             variants), "Form")
+        self.assertEqual(
+            _infer_src_label("HAS_METHOD", "Catalog.Контрагенты.ObjectModule",
+                             variants), "MetadataObject")
+        self.assertEqual(
+            _infer_src_label("HAS_METHOD", "CommonModule.Общий", variants),
+            "MetadataObject")
+
+    def test_resolver_marks_form_modules(self):
+        """
+        build_call_graph обязан проставлять метку сам — вывод по id это
+        страховка, а не основной путь.
+        """
+        from bsl_parser import ParsedModule, ParsedProcedure
+        import bsl_resolver as R
+
+        def mod(module_id, kind):
+            return ParsedModule(
+                module_id=module_id, module_kind=kind,
+                parent_metadata_id=None, source_path=f"{module_id}.bsl",
+                is_server=True, is_client=False,
+                procedures=[ParsedProcedure(
+                    name="П", kind="Procedure", is_export=False,
+                    directive="", line_start=1, line_end=2, parameters=[],
+                )],
+            )
+
+        cg = R.build_call_graph(
+            [mod("Catalog.К.Form.ФормаЭлемента", "Form"),
+             mod("Catalog.К.ObjectModule", "ObjectModule"),
+             mod("CommonModule.Общий", "CommonModule")],
+            R.Index(), max_iterations=1,
+        )
+        labels = {e["src"]: e.get("src_label")
+                  for e in cg["edges"] if e["rel"] == "HAS_METHOD"}
+        self.assertEqual(labels["Catalog.К.Form.ФормаЭлемента"], "Form")
+        self.assertEqual(labels["Catalog.К.ObjectModule"], "MetadataObject")
+        self.assertEqual(labels["CommonModule.Общий"], "MetadataObject")
+
+
+# ─── FIX-15: недостача записи больше не молчит ────────────────────────
+
+
+class TestWriteShortfallIsReported(unittest.TestCase):
+    """
+    Писатели возвращали число ОТПРАВЛЕННЫХ строк, а не записанных.
+
+    Из-за этого потеря 69 % рёбер :HAS_METHOD прошла с бодрым логом об
+    успехе и нашлась только ручной сверкой счётчиков с базой. То есть
+    могла не найтись вовсе.
+    """
+
+    def test_counter_reflects_written_not_sent(self):
+        neo = FakeNeo4jPartialWrite(write_fraction=0.5)
+        edges = [{"rel": "CONTAINS", "src": f"s{i}", "dst": f"d{i}", "props": {}}
+                 for i in range(100)]
+        counters = write_edges(neo, edges, batch=100, log_progress=False)
+        self.assertEqual(counters["CONTAINS"], 50,
+                         "счётчик обязан показывать записанное, а не отправленное")
+
+    def test_shortfall_is_logged_as_warning(self):
+        neo = FakeNeo4jPartialWrite(write_fraction=0.25)
+        edges = [{"rel": "CONTAINS", "src": f"s{i}", "dst": f"d{i}", "props": {}}
+                 for i in range(40)]
+        with self.assertLogs("graph_writer", level="WARNING") as cm:
+            write_edges(neo, edges, batch=40, log_progress=False)
+        self.assertTrue(any("не нашли узлов" in m for m in cm.output))
+
+    def test_no_warning_when_all_written(self):
+        import logging as _log
+        neo = FakeNeo4j()
+        edges = [{"rel": "CONTAINS", "src": "a", "dst": "b", "props": {}}]
+        logger = _log.getLogger("graph_writer")
+        with self.assertLogs(logger, level="DEBUG") as cm:
+            logger.debug("якорь")   # assertLogs требует хотя бы одной записи
+            write_edges(neo, edges, log_progress=False)
+        self.assertFalse(any(r.levelno >= _log.WARNING for r in cm.records))
+
+    def test_query_written_reads_the_counter(self):
+        from graph_writer import _query_written
+        neo = FakeNeo4jPartialWrite(write_fraction=0.5)
+        self.assertEqual(_query_written(neo, "MERGE (n)", [1, 2, 3, 4]), 2)
+        self.assertIn("RETURN count(*) AS written", neo.calls[0][0])
+
+    def test_query_written_falls_back_without_counter(self):
+        """Драйвер не вернул счётчик — недостачу не выдумываем."""
+        from graph_writer import _query_written
+
+        class Silent(FakeNeo4j):
+            def rows(self, cypher, parameters=None):
+                self.calls.append((cypher, parameters or {}))
+                return []
+
+        self.assertEqual(_query_written(Silent(), "MERGE (n)", [1, 2, 3]), 3)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

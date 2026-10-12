@@ -1,0 +1,2685 @@
+// MCP-сервер (v0.5+) — тонкий read-only слой над SQLite-индексом.
+//
+// Multi-repo: один stdio-процесс держит открытыми несколько SQLite-баз
+// (по одной на репозиторий), диспатч по параметру `repo` в каждом tool-call.
+// Перед каждым tool-call проверяет у демона статус папки для конкретного репо.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    },
+    service::{NotificationContext, Peer, RequestContext},
+    tool, tool_router, ErrorData, RoleServer, ServerHandler,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::extension::{IndexTool, LanguageProcessor, ProcessorRegistry};
+use crate::serve_cache::ServeCache;
+use crate::serve_dedup::SessionDedup;
+use crate::federation::client::RemoteClientPool;
+use crate::federation::repos::FederatedRepo;
+use crate::storage::{PoolConfig, Storage, StoragePool};
+
+pub mod cap;
+pub mod config_watch;
+pub mod tools;
+
+/// IP по умолчанию для legacy-конструкторов (моно-режим без serve.toml).
+/// Все репо считаются local на этом IP.
+pub(crate) const LEGACY_OWN_IP: &str = "127.0.0.1";
+
+// ── Один репозиторий, обслуживаемый сервером ───────────────────────────────
+
+/// Одна запись в репо-карте.
+///
+/// Для local-репо заполнены `root_path` и `storage` — tool-handler читает
+/// данные из локального SQLite. Для remote — оба поля `None`, `is_local=false`,
+/// и tool-handler форвардит запрос через `RemoteClientPool` по `ip`.
+#[derive(Clone)]
+pub struct RepoEntry {
+    /// Канонический путь к корню проекта (только для local).
+    pub root_path: Option<PathBuf>,
+    /// Пул read-only SQLite-соединений (только для local). Несколько соединений
+    /// позволяют читать индекс одновременно — запросы к одному репо больше не
+    /// сериализуются на едином мьютексе. БД read-only, на запись не конкурирует.
+    pub storage: Option<Arc<StoragePool>>,
+    /// IP машины, на которой лежит репо (для решения local vs remote и логов).
+    pub ip: String,
+    /// Порт удалённого `code-index serve` для federate-форвардинга.
+    /// Для remote-репо — обязателен (default `DEFAULT_REMOTE_PORT` из
+    /// `serve.toml::ServePathEntry::effective_port`). Для local-репо —
+    /// заполнен тем же значением, что и у remote (информационно), но не
+    /// используется: tool-handler идёт по local-ветке.
+    pub port: u16,
+    /// `true` если репо обслуживается этим процессом (`ip == own_ip`).
+    pub is_local: bool,
+    /// Преобладающий язык, под который репо классифицирован. Определяется
+    /// при загрузке конфига (явно из TOML или auto-detect). `None` — пока
+    /// не определён (например, для remote-репо без локального daemon.toml).
+    /// Используется для conditional registration MCP-tools и для
+    /// валидации совместимости в `IndexTool::execute`.
+    pub language: Option<String>,
+    /// Процессор языка этого репо (из `ProcessorRegistry` по `language`).
+    /// Нужен tool-слою, чтобы спросить у расширения декларативные привязки
+    /// (`LanguageProcessor::declarative_callers`). `None` — remote-репо,
+    /// язык не определён либо сервер собран без реестра.
+    pub processor: Option<Arc<dyn LanguageProcessor>>,
+}
+
+impl RepoEntry {
+    /// Ссылка на корневой путь — для local. Panic для remote (ловит баги
+    /// диспатчера: tools::* не должны вызываться для remote).
+    pub fn local_root(&self) -> &Path {
+        self.root_path.as_ref().unwrap_or_else(|| {
+            panic!("local_root() вызван для remote-репо ip={} — это баг диспатчера", self.ip)
+        })
+    }
+
+    /// Ссылка на пул соединений — для local. Panic для remote.
+    pub fn storage_pool(&self) -> &Arc<StoragePool> {
+        self.storage.as_ref().unwrap_or_else(|| {
+            panic!(
+                "storage_pool() вызван для remote-репо ip={} — это баг диспатчера",
+                self.ip
+            )
+        })
+    }
+}
+
+// ── Параметры инструментов ─────────────────────────────────────────────────
+//
+// Везде добавлен `repo: String` — алиас репозитория, выбранный при старте сервера
+// (см. `code-index serve --path <alias>=<dir>`). Если передан неизвестный alias —
+// возвращается ToolUnavailable::NotStarted.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SearchParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    pub query: String,
+    pub limit: Option<usize>,
+    pub language: Option<String>,
+    /// Glob по path для сужения поиска (Phase 1, post-filter в MCP-слое).
+    /// Например `src/**/*.py` или `Documents/**`.
+    pub path_glob: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct NameParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Точное имя символа. Запасные имена на входе (модели путают ключ):
+    /// `symbol`, `query` принимаются как `name` — иначе слепой вызов падал
+    /// с тёмной ошибкой разборщика «missing field name» (потерянный ход).
+    #[serde(alias = "symbol", alias = "query")]
+    pub name: String,
+    pub language: Option<String>,
+    /// Glob по path (Phase 1, post-filter).
+    pub path_glob: Option<String>,
+}
+
+/// Параметры для get_function/get_class с поддержкой МАССОВОГО режима:
+/// одиночное `name` ИЛИ список `names` (структуры нескольких символов одним
+/// вызовом → {results:[...]}). find_symbol на это не переводим — у него свой
+/// одиночный NameParams.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MultiNameParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Имя ОДНОГО символа. Для нескольких — `names`.
+    pub name: Option<String>,
+    /// Список имён для МАССОВОГО запроса. Применяй ТОЛЬКО когда заведомо нужны все из набора (см. описание инструмента); отбираешь релевантные — по одному 'name'.
+    /// Ответ — {results:[...]} в порядке запроса. Передавайте либо `name`, либо `names`.
+    pub names: Option<Vec<String>>,
+    pub language: Option<String>,
+    /// Glob по path (Phase 1, post-filter).
+    pub path_glob: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FunctionNameParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Точное имя функции. Запасные ключи на входе (модели путают параметр
+    /// с get_function): `name`, `symbol` принимаются как `function_name` —
+    /// иначе слепой вызов get_callers/get_callees падал тёмной ошибкой
+    /// разборщика «missing field function_name» (потерянный ход).
+    #[serde(alias = "name", alias = "symbol")]
+    pub function_name: String,
+    pub language: Option<String>,
+    /// Cap на число рёбер графа вызовов (default 200). При обрезке в ответе —
+    /// {truncated, total, limit}. Защищает от мегабайтных ответов на «горячих» функциях.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FindPathParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Имя функции-источника (caller) — начало пути.
+    pub from: String,
+    /// Имя функции-цели (callee) — конец пути.
+    pub to: String,
+    /// Максимальная длина пути (число рёбер), [1..10]. По умолчанию 5.
+    pub max_depth: Option<i64>,
+    /// Опциональный фильтр по языку файла-источника ребра (rust/python/bsl/…).
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CallTreeParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Имя функции-корня дерева.
+    pub root: String,
+    /// Направление: "callees"/"down" (что вызывает root, вглубь — по умолчанию)
+    /// или "callers"/"up" (кто вызывает root).
+    pub direction: Option<String>,
+    /// Глубина дерева (число уровней), [1..10]. По умолчанию 3.
+    pub max_depth: Option<i64>,
+    /// Cap на число рёбер, [1..5000]. По умолчанию 200; при обрезке — truncated=true.
+    pub max_nodes: Option<i64>,
+    /// Опциональный фильтр по языку файла-источника ребра.
+    pub language: Option<String>,
+    /// Бюджет размера ответа в байтах; по умолчанию — бюджет сервера.
+    /// Не уместившиеся дальние рёбра отбрасываются — в ответе truncated,
+    /// edges_total, edges_shown и hint.
+    pub max_response_bytes: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ImportParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    pub file_id: Option<i64>,
+    pub module: Option<String>,
+    pub language: Option<String>,
+    /// Cap на число импортов в ответе (default 200). При обрезке — {truncated, total, limit}.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FilePathParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GrepBodyParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Подстрока: ищется буквально, регистр не учитывается (в том числе у
+    /// кириллицы). Подстановочных знаков нет — `%` и `_` обычные символы.
+    pub pattern: Option<String>,
+    /// Регулярное выражение (REGEXP).
+    pub regex: Option<String>,
+    /// Алиас для `regex` (частая путаница: модели передают `query`).
+    /// Если ни `pattern`, ни `regex` не заданы — используется `query` как regex.
+    pub query: Option<String>,
+    pub language: Option<String>,
+    /// Максимум находок в ответе. Default 100. При обрезке — `truncated=true`.
+    pub limit: Option<usize>,
+    /// Glob по path для сужения поиска. SQL-pushdown.
+    pub path_glob: Option<String>,
+    /// Сколько строк до/после совпадения возвращать в `context`.
+    /// 0 (по умолчанию) — без контекста, как раньше.
+    pub context_lines: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StatsParams {
+    /// Алиас репозитория. Если не указан — возвращается статистика по всем подключённым репо.
+    pub repo: Option<String>,
+}
+
+// ── Phase 1 параметры (v0.7.0) ──
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StatFileParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Путь к файлу как он хранится в индексе (см. list_files).
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListFilesParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Glob по path (`**/*.py`, `Documents/**/*.bsl`). Опционально.
+    pub pattern: Option<String>,
+    /// Префикс по path (`src/auth/`). Опционально.
+    pub path_prefix: Option<String>,
+    pub language: Option<String>,
+    /// Максимум файлов в ответе. Default 500. При обрезке в ответе —
+    /// {truncated, total, shown, limit}.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Путь к файлу как он хранится в индексе (см. list_files).
+    pub path: String,
+    /// 1-based, inclusive. None — с начала.
+    pub line_start: Option<usize>,
+    /// 1-based, inclusive. None — до конца.
+    pub line_end: Option<usize>,
+}
+
+/// Свести входные ключи grep-инструментов к одному регулярному выражению.
+///
+/// Приоритет: `regex` → `query` (алиас) → `pattern`. Последний трактуется как
+/// буквальная подстрока без учёта регистра — та же семантика, что у
+/// одноимённого параметра `grep_body`: одно имя не должно значить в семействе
+/// разное. Пустая строка равносильна незаданному ключу.
+///
+/// `None` — не задан ни один ключ; вызывающий отдаёт свою подсказку.
+pub fn grep_regex_from_params(
+    regex: Option<String>,
+    query: Option<String>,
+    pattern: Option<String>,
+) -> Option<String> {
+    let filled = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    if let Some(r) = filled(regex).or_else(|| filled(query)) {
+        return Some(r);
+    }
+    filled(pattern).map(|p| format!("(?i){}", ::regex::escape(&p)))
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GrepTextParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Регулярное выражение (синтаксис crate `regex`).
+    pub regex: Option<String>,
+    /// Алиас для `regex` (частая путаница: модели передают `query`).
+    /// Если `regex` не задан — используется `query` как regex.
+    pub query: Option<String>,
+    /// Буквальная подстрока без учёта регистра — как одноимённый параметр
+    /// `grep_body` (подстановочных знаков нет). Берётся, когда не заданы ни
+    /// `regex`, ни `query`: модели переносят имя из соседних инструментов
+    /// семейства, и без этого ключа вызов терял ход на подсказке.
+    pub pattern: Option<String>,
+    /// Glob по path. Хотя бы один из {path_glob, language} желателен —
+    /// иначе работает full-scan по всем text-файлам.
+    pub path_glob: Option<String>,
+    pub language: Option<String>,
+    /// Максимум находок в ответе (default 100; при заданном path_glob/language — 500). При обрезке — `truncated=true`.
+    pub limit: Option<usize>,
+    /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
+    pub context_lines: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GrepCodeParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
+    pub repo: String,
+    /// Регулярное выражение (синтаксис crate `regex`).
+    pub regex: Option<String>,
+    /// Алиас для `regex` (частая путаница: модели передают `query`).
+    /// Если `regex` не задан — используется `query` как regex.
+    pub query: Option<String>,
+    /// Буквальная подстрока без учёта регистра — как одноимённый параметр
+    /// `grep_body` (подстановочных знаков нет). Берётся, когда не заданы ни
+    /// `regex`, ни `query`: модели переносят имя из соседних инструментов
+    /// семейства, и без этого ключа вызов терял ход на подсказке.
+    pub pattern: Option<String>,
+    /// Glob по path. Хотя бы один из {path_glob, language} желателен —
+    /// иначе full-scan по всем code-файлам репо (zstd-decode каждого) дорогой.
+    pub path_glob: Option<String>,
+    pub language: Option<String>,
+    /// Максимум совпадений в ответе. Default 100. При достижении — `truncated=true`.
+    pub limit: Option<usize>,
+    /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
+    pub context_lines: Option<usize>,
+}
+
+/// Универсальные параметры для federation-форварда extension-tools
+/// (`get_object_structure`, `get_form_handlers`, `find_path_bsl` и т.д.).
+///
+/// Введён в v0.8.1 как замена per-tool routes: extension-tools меняются
+/// чаще, чем core, и заводить отдельный route на каждый — лишний шум.
+/// `tool_name` — имя tool (например, `"get_object_structure"`),
+/// `args` — оригинальные arguments вызова MCP (включая `repo`).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExtensionToolParams {
+    /// Имя extension-tool как он зарегистрирован в `IndexTool::name()`.
+    pub tool_name: String,
+    /// Полный набор arguments в формате MCP (произвольный JSON-объект).
+    /// `repo` извлекается из этого поля на target-стороне.
+    pub args: serde_json::Value,
+}
+
+// ── Сервер ───────────────────────────────────────────────────────────────────
+
+/// Read-only MCP-сервер индексатора. Держит N открытых репозиториев
+/// (по одному на alias), диспатч по параметру `repo` в каждом tool-call.
+///
+/// В федеративном режиме (`from_federated`): часть репо может быть remote —
+/// для них `RepoEntry.is_local=false`, tool-handler форвардит запрос
+/// в `clients` по `ip`.
+///
+/// Инструменты с массовым режимом и их plural-параметр (`tool`, `plural`).
+/// Управляется белым списком `daemon.toml [mcp].mass_mode_tools`: инструмент
+/// **в списке** публикует plural-параметр (модель видит/может батчить);
+/// **не в списке** — `list_tools` убирает параметр из схемы, `call_tool`
+/// отбивает вызов с ним. Пустой список (дефолт v0.28.0) → массовый режим
+/// выключен у всех. Причина дефолта-выкл — см. [`crate::daemon_core::config::McpSection`].
+pub(crate) const MASS_MODE_PARAMS: &[(&str, &str)] = &[
+    ("get_function", "names"),
+    ("get_class", "names"),
+    ("get_object_structure", "full_names"),
+];
+
+/// Поверх жёстко прописанных core-tools (макрос `#[tool_router]`) сервер
+/// держит набор «extension-tools» — MCP-инструментов, поставляемых
+/// активными `LanguageProcessor`-ами. Их подбор зависит от того, какие
+/// языки реально используются репозиториями (`active_languages`):
+/// например, BSL-tools (`get_object_structure` и т.д.) попадают в
+/// `tools/list` только если хотя бы один репо имеет `language = "bsl"`.
+/// Сама интеграция в MCP-протокол (override `list_tools`/`call_tool`)
+/// сделана на этапе 1.6.
+#[derive(Clone)]
+pub struct CodeIndexServer {
+    /// Карта alias → RepoEntry. BTreeMap для детерминированного порядка в логах и /health.
+    pub repos: Arc<ArcSwap<BTreeMap<String, RepoEntry>>>,
+    /// Собственный IP машины (из `serve.toml [me].ip`) — для логов и диагностики.
+    pub own_ip: Arc<String>,
+    /// Пул HTTP-клиентов к удалённым serve-нодам (lazy init).
+    pub clients: Arc<RemoteClientPool>,
+    /// Роутер MCP-инструментов (генерируется макросом).
+    tool_router: ToolRouter<Self>,
+    /// Множество активных языков репозиториев. Обёрнуто в `ArcSwap`,
+    /// чтобы file-watch на `daemon.toml` (этап 1.7) мог атомарно
+    /// заменить содержимое без блокировок чтения. Тип внутри — `Arc`
+    /// для дешёвого клонирования при чтении.
+    pub active_languages: Arc<ArcSwap<BTreeSet<String>>>,
+    /// Tool-инструменты от активных `LanguageProcessor`-ов. Тоже `ArcSwap`,
+    /// так как пересобирается одновременно с `active_languages`.
+    pub extension_tools: Arc<ArcSwap<Vec<Arc<dyn IndexTool>>>>,
+    /// Реестр процессоров. Хранится отдельно, чтобы `reload_extensions`
+    /// мог пересобрать `extension_tools` после изменения `active_languages`.
+    /// `None` — legacy-сценарий без registry.
+    pub registry: Arc<Option<ProcessorRegistry>>,
+    /// Peer клиента для отправки `notifications/tools/list_changed`.
+    /// Заполняется в `on_initialized`, очищается при разрыве сессии
+    /// (rmcp дёргает `on_initialized` для каждой сессии). Mutex поверх
+    /// `Option<Peer>` нужен, потому что `Peer` не Sync без обёртки.
+    pub peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    /// Опциональный whitelist MCP-инструментов из `daemon.toml [tools].enabled`.
+    /// `None` — фильтр не применяется (все зарегистрированные tools доступны),
+    /// `Some(set)` — в `tools/list` уходят только tools с именами из множества,
+    /// а `tools/call` для остальных возвращает `-32602 Invalid params`.
+    /// Двойная защита нужна потому, что модель может вызвать tool вне
+    /// `tools/list` (из системного промпта/CLAUDE.md) — фильтр в `list_tools`
+    /// её не остановит, без проверки в `call_tool` это уйдёт в router.
+    pub allowed_tools: Arc<Option<BTreeSet<String>>>,
+    /// Белый список инструментов, публикующих массовый режим (`names[]`/
+    /// `full_names[]`). Пустой (дефолт с v0.28.0) → массовый режим выключен у
+    /// всех: `list_tools` убирает plural-параметр из схемы, `call_tool`
+    /// отбивает вызов с ним. Управляется `daemon.toml [mcp].mass_mode_tools`.
+    /// Перечень массовых инструментов — [`MASS_MODE_PARAMS`].
+    pub mass_mode_tools: Arc<BTreeSet<String>>,
+    /// In-process кэш результатов tool-вызовов (встроенная форма прокси
+    /// mcp-cache-ci для ci-цепочки). Общий на все сессии (поле `Arc`, сервер
+    /// клонируется на сессию). Кэшируются только LOCAL-репо (federation
+    /// инвалидируется на удалённой ноде, не локальным watcher'ом). Инвалидация
+    /// — по scope (repo) через `/invalidate` от демона при переиндексации.
+    pub cache: Arc<ServeCache>,
+    /// Сессионный дедуп ре-доставки строк результата (ключ — mcp-session-id).
+    /// Общий на сессии (Arc), состояние внутри ключуется по session_id.
+    pub dedup: Arc<SessionDedup>,
+    /// Итог последней попытки перечитать федеративные конфиги. В монорежиме
+    /// и до первой попытки остаётся `None`.
+    pub config_reload: Arc<ArcSwapOption<crate::federation::reload::ReloadResult>>,
+}
+
+impl CodeIndexServer {
+    /// Создать сервер из уже собранной карты репо. own_ip и clients задаются
+    /// дефолтами для legacy-сценария (моно-режим, локальный пул).
+    /// Активные языки и extension-tools вычисляются по `RepoEntry.language`
+    /// (если у каких-то записей оно заполнено), но без `ProcessorRegistry`
+    /// extension-tools остаётся пустым.
+    pub fn with_repos(repos: BTreeMap<String, RepoEntry>) -> Self {
+        let active_languages = collect_active_languages(&repos);
+        Self {
+            repos: Arc::new(ArcSwap::from_pointee(repos)),
+            own_ip: Arc::new(LEGACY_OWN_IP.to_string()),
+            clients: Arc::new(RemoteClientPool::with_defaults()),
+            tool_router: Self::tool_router(),
+            active_languages: Arc::new(ArcSwap::from_pointee(active_languages)),
+            extension_tools: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            registry: Arc::new(None),
+            peer: Arc::new(Mutex::new(None)),
+            allowed_tools: Arc::new(None),
+            mass_mode_tools: Arc::new(BTreeSet::new()),
+            // TTL 3600с — подстраховка; основной механизм корректности —
+            // инвалидация по scope от демона при переиндексации.
+            cache: Arc::new(ServeCache::new(3600, true)),
+            dedup: Arc::new(SessionDedup::new(true)),
+            config_reload: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// Создать сервер из карты репо и реестра процессоров.
+    /// Активные языки берутся из `RepoEntry.language`; extension-tools
+    /// собираются из `additional_tools()` каждого зарегистрированного
+    /// процессора, чьё имя входит в множество активных языков.
+    pub fn with_repos_and_registry(
+        mut repos: BTreeMap<String, RepoEntry>,
+        registry: ProcessorRegistry,
+    ) -> Self {
+        attach_processors(&mut repos, Some(&registry));
+        let active_languages = collect_active_languages(&repos);
+        let extension_tools = collect_extension_tools(&active_languages, &registry);
+        Self {
+            repos: Arc::new(ArcSwap::from_pointee(repos)),
+            own_ip: Arc::new(LEGACY_OWN_IP.to_string()),
+            clients: Arc::new(RemoteClientPool::with_defaults()),
+            tool_router: Self::tool_router(),
+            active_languages: Arc::new(ArcSwap::from_pointee(active_languages)),
+            extension_tools: Arc::new(ArcSwap::from_pointee(extension_tools)),
+            registry: Arc::new(Some(registry)),
+            peer: Arc::new(Mutex::new(None)),
+            allowed_tools: Arc::new(None),
+            mass_mode_tools: Arc::new(BTreeSet::new()),
+            // TTL 3600с — подстраховка; основной механизм корректности —
+            // инвалидация по scope от демона при переиндексации.
+            cache: Arc::new(ServeCache::new(3600, true)),
+            dedup: Arc::new(SessionDedup::new(true)),
+            config_reload: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// Федеративный конструктор: принимает реестр из `federation::repos::merge`,
+    /// собственный IP, опциональный реестр процессоров и мапу local-aliases →
+    /// language (из daemon.toml). Для local-записей открывает SQLite read-only
+    /// и проставляет `RepoEntry.language` из `local_languages`, чтобы
+    /// `collect_active_languages` нашёл нужные языки и conditional registration
+    /// зарегистрировал extension-tools (`get_object_structure` и др.) в
+    /// `tools/list`. Для remote-записей storage/root_path/language=None —
+    /// они приходят через federation, активный язык по ним неизвестен.
+    pub fn from_federated(
+        repos: Vec<FederatedRepo>,
+        own_ip: String,
+        registry: Option<ProcessorRegistry>,
+        local_languages: BTreeMap<String, String>,
+        pool_cfg: PoolConfig,
+    ) -> anyhow::Result<Self> {
+        let map = build_federated_repo_map(
+            repos,
+            registry.as_ref(),
+            &local_languages,
+            pool_cfg,
+            None,
+            false,
+        )?;
+        let active_languages = collect_active_languages(&map);
+        let extension_tools = match registry.as_ref() {
+            Some(reg) => collect_extension_tools(&active_languages, reg),
+            None => Vec::new(),
+        };
+        Ok(Self {
+            repos: Arc::new(ArcSwap::from_pointee(map)),
+            own_ip: Arc::new(own_ip),
+            clients: Arc::new(RemoteClientPool::with_defaults()),
+            tool_router: Self::tool_router(),
+            active_languages: Arc::new(ArcSwap::from_pointee(active_languages)),
+            extension_tools: Arc::new(ArcSwap::from_pointee(extension_tools)),
+            registry: Arc::new(registry),
+            peer: Arc::new(Mutex::new(None)),
+            allowed_tools: Arc::new(None),
+            mass_mode_tools: Arc::new(BTreeSet::new()),
+            // TTL 3600с — подстраховка; основной механизм корректности —
+            // инвалидация по scope от демона при переиндексации.
+            cache: Arc::new(ServeCache::new(3600, true)),
+            dedup: Arc::new(SessionDedup::new(true)),
+            config_reload: Arc::new(ArcSwapOption::empty()),
+        })
+    }
+
+    /// Удобство: собрать сервер из массива (alias, root_path, db_path),
+    /// открывая все БД read-only. Все репо считаются local на 127.0.0.1
+    /// (моно-режим, обратная совместимость с rc5).
+    pub fn open_readonly_multi(entries: Vec<(String, PathBuf, PathBuf)>) -> anyhow::Result<Self> {
+        let mut map = BTreeMap::new();
+        for (alias, root_path, db_path) in entries {
+            let storage = StoragePool::open_file_readonly(&db_path, PoolConfig::default())?;
+            map.insert(alias, RepoEntry {
+                root_path: Some(root_path),
+                storage: Some(storage),
+                ip: LEGACY_OWN_IP.to_string(),
+                port: crate::federation::client::DEFAULT_REMOTE_PORT,
+                is_local: true,
+                language: None,
+                processor: None,
+            });
+        }
+        Ok(Self::with_repos(map))
+    }
+
+    /// Legacy-совместимый конструктор: одно репо под алиасом `default`.
+    pub fn open_readonly(root_path: PathBuf, db_path: &Path) -> anyhow::Result<Self> {
+        Self::open_readonly_multi(vec![("default".to_string(), root_path, db_path.to_path_buf())])
+    }
+
+    /// Конструктор для тестов/встраивания — принимает уже открытое хранилище под alias.
+    pub fn with_storage(alias: impl Into<String>, root_path: PathBuf, storage: Storage) -> Self {
+        let mut map = BTreeMap::new();
+        map.insert(alias.into(), RepoEntry {
+            root_path: Some(root_path),
+            storage: Some(StoragePool::single(storage)),
+            ip: LEGACY_OWN_IP.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
+            is_local: true,
+            language: None,
+            processor: None,
+        });
+        Self::with_repos(map)
+    }
+
+    /// Список алиасов для описаний и диагностики.
+    pub fn repo_aliases(&self) -> Vec<String> {
+        self.repos.load().keys().cloned().collect()
+    }
+
+    /// Builder для опционального whitelist'а MCP-инструментов
+    /// (`daemon.toml [tools].enabled`).
+    ///
+    /// - `None` (или метод не вызван) → фильтр выключен, все зарегистрированные
+    ///   tools отдаются в `tools/list` и доступны через `tools/call`.
+    /// - `Some(set)` → в `tools/list` уходят только tools с именами из множества;
+    ///   `tools/call` для tools вне набора возвращает ошибку
+    ///   `-32602 Invalid params` с пояснением «tool 'X' is disabled by
+    ///   `[tools].enabled` whitelist in daemon.toml».
+    ///
+    /// Пустое множество (`Some(BTreeSet::new())`) трактуется буквально —
+    /// **ни один tool не доступен**. Если намерение — «снять фильтр», передавайте
+    /// `None`, не пустой `Some`. На уровне `daemon.toml` пустой `enabled = []`
+    /// в `cli.rs` маппится в `None` (см. конвертацию в `Commands::Serve`),
+    /// поэтому пользователь не может случайно отключить вообще всё через
+    /// пустой массив.
+    pub fn with_allowed_tools(mut self, allowed: Option<BTreeSet<String>>) -> Self {
+        self.allowed_tools = Arc::new(allowed);
+        self
+    }
+
+    /// Применить whitelist tools из списка имён (типично из
+    /// `daemon.toml [tools].enabled`).
+    ///
+    /// Это convenience-обёртка над [`Self::validate_whitelist`] +
+    /// [`Self::with_allowed_tools`]: преобразует список в множество,
+    /// логирует количество известных/неизвестных tools, при опечатках
+    /// печатает warning, и устанавливает whitelist. Используется обоими
+    /// ветками `code-index serve` (federation и моно) — это единственная
+    /// точка интеграции с `daemon.toml [tools]`.
+    ///
+    /// Поведение:
+    /// - Пустой `enabled` → фильтр выключен (`allowed_tools = None`),
+    ///   все tools доступны. Лог: `[tools].enabled пуст — whitelist выключен`.
+    /// - Непустой → фильтр применяется. Лог: `whitelist активен: N известных
+    ///   tools разрешены (M в списке)`. Если в списке есть имена, не
+    ///   соответствующие ни одному зарегистрированному tool, печатается
+    ///   warning (но сервер запускается — неизвестные имена просто не
+    ///   повлияют ни на что).
+    ///
+    /// Метод **потребляет self и возвращает Self** — удобно для chain'а
+    /// после конструктора:
+    /// ```ignore
+    /// let server = CodeIndexServer::from_federated(...)?
+    ///     .apply_tools_whitelist(&daemon_cfg.tools.enabled);
+    /// ```
+    pub fn apply_tools_whitelist(self, enabled: &[String]) -> Self {
+        if enabled.is_empty() {
+            tracing::info!(
+                "[tools].enabled пуст — whitelist выключен, все tools доступны"
+            );
+            return self;
+        }
+        let allowed: BTreeSet<String> = enabled.iter().cloned().collect();
+        let unknown = self.validate_whitelist(&allowed);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "[tools].enabled содержит неизвестные имена tools (опечатка?): {:?}. \
+                 Сервер запущен, но эти имена ни на что не повлияют — реальных tools \
+                 с такими именами не зарегистрировано.",
+                unknown
+            );
+        }
+        let known_count = allowed.len().saturating_sub(unknown.len());
+        tracing::info!(
+            "[tools].enabled whitelist активен: {} известных tools разрешены ({} в списке)",
+            known_count,
+            allowed.len(),
+        );
+        self.with_allowed_tools(Some(allowed))
+    }
+
+    /// Builder: белый список инструментов с массовым режимом
+    /// (`names[]`/`full_names[]`). Пустой набор (дефолт) → массовый режим
+    /// выключен у всех. См. [`MASS_MODE_PARAMS`] и [`Self::apply_mass_mode_tools`].
+    pub fn with_mass_mode_tools(mut self, tools: BTreeSet<String>) -> Self {
+        self.mass_mode_tools = Arc::new(tools);
+        self
+    }
+
+    /// Применить белый список массового режима из `daemon.toml [mcp].mass_mode_tools`.
+    /// Пустой список → массовый режим выключен у всех (дефолт). Имена вне
+    /// набора массовых инструментов ([`MASS_MODE_PARAMS`]) игнорируются с
+    /// warning. Единственная точка интеграции с `[mcp]` для обеих веток serve.
+    pub fn apply_mass_mode_tools(self, names: &[String]) -> Self {
+        if names.is_empty() {
+            tracing::info!(
+                "[mcp].mass_mode_tools пуст — массовый режим выключен у всех инструментов"
+            );
+            return self.with_mass_mode_tools(BTreeSet::new());
+        }
+        let known: BTreeSet<&str> = MASS_MODE_PARAMS.iter().map(|(n, _)| *n).collect();
+        let unknown: Vec<&String> = names.iter().filter(|n| !known.contains(n.as_str())).collect();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "[mcp].mass_mode_tools содержит имена без массового режима (опечатка?): {:?}. \
+                 Массовый режим есть только у: {:?}",
+                unknown,
+                known
+            );
+        }
+        let set: BTreeSet<String> = names.iter().cloned().collect();
+        tracing::info!(
+            "[mcp].mass_mode_tools активен: массовый режим включён для {:?}",
+            set
+        );
+        self.with_mass_mode_tools(set)
+    }
+
+    /// Применить настройку сессионного отсева повторной выдачи из
+    /// `daemon.toml [mcp].dedup_enabled`. Секции нет → включён (дефолт).
+    /// Единственная точка интеграции для обеих веток serve.
+    pub fn apply_dedup_enabled(mut self, enabled: bool) -> Self {
+        if enabled {
+            tracing::info!("[mcp].dedup_enabled = true — сессионный отсев повторной выдачи включён");
+        } else {
+            tracing::info!(
+                "[mcp].dedup_enabled = false — сессионный отсев выключен, результаты идут как есть"
+            );
+        }
+        self.dedup = Arc::new(SessionDedup::new(enabled));
+        self
+    }
+
+    /// Проверить, какие имена из whitelist'а НЕ соответствуют ни одному
+    /// зарегистрированному tool (опечатки, удалённые tools).
+    ///
+    /// Возвращает отсортированный список «неизвестных» имён. Сервер
+    /// использует это для warning при старте; неизвестные имена не
+    /// блокируют запуск, потому что в обычной работе они просто ни на
+    /// что не повлияют (никакой реальный tool с таким именем не
+    /// зарегистрирован → фильтрация для него тривиально проходит).
+    pub fn validate_whitelist(&self, whitelist: &BTreeSet<String>) -> Vec<String> {
+        let mut known: BTreeSet<String> = self
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let snapshot = self.extension_tools.load();
+        for ext in snapshot.iter() {
+            known.insert(ext.name().to_string());
+        }
+        let mut unknown: Vec<String> = whitelist
+            .iter()
+            .filter(|name| !known.contains(name.as_str()))
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown
+    }
+
+    /// Имена активных языков. Возвращает копию (через клонирование строк),
+    /// так как `ArcSwap::load()` отдаёт guard, а не статический срез.
+    pub fn active_language_names(&self) -> Vec<String> {
+        self.active_languages.load().iter().cloned().collect()
+    }
+
+    /// Сколько extension-tools поставлено активными процессорами.
+    /// Удобно для тестов и для логирования.
+    pub fn extension_tools_count(&self) -> usize {
+        self.extension_tools.load().len()
+    }
+
+    /// Пересобрать active_languages и extension_tools и атомарно
+    /// подменить через `ArcSwap`. После подмены, если состав активных
+    /// языков изменился, отправляется `notifications/tools/list_changed`
+    /// по сохранённому peer (если он есть).
+    ///
+    /// `new_active_languages` приходит снаружи: file-watch на `daemon.toml`
+    /// читает обновлённый конфиг и собирает множество явных или
+    /// auto-detected языков по всем `[[paths]]`. Сервер сам не парсит
+    /// конфиг — он только реагирует на готовые данные.
+    pub async fn reload_extensions(&self, new_active_languages: BTreeSet<String>) {
+        let registry_opt = self.registry.as_ref().as_ref();
+        let new_tools = match registry_opt {
+            Some(reg) => collect_extension_tools(&new_active_languages, reg),
+            None => Vec::new(),
+        };
+
+        let prev_languages = self.active_languages.load_full();
+        let changed = (*prev_languages) != new_active_languages;
+
+        self.active_languages
+            .store(Arc::new(new_active_languages));
+        self.extension_tools.store(Arc::new(new_tools));
+
+        if changed {
+            tracing::info!(
+                "Состав активных языков изменился: {:?} → {:?}. Отправляю tools/list_changed.",
+                prev_languages.iter().collect::<Vec<_>>(),
+                self.active_languages
+                    .load()
+                    .iter()
+                    .collect::<Vec<_>>()
+            );
+            self.notify_tools_changed_if_peer().await;
+        }
+    }
+
+    /// Проставить local-записям язык из `languages` (алиас → язык) и заново
+    /// привязать процессоры. Remote-записи и записи, чьего алиаса нет в карте,
+    /// остаются как были. Карта подменяется атомарно и только при изменении.
+    pub(crate) fn apply_repo_languages(&self, languages: &BTreeMap<String, String>) {
+        let old = self.repos.load_full();
+        let mut map = (*old).clone();
+        let mut changed = false;
+        for (alias, entry) in map.iter_mut() {
+            if !entry.is_local {
+                continue;
+            }
+            if let Some(lang) = languages.get(alias) {
+                if entry.language.as_deref() != Some(lang.as_str()) {
+                    entry.language = Some(lang.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            attach_processors(&mut map, self.registry.as_ref().as_ref());
+            self.repos.store(Arc::new(map));
+        }
+    }
+
+    /// Отправить `notifications/tools/list_changed` по сохранённому peer.
+    /// Если peer не сохранён (клиент ещё не подключился или сессия
+    /// уже завершилась) — просто пишем info в лог. Ошибки отправки
+    /// логируем как warning, но не пробрасываем — это «информирующее»
+    /// уведомление, его потеря не должна валить операцию rebuild.
+    pub async fn notify_tools_changed_if_peer(&self) {
+        let peer_guard = self.peer.lock().await;
+        match peer_guard.as_ref() {
+            Some(peer) => {
+                if let Err(e) = peer.notify_tool_list_changed().await {
+                    tracing::warn!("notify_tool_list_changed: {}", e);
+                }
+            }
+            None => {
+                tracing::info!(
+                    "tools/list_changed: peer не сохранён (клиент не подключён или ещё не initialized)"
+                );
+            }
+        }
+    }
+
+    /// Получить RepoEntry по alias или вернуть ToolUnavailable::UnknownRepo JSON.
+    pub(crate) fn resolve_repo(&self, alias: &str) -> Result<RepoEntry, String> {
+        let entry = self.repos.load().get(alias).cloned();
+        entry.ok_or_else(|| {
+            tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
+                message: format!(
+                    "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера.",
+                    alias,
+                    self.repo_aliases()
+                ),
+            })
+        })
+    }
+}
+
+// ── Conditional registration helpers ──────────────────────────────────────
+//
+// Эти функции собирают «активные» языки и tools из репо-карты и реестра
+// процессоров. Активный = есть хотя бы одно репо с `language = X`.
+// extension-tools — сумма `additional_tools()` всех активных процессоров.
+//
+// В реестре могут быть процессоры, чьи языки сейчас не используются
+// (например, BSL-процессор в `bsl-indexer`, но `daemon.toml` сейчас
+// содержит только Python-репо). Их tools не попадают в `extension_tools`
+// — клиент не должен видеть невалидных вариантов.
+
+/// Проставить каждому local-репо процессор его языка. Делается один раз при
+/// сборке сервера: tool-слой обращается к процессору по каждому вызову
+/// (декларативные привязки), и искать его в реестре каждый раз незачем.
+/// Для remote-репо и репо без языка поле остаётся `None`.
+pub(crate) fn attach_processors(
+    repos: &mut BTreeMap<String, RepoEntry>,
+    registry: Option<&ProcessorRegistry>,
+) {
+    let Some(registry) = registry else { return };
+    for entry in repos.values_mut() {
+        if !entry.is_local {
+            continue;
+        }
+        entry.processor = entry
+            .language
+            .as_deref()
+            .and_then(|lang| registry.get(lang))
+            .cloned();
+    }
+}
+
+/// Собрать полный снимок федеративной таблицы. При reload неизменившиеся
+/// локальные записи переиспользуют прежний пул, а для новых путей функция
+/// проверяет корень и при необходимости создаёт только `.code-index/index.db`.
+pub(crate) fn build_federated_repo_map(
+    repos: Vec<FederatedRepo>,
+    registry: Option<&ProcessorRegistry>,
+    local_languages: &BTreeMap<String, String>,
+    pool_cfg: PoolConfig,
+    previous: Option<&BTreeMap<String, RepoEntry>>,
+    create_missing_db: bool,
+) -> anyhow::Result<BTreeMap<String, RepoEntry>> {
+    let mut map = BTreeMap::new();
+    for repo in repos {
+        let alias = repo.alias.clone();
+        let entry = if repo.is_local {
+            let root = repo.root_path.ok_or_else(|| {
+                anyhow::anyhow!("Локальный репо '{}' (ip={}) без root_path — баг merge.", alias, repo.ip)
+            })?;
+            let db_path = repo.db_path.ok_or_else(|| {
+                anyhow::anyhow!("Локальный репо '{}' (ip={}) без db_path — баг merge.", alias, repo.ip)
+            })?;
+            let reused = previous
+                .and_then(|old| old.get(&alias))
+                .filter(|old| old.is_local && old.root_path.as_ref() == Some(&root))
+                .and_then(|old| old.storage.clone());
+            let storage = match reused {
+                Some(storage) => storage,
+                None => {
+                    if create_missing_db {
+                        if !root.is_dir() {
+                            anyhow::bail!(
+                                "Корень локального репо '{}' не существует или не является каталогом: {}",
+                                alias,
+                                root.display()
+                            );
+                        }
+                        if !db_path.exists() {
+                            std::fs::create_dir_all(db_path.parent().ok_or_else(|| {
+                                anyhow::anyhow!("У {} нет родительского каталога", db_path.display())
+                            })?)?;
+                            let storage = Storage::open_file(&db_path)?;
+                            drop(storage);
+                        }
+                    }
+                    StoragePool::open_file_readonly(&db_path, pool_cfg)?
+                }
+            };
+            RepoEntry {
+                root_path: Some(root),
+                storage: Some(storage),
+                ip: repo.ip,
+                port: repo.port,
+                is_local: true,
+                language: local_languages.get(&alias).cloned(),
+                processor: None,
+            }
+        } else {
+            RepoEntry {
+                root_path: None,
+                storage: None,
+                ip: repo.ip,
+                port: repo.port,
+                is_local: false,
+                language: None,
+                processor: None,
+            }
+        };
+        map.insert(alias, entry);
+    }
+    attach_processors(&mut map, registry);
+    Ok(map)
+}
+
+fn collect_active_languages(repos: &BTreeMap<String, RepoEntry>) -> BTreeSet<String> {
+    repos
+        .values()
+        .filter_map(|e| e.language.clone())
+        .collect()
+}
+
+fn collect_extension_tools(
+    active_languages: &BTreeSet<String>,
+    registry: &ProcessorRegistry,
+) -> Vec<Arc<dyn IndexTool>> {
+    let mut out = Vec::new();
+    for proc in registry.iter() {
+        if active_languages.contains(proc.name()) {
+            for t in proc.additional_tools() {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Сборка ответа массового режима get_function/get_class из результатов
+/// `tools::mass_map`: порядок элементов = порядок имён в запросе, ошибка
+/// отдельного элемента — `{error}` на его позиции, не валит весь батч.
+fn mass_rows_to_results(rows: Vec<Result<String, String>>) -> String {
+    // Зависимости всей пачки: объединение по элементам (M-13). Раньше служебное
+    // поле просто выбрасывалось, и ответ массового режима не был привязан ни к
+    // одному файлу: точечная инвалидация кэша до него не доставала, а проверка
+    // «ответ построен на не догнавшем индексе» не выполнялась вовсе — спасал
+    // только короткий срок хранения для ответов без зависимостей.
+    let mut dependent_files: BTreeSet<String> = BTreeSet::new();
+    let mut file_mtimes = serde_json::Map::new();
+    let results: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| match row {
+            Ok(one) => {
+                let mut v = serde_json::from_str::<serde_json::Value>(&one)
+                    .unwrap_or(serde_json::Value::String(one));
+                // tools::* оборачивают ответ в {_meta, result(, hint)}. Из элемента
+                // служебное поле снимаем (иначе N копий мусора в ответе модели),
+                // но не теряем — переносим в общее `_meta` пачки.
+                if let Some(o) = v.as_object_mut() {
+                    if let Some(meta) = o.remove("_meta") {
+                        if let Some(files) = meta.get("dependent_files").and_then(|d| d.as_array())
+                        {
+                            dependent_files.extend(
+                                files.iter().filter_map(|f| f.as_str().map(String::from)),
+                            );
+                        }
+                        if let Some(mt) = meta.get("file_mtimes").and_then(|m| m.as_object()) {
+                            for (path, mtime) in mt {
+                                file_mtimes.insert(path.clone(), mtime.clone());
+                            }
+                        }
+                    }
+                }
+                v
+            }
+            Err(e) => serde_json::json!({ "error": e }),
+        })
+        .collect();
+    serde_json::json!({
+        "results": results,
+        "_meta": {
+            "dependent_files": dependent_files.into_iter().collect::<Vec<String>>(),
+            "file_mtimes": file_mtimes,
+        },
+    })
+    .to_string()
+}
+
+// ── MCP tools ──────────────────────────────────────────────────────────────
+//
+// В каждом data-handler:
+//   1. `resolve_repo` — найти RepoEntry по alias или вернуть JSON-ошибку.
+//   2. Если `entry.is_local == false` — форвард через `federation::dispatcher`
+//      на удалённый serve по `entry.ip` (порт 8011, тот же endpoint /federate/<tool>).
+//   3. Иначе — позвать `tools::*`, которая читает локальный SQLite.
+//
+// `health` не форвардится — это диагностика локального процесса.
+
+#[tool_router]
+impl CodeIndexServer {
+    #[tool(description = "Нечёткий FTS-поиск функций по СЛОВАМ (bm25, OR между словами, префиксные термы): имя важнее qualified_name/docstring. Принимает и точное имя, и описание из слов ('расчёт цены продажи реализация'). Выдача БЕЗ тел — только локации (имя/путь/строки/сигнатура/обрезанный docstring). Тело конкретной функции — get_function; локации по ТОЧНОМУ имени — find_symbol; regex по коду — grep_code. path_glob — фильтр по пути. При 0 совпадений — hint; на BSL-репо он подсказывает search_terms (поиск процедур по смысловым термам).")]
+    async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "search_function", &p,
+            ).await;
+        }
+        tools::search_function(&entry, p.query, p.limit, p.language, p.path_glob).await
+    }
+
+    #[tool(description = "Нечёткий FTS-поиск классов/структур по СЛОВАМ (bm25): имя важнее docstring. Выдача БЕЗ тел — только локации (имя/путь/строки/bases). Тело конкретного класса — get_class; локации по ТОЧНОМУ имени — find_symbol. path_glob — фильтр по пути. При 0 совпадений — hint.")]
+    async fn search_class(&self, Parameters(p): Parameters<SearchParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "search_class", &p,
+            ).await;
+        }
+        tools::search_class(&entry, p.query, p.limit, p.language, p.path_glob).await
+    }
+
+    #[tool(description = "Тело функции по ТОЧНОМУ имени (с исходником). Уникальное имя → одно тело. НЕуникальное (совпадений > порога) → тела опускаются, возвращаются локации + hint: уточните path_glob к нужному файлу. Навигация «где символ» без тел — find_symbol; поиск по словам — search_function. Возвращает JSON-массив FunctionRecord (или облегчённые локации при множестве). МАССОВЫЙ РЕЖИМ ('names'): батчи список ТОЛЬКО когда точно нужны тела ВСЕХ этих функций и результат одной не отменит надобность в остальных (например, правишь их все). Если ОТБИРАЕШЬ, какие из кандидатов релевантны, — НЕ батчи, бери по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в порядке запроса.")]
+    async fn get_function(&self, Parameters(p): Parameters<MultiNameParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_function", &p,
+            ).await;
+        }
+        if let Some(names) = p.names {
+            // Массовый режим — конкуррентно: каждый элемент берёт своё соединение
+            // из пула и исполняется в spawn_blocking (tools::mass_map). Статус
+            // папки проверяется один раз на весь батч.
+            if let Some(json) = tools::check_path_status(&entry).await {
+                return json;
+            }
+            if names.is_empty() {
+                return serde_json::json!({ "results": [] }).to_string();
+            }
+            let pool = entry.storage_pool().clone();
+            let glob = p.path_glob.clone();
+            let rows = tools::mass_map(&pool, names, move |st, nm| {
+                tools::get_function_with(st, nm, glob.clone())
+            })
+            .await;
+            return mass_rows_to_results(rows);
+        }
+        match p.name {
+            Some(nm) => tools::get_function(&entry, nm, p.path_glob).await,
+            None => serde_json::json!({
+                "error": "missing parameter: передайте 'name' — точное имя символа (строка)"
+            })
+            .to_string(),
+        }
+    }
+
+    #[tool(description = "Тело класса/структуры по ТОЧНОМУ имени (с исходником). НЕуникальное имя (совпадений > порога) → тела опускаются, локации + hint, уточните path_glob. Навигация без тел — find_symbol; поиск по словам — search_class. Возвращает JSON-массив ClassRecord (или локации при множестве). МАССОВЫЙ РЕЖИМ ('names'): батчи список ТОЛЬКО когда точно нужны тела ВСЕХ этих классов и результат одного не отменит надобность в остальных (например, правишь их все). Если ОТБИРАЕШЬ, какие из кандидатов релевантны, — НЕ батчи, бери по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в порядке запроса.")]
+    async fn get_class(&self, Parameters(p): Parameters<MultiNameParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_class", &p,
+            ).await;
+        }
+        if let Some(names) = p.names {
+            // Массовый режим — конкуррентно, зеркало get_function (см. выше).
+            if let Some(json) = tools::check_path_status(&entry).await {
+                return json;
+            }
+            if names.is_empty() {
+                return serde_json::json!({ "results": [] }).to_string();
+            }
+            let pool = entry.storage_pool().clone();
+            let glob = p.path_glob.clone();
+            let rows = tools::mass_map(&pool, names, move |st, nm| {
+                tools::get_class_with(st, nm, glob.clone())
+            })
+            .await;
+            return mass_rows_to_results(rows);
+        }
+        match p.name {
+            Some(nm) => tools::get_class(&entry, nm, p.path_glob).await,
+            None => serde_json::json!({
+                "error": "missing parameter: передайте 'name' — точное имя символа (строка)"
+            })
+            .to_string(),
+        }
+    }
+
+    #[tool(description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord.")]
+    async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_callers", &p,
+            ).await;
+        }
+        tools::get_callers(&entry, p.function_name, p.language, p.limit).await
+    }
+
+    #[tool(description = "Что вызывает данная функция (callees) — весь список за ОДИН вызов. В каждой записи уже есть caller, callee, line, path файла с вызовом, а для однозначных имён ещё и callee_path/callee_line — место, где вызываемая процедура ОПРЕДЕЛЕНА. Искать каждое вызываемое имя отдельным find_symbol/get_function НЕ нужно; если callee_path нет, значит имя носят несколько процедур — тогда спрашивай их одним grep_code с перечислением через | , а не по вызову на имя. limit — cap (default 200); при обрезке {truncated,total,limit}. Цепочка до конкретной функции — find_path, дерево на несколько уровней — get_call_tree.")]
+    async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_callees", &p,
+            ).await;
+        }
+        tools::get_callees(&entry, p.function_name, p.language, p.limit).await
+    }
+
+    #[tool(description = "Цепочка вызовов между двумя функциями за ОДИН вызов. Бери его на вопросы вида «есть ли путь от A до B», «как из A попадают в B», «через что A вызывает B»: кратчайший путь по графу ищет сервер. НЕ восстанавливай цепочку вручную — обход через get_callers/get_callees по одному узлу и чтение тел стоит десятки вызовов и даёт тот же ответ. Параметры: from, to — имена функций; max_depth по умолчанию 5, [1..10]. Универсальный, любой язык. Возвращает {from,to,found,path:[{caller,callee,line}]}. Пути нет — ответ различает «дошли до потолка» и «подграф исчерпан». Для 1С есть отдельный find_path_bsl (учитывает вид вызова).")]
+    async fn find_path(&self, Parameters(p): Parameters<FindPathParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_path", &p,
+            ).await;
+        }
+        tools::find_path(&entry, p.from, p.to, p.max_depth, p.language).await
+    }
+
+    #[tool(description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Большой ответ сокращается по размеру: дальние рёбра отбрасываются, поля tree нет, в ответе truncated, edges_total, edges_shown и hint — как сузить запрос. Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
+    async fn get_call_tree(&self, Parameters(p): Parameters<CallTreeParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_call_tree", &p,
+            ).await;
+        }
+        tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language, p.max_response_bytes, &p.repo).await
+    }
+
+    #[tool(description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура). Голым именем зови ТОЛЬКО для уникального имени: если имя — стандартный обработчик объекта/набора записей или просто распространённое, вернутся сотни локаций (truncated) — для таких сразу задавай path_glob (фильтр по пути).")]
+    async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_symbol", &p,
+            ).await;
+        }
+        tools::find_symbol(&entry, p.name, p.language, p.path_glob).await
+    }
+
+    #[tool(description = "Импорты файла (file_id) или модуля (module) в указанном репо. limit — cap (default 200); при обрезке {truncated,total,limit}. Возвращает JSON-массив ImportRecord.")]
+    async fn get_imports(&self, Parameters(p): Parameters<ImportParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_imports", &p,
+            ).await;
+        }
+        tools::get_imports(&entry, p.file_id, p.module, p.language, p.limit).await
+    }
+
+    #[tool(description = "Карта/оглавление файла БЕЗ тел функций/классов (безопасно на больших модулях): имена, сигнатуры (args/return_type), диапазоны строк, обрезанные docstring, импорты, переменные + functions_total/classes_total. Для чтения тела метода ОБЯЗАТЕЛЬНО используйте get_function(name). Использование read_file(line_start,line_end) для функций запрещено (сильно расходует контекст); read_file — только для кода ВНЕ функций/классов. Возвращает JSON-объект.")]
+    async fn get_file_summary(&self, Parameters(p): Parameters<FilePathParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_file_summary", &p,
+            ).await;
+        }
+        tools::get_file_summary(&entry, p.path).await
+    }
+
+    #[tool(description = "Статистика индекса. Если repo указан — для одного репо, иначе — массив по всем подключённым репо.")]
+    async fn get_stats(&self, Parameters(p): Parameters<StatsParams>) -> String {
+        // Если запрос адресован конкретному remote-репо — форвардим как обычно.
+        if let Some(ref alias) = p.repo {
+            let entry = self.repos.load().get(alias).cloned();
+            let Some(entry) = entry else {
+                return tools::format_unavailable(
+                    crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
+                        message: format!(
+                            "Неизвестный repo '{}'. Доступные: {:?}.",
+                            alias,
+                            self.repo_aliases()
+                        ),
+                    },
+                );
+            };
+            if !entry.is_local {
+                return crate::federation::dispatcher::dispatch_remote(
+                    &self.clients, &entry.ip, entry.port, "get_stats", &p,
+                ).await;
+            }
+            return tools::stats_for_entry(self, alias, &entry).await;
+        }
+        // Без repo — fan-out по всем (включая удалённые) реализуется в этапе 5.
+        tools::get_stats(self, p.repo).await
+    }
+
+    #[tool(description = "FTS поиск по текстовым файлам (md, txt, yaml, toml) в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-массив [{path, snippet}].")]
+    async fn search_text(&self, Parameters(p): Parameters<SearchParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "search_text", &p,
+            ).await;
+        }
+        tools::search_text(&entry, p.query, p.limit, p.language, p.path_glob).await
+    }
+
+    #[tool(description = "Поиск ТОЛЬКО в телах функций и классов (module-level код — объявления Перем, таблицы инициализации/маршрутизации, константы и строковые литералы ВНЕ процедур — НЕ виден; для поиска по всему файлу бери grep_code). Плюс grep_body в том, что показывает, в какой ИМЕННО функции/классе найден паттерн. pattern — буквальная подстрока без учёта регистра (кириллица тоже; `%` и `_` — обычные символы), regex — регулярное выражение; query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\".")]
+    async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_body", &p,
+            ).await;
+        }
+        // `query` — алиас для `regex` (частая путаница моделей).
+        let regex = p.regex.clone().or_else(|| p.query.clone());
+        if p.pattern.is_none() && regex.is_none() {
+            return "{\"error\": \"grep_body: укажите pattern= (подстрока) или regex= (regexp). Для кода вне тел функций — grep_code(regex=…); по xml/md/yaml — grep_text(regex=…).\"}".to_string();
+        }
+        tools::grep_body(
+            &entry, p.pattern, regex, p.language, p.limit, p.path_glob, p.context_lines,
+        )
+        .await
+    }
+
+    #[tool(description = "Метаданные файла из индекса: existence, размер, mtime, lines_total, language, category. Чистая выборка из таблицы files (быстро). ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path.")]
+    async fn stat_file(&self, Parameters(p): Parameters<StatFileParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "stat_file", &p,
+            ).await;
+        }
+        tools::stat_file(&entry, p.path).await
+    }
+
+    #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`; альтернативы `{a,b}`: `**/*.{rs,toml}`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив строк \"<path> | <lang> | <N> lines | <size>\" (mtime — в _meta.file_mtimes). limit — максимум файлов в ответе (default 500); если подходящих файлов больше, ответ несёт {truncated, total, shown, limit}, где total — сколько их всего.")]
+    async fn list_files(&self, Parameters(p): Parameters<ListFilesParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "list_files", &p,
+            ).await;
+        }
+        tools::list_files(&entry, p.pattern, p.path_prefix, p.language, p.limit).await
+    }
+
+    #[tool(description = "Прочитать содержимое файла из индекса. ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ.")]
+    async fn read_file(&self, Parameters(p): Parameters<ReadFileParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "read_file", &p,
+            ).await;
+        }
+        tools::read_file(&entry, p.path, p.line_start, p.line_end).await
+    }
+
+    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    async fn grep_text(&self, Parameters(mut p): Parameters<GrepTextParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        // `query` — алиас для `regex`, `pattern` — буквальная подстрока
+        // (частая путаница моделей: имя переносится от grep_body/list_files).
+        let regex = match grep_regex_from_params(p.regex.clone(), p.query.clone(), p.pattern.clone()) {
+            Some(r) => r,
+            None => return "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для кода .bsl/.py/.rs — grep_code; для тел функций — grep_body.\"}".to_string(),
+        };
+        if !entry.is_local {
+            // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
+            // поля `pattern` ещё нет, и при разборе оно бы потерялось.
+            p.regex = Some(regex);
+            p.query = None;
+            p.pattern = None;
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_text", &p,
+            ).await;
+        }
+        tools::grep_text(&entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
+    }
+
+    #[tool(description = "ВАЖНО: ищет ТОЛЬКО точные текстовые совпадения (RegEx/подстрока) в code-файлах. НЕ используйте для поиска бизнес-логики, терминов или синонимов (напр. «где реализован ДемоЮнит») — для смысла берите search_terms (BSL) или search_function. Если вернул 0 совпадений и hint — СТРОГО ЗАПРЕЩАЕТСЯ вызывать повторно с другими path_glob/language; немедленно меняйте стратегию (search_terms/search_function). Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    async fn grep_code(&self, Parameters(mut p): Parameters<GrepCodeParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        // `query` — алиас для `regex`, `pattern` — буквальная подстрока
+        // (частая путаница моделей: имя переносится от grep_body/list_files).
+        let regex = match grep_regex_from_params(p.regex.clone(), p.query.clone(), p.pattern.clone()) {
+            Some(r) => r,
+            None => return "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для тел функций/классов — grep_body; для xml/md/yaml — grep_text.\"}".to_string(),
+        };
+        if !entry.is_local {
+            // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
+            // поля `pattern` ещё нет, и при разборе оно бы потерялось.
+            p.regex = Some(regex);
+            p.query = None;
+            p.pattern = None;
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_code", &p,
+            ).await;
+        }
+        tools::grep_code(&entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
+    }
+
+    #[tool(description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON.")]
+    async fn health(&self) -> String {
+        tools::health(self).await
+    }
+}
+
+// Реализация ServerHandler без `#[tool_handler]`-макроса. Макрос
+// собирал `list_tools`/`call_tool`/`get_tool` строго через `tool_router`,
+// а нам нужно ещё подмешать extension-tools от активных
+// `LanguageProcessor`-ов. Поэтому пишем три метода руками, делегируя
+// core-tools в `tool_router`, а extension — в свой Vec.
+
+/// Инструменты, которые НЕ кэшируем: `health` (liveness), `get_stats`
+/// (federation-опрос живости remote-нод — ответ должен быть свежим) и
+/// `stat_file`.
+///
+/// `stat_file` добавлен в 0.49.4 (M-7): он и задуман некэшируемым — отдаёт
+/// размер, mtime и признак oversize, то есть ровно то, что меняется первым, —
+/// и потому единственный из инструментов намеренно не заворачивается в `_meta`.
+/// Но в списке его не было, а без `_meta` у ответа нет зависимых файлов, значит
+/// точечная инвалидация до него не достаёт: устаревшие метаданные файла жили
+/// весь срок хранения записи.
+fn is_cacheable_tool(tool: &str) -> bool {
+    !matches!(tool, "health" | "get_stats" | "stat_file")
+}
+
+/// Срок хранения ответа, у которого НЕТ зависимых файлов (M-7).
+///
+/// Точечная инвалидация вытесняет записи через обратный индекс `файл → ключи`.
+/// Ответ, не связанный ни с одним файлом (пустой результат поиска, обход графа
+/// вызовов), в этот индекс не попадает и обычным путём не вытесняется вообще —
+/// он доживает до конца базового срока (час). Практическое последствие:
+/// «ничего не найдено» продолжает отдаваться после того, как данные появились.
+/// Такие ответы дёшевы в пересчёте, поэтому храним их недолго.
+const DEPLESS_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Статусы служебных отказов `ToolUnavailable`. Отдаются как ОБЫЧНАЯ успешная
+/// строка (в теле ответа), поэтому по `is_error` их не отличить.
+const TRANSIENT_STATUSES: [&str; 5] = [
+    "not_started",
+    "indexing",
+    "error",
+    "daemon_offline",
+    "unknown_repo",
+];
+
+/// Достать содержательную часть ответа из сериализованного `CallToolResult`.
+/// Формы те же три, что у `extract_meta_obj`: вложенный JSON в `content[*].text`,
+/// `structuredContent`, плоский объект верхнего уровня.
+fn extract_inner_value(payload: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(t) {
+                    return Some(inner);
+                }
+            }
+        }
+    }
+    if let Some(sc) = v.get("structuredContent") {
+        return Some(sc.clone());
+    }
+    Some(v)
+}
+
+/// Ответ — служебный отказ, а не данные? (M-7)
+///
+/// Сюда попадают `ToolUnavailable` («демон недоступен», «идёт индексация», «путь
+/// не отслеживается», «неизвестный репозиторий») и ответы вида `{"error": …}`
+/// («файл не найден», ошибка разбора образца пути). Все они возвращаются
+/// успешным результатом, поэтому проверка `is_error` их пропускает, а зависимых
+/// файлов у них нет — точечная инвалидация бессильна. Кэшировать нельзя: демон
+/// поднялся минуту назад, а клиент до конца срока хранения получает отказ.
+fn is_transient_failure(inner: &serde_json::Value) -> bool {
+    if inner.get("error").is_some() {
+        return true;
+    }
+    match inner.get("status").and_then(|s| s.as_str()) {
+        Some(s) => TRANSIENT_STATUSES.contains(&s),
+        None => false,
+    }
+}
+
+/// Снять служебное поле `_meta` из сериализованного `CallToolResult` перед
+/// отдачей клиенту — зеркало `strip_meta` прокси mcp-cache-ci. `_meta`
+/// (`dependent_files` / `file_mtimes`) — служебный канал serve↔демон: deps шли
+/// бы в reverse-index, mtimes — в write-triggered ревалидацию. К моменту выдачи
+/// инвалидация уже отработала по scope (repo), клиенту (модели) поле не нужно и
+/// только раздувает контекст. Три формы: MCP `content[*].text` (вложенный JSON),
+/// top-level `{result,_meta}` (non-MCP), `structuredContent._meta` (structured
+/// output extension-tools — ловилось на живом `get_object_structure`).
+/// Возвращает `(payload, changed)`; при любой неожиданности payload не меняется.
+fn strip_meta(payload: &str) -> (String, bool) {
+    let mut v: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return (payload.to_string(), false),
+    };
+    let mut changed = false;
+    let is_mcp = v.get("content").map(|c| c.is_array()).unwrap_or(false);
+    if is_mcp {
+        // Наш `_meta` лежит во вложенном JSON `content[*].text`; top-level `_meta`
+        // (поле протокола rmcp) не трогаем.
+        if let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) {
+            for item in content.iter_mut() {
+                let text = match item.get("text").and_then(|t| t.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => continue,
+                };
+                let mut inner: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(iv) => iv,
+                    Err(_) => continue,
+                };
+                let removed = inner
+                    .as_object_mut()
+                    .map(|o| o.remove("_meta").is_some())
+                    .unwrap_or(false);
+                if removed {
+                    if let Ok(reser) = serde_json::to_string(&inner) {
+                        item["text"] = serde_json::Value::String(reser);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    } else if let Some(obj) = v.as_object_mut() {
+        // Top-level форма (non-MCP бэкенд): `_meta` рядом с `result`.
+        if obj.remove("_meta").is_some() {
+            changed = true;
+        }
+    }
+    // structuredContent (rmcp structured output) — extension-tools serve кладут
+    // `{_meta, result}` ещё и сюда, дублируя content[*].text.
+    if let Some(sc) = v
+        .get_mut("structuredContent")
+        .and_then(|s| s.as_object_mut())
+    {
+        if sc.remove("_meta").is_some() {
+            changed = true;
+        }
+    }
+    if changed {
+        (
+            serde_json::to_string(&v).unwrap_or_else(|_| payload.to_string()),
+            true,
+        )
+    } else {
+        (payload.to_string(), false)
+    }
+}
+
+/// Достать `_meta`-объект из сериализованного `CallToolResult`. Три формы (как
+/// в `strip_meta`): вложенный JSON в `content[*].text`, `structuredContent._meta`,
+/// top-level `_meta`. `None`, если `_meta` нет. Парсинг — БЕЗ удержания локов кэша.
+fn extract_meta_obj(payload: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if v.get("content").map(|c| c.is_array()).unwrap_or(false) {
+        if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+            for item in arr {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(t) {
+                        if let Some(m) = inner.get("_meta") {
+                            return Some(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(m) = v.get("structuredContent").and_then(|s| s.get("_meta")) {
+        return Some(m.clone());
+    }
+    v.get("_meta").cloned()
+}
+
+/// Имена файлов-источников ответа из `_meta.dependent_files` (для обратного
+/// индекса per-file инвалидации).
+fn meta_dependent_files(meta: &serde_json::Value) -> Vec<String> {
+    meta.get("dependent_files")
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl CodeIndexServer {
+    /// Ключ кэша для (tool, args), если репо локальный и инструмент кэшируем.
+    /// `None` → не кэшировать: remote-репо (federation инвалидируется на
+    /// удалённой ноде, не локальным watcher'ом), health/get_stats, нет `repo`,
+    /// кэш выключен.
+    fn cache_key_if_local(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
+        if !self.cache.enabled() || !is_cacheable_tool(tool) {
+            return None;
+        }
+        let repo = args.get("repo").and_then(|v| v.as_str())?;
+        let repos = self.repos.load();
+        let entry = repos.get(repo)?;
+        if !entry.is_local {
+            return None;
+        }
+        // Свежесть проверяется ПО ФАЙЛУ уже на выдаче/записи (response_is_stale),
+        // а не подавлением кэша всего репо — здесь ключ строим всегда.
+        Some(ServeCache::key(repo, tool, args))
+    }
+
+    /// Положить успешный результат в кэш (no-op при `key=None`, ошибке или
+    /// `is_error`). Вызывается на каждом пути возврата `call_tool`.
+    /// Per-file свежесть: НЕ кэшируем ответ, построенный на не догнавшем индексе
+    /// (хоть один файл-источник «грязный»). Зависимые файлы регистрируются в
+    /// обратном индексе для точечной инвалидации.
+    fn maybe_cache(
+        &self,
+        key: &Option<String>,
+        repo: &str,
+        result: &Result<CallToolResult, ErrorData>,
+        epoch_before: u64,
+    ) {
+        let (Some(k), Ok(res)) = (key, result) else {
+            return;
+        };
+        // Индекс сдвинулся, пока считался ответ: демон прислал сигнал об
+        // изменении файлов. Ответ мог быть построен на данных ДО фиксации
+        // батча, а «грязные» пометки к этому моменту уже сняты — проверка по
+        // ним такого не заметит. Такой ответ в кэш не берём.
+        if self.cache.epoch(repo) != epoch_before {
+            return;
+        }
+        if res.is_error.unwrap_or(false) {
+            return;
+        }
+        let Ok(s) = serde_json::to_string(res) else {
+            return;
+        };
+        // Служебный отказ, отданный успешным результатом (M-7): «демон
+        // недоступен», «идёт индексация», «файл не найден». Зависимых файлов у
+        // него нет, точечная инвалидация до него не достаёт — в кэш не берём,
+        // иначе отказ переживает устранение своей причины.
+        if let Some(inner) = extract_inner_value(&s) {
+            if is_transient_failure(&inner) {
+                return;
+            }
+        }
+        let meta = extract_meta_obj(&s);
+        if let Some(m) = &meta {
+            if self.meta_has_stale(repo, m) {
+                return; // ответ на не догнавшем индексе — не кэшируем
+            }
+        }
+        let deps = meta.as_ref().map(meta_dependent_files).unwrap_or_default();
+        if deps.is_empty() {
+            // Ответ ни к одному файлу не привязан (пустой результат поиска,
+            // обход графа вызовов) — обычной инвалидацией не вытесняется,
+            // поэтому кладём на короткий срок (M-7).
+            self.cache
+                .insert_with_ttl(k.clone(), Arc::new(s), repo, &deps, DEPLESS_TTL);
+        } else {
+            self.cache.insert(k.clone(), Arc::new(s), repo, &deps);
+        }
+    }
+
+    /// Ответ построен на НЕ догнавшем индексе? Проверка ПО ФАЙЛУ: для каждого
+    /// файла-источника (`_meta.file_mtimes`) сверяем index_mtime с observed-mtime
+    /// диска (`dirty`). `true` → хоть один файл «грязный» (на диске новее индекса).
+    fn response_is_stale(&self, repo: &str, payload: &str) -> bool {
+        match extract_meta_obj(payload) {
+            Some(m) => self.meta_has_stale(repo, &m),
+            None => false,
+        }
+    }
+
+    /// Есть ли среди файлов `_meta.file_mtimes` хоть один «грязный» относительно
+    /// своего index_mtime (см. `ServeCache::is_path_stale`).
+    fn meta_has_stale(&self, repo: &str, meta: &serde_json::Value) -> bool {
+        let Some(mtimes) = meta.get("file_mtimes").and_then(|m| m.as_object()) else {
+            return false;
+        };
+        for (path, idx) in mtimes {
+            if let Some(index_mtime) = idx.as_i64() {
+                if self.cache.is_path_stale(repo, path, index_mtime) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Финальная обработка результата перед отдачей клиенту: сессионный дедуп
+    /// ре-доставки (опустить строки табличного результата, уже отданные в ЭТОЙ
+    /// сессии). Применяется ПОСЛЕ кэша — кэш хранит ПОЛНЫЙ результат
+    /// (session-independent), а дедуп специфичен для сессии и в кэш не пишется.
+    /// Нетабличные результаты и ошибки проходят без изменений.
+    fn finish(
+        &self,
+        session_id: &Option<String>,
+        dedup_scope: &str,
+        result: Result<CallToolResult, ErrorData>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Ok(res) = &result else {
+            return result;
+        };
+        if res.is_error.unwrap_or(false) {
+            return result;
+        }
+        let Ok(s) = serde_json::to_string(res) else {
+            return result;
+        };
+        // 1. Сессионный дедуп ре-доставки (опустить уже отданные в этой сессии
+        //    строки табличного результата). Выключен → проходим без изменений.
+        let (s, elided) = if self.dedup.enabled() {
+            self.dedup.process(session_id.as_deref(), dedup_scope, &s)
+        } else {
+            (s, 0)
+        };
+        // 2. Срез служебного `_meta` перед отдачей клиенту (раньше это делал
+        //    прокси mcp-cache-ci; теперь serve самодостаточен в ci-цепочке).
+        let (s, meta_stripped) = strip_meta(&s);
+        // Ничего не изменилось → отдаём исходный результат без лишней пересборки.
+        if elided == 0 && !meta_stripped {
+            return result;
+        }
+        match serde_json::from_str::<CallToolResult>(&s) {
+            Ok(new_res) => Ok(new_res),
+            Err(_) => result,
+        }
+    }
+}
+
+impl ServerHandler for CodeIndexServer {
+    fn get_info(&self) -> ServerInfo {
+        // enable_tool_list_changed: даём клиенту знать, что мы способны
+        // отправлять `notifications/tools/list_changed`. Сама отправка
+        // подключится на этапе 1.7 (file-watch на daemon.toml вызовет
+        // rebuild active set и notify_tool_list_changed через peer).
+        let caps = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .build();
+        ServerInfo::new(caps).with_server_info(Implementation::new(
+            "code-index-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        let extension_snapshot = self.extension_tools.load();
+        for ext in extension_snapshot.iter() {
+            tools.push(extension_tool_to_rmcp(ext.as_ref()));
+        }
+        // Если задан whitelist через `daemon.toml [tools].enabled` —
+        // оставляем только перечисленные tools. Модель видит ровно тот
+        // набор, который оператор разрешил; без whitelist (`None`) фильтр
+        // не применяется (поведение до v0.10.x).
+        if let Some(allowed) = self.allowed_tools.as_ref().as_ref() {
+            tools.retain(|t| allowed.contains(t.name.as_ref()));
+        }
+        // Массовый режим: инструмент не в `[mcp].mass_mode_tools` → убираем его
+        // plural-параметр (`names`/`full_names`) из схемы, чтобы модель не
+        // видела опцию пачки. Дефолт — пустой список → выключено у всех.
+        for (name, plural) in MASS_MODE_PARAMS {
+            if !self.mass_mode_tools.contains(*name) {
+                if let Some(tool) = tools.iter_mut().find(|t| t.name.as_ref() == *name) {
+                    strip_mass_mode_param(tool, plural);
+                }
+            }
+        }
+        // Стабильный порядок (как у tool_router::list_all): по имени.
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Session id из HTTP-заголовка `mcp-session-id`: rmcp вкладывает
+        // `http::request::Parts` в `context.extensions` (tower.rs), а оттуда оно
+        // попадает в `RequestContext.extensions`. Нужен для сессионного дедупа
+        // ре-доставки — ключ «что уже отдано в этой сессии».
+        let session_id: Option<String> = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|p| p.headers.get("mcp-session-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        tracing::debug!(session = ?session_id, tool = %request.name.as_ref(), "call_tool");
+
+        // 0. Whitelist-проверка ДО router-диспетча. Модель может вызвать
+        // tool, отсутствующий в `tools/list` (из системного промпта, из
+        // памяти обучения, из CLAUDE.md проекта) — без этой проверки
+        // вызов уйдёт в router и выполнится. Дублирует фильтр в
+        // `list_tools` намеренно (двойная защита).
+        if let Some(allowed) = self.allowed_tools.as_ref().as_ref() {
+            if !allowed.contains(request.name.as_ref()) {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "tool '{}' is disabled by [tools].enabled whitelist in daemon.toml",
+                        request.name
+                    ),
+                    None,
+                ));
+            }
+        }
+        // 0b. Массовый режим выключен для этого инструмента? Отбиваем вызов с
+        // plural-параметром (`names`/`full_names`). Дублирует стрип схемы в
+        // `list_tools` (двойная защита: модель может прислать параметр из
+        // памяти/системного промпта, минуя `tools/list`). Одиночный
+        // `name`/`full_name` всегда проходит.
+        if let Some((_, plural)) = MASS_MODE_PARAMS
+            .iter()
+            .find(|(n, _)| *n == request.name.as_ref())
+        {
+            if !self.mass_mode_tools.contains(request.name.as_ref()) {
+                let has_plural = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|m| m.get(*plural))
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false);
+                if has_plural {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "массовый режим ('{}') для tool '{}' выключен — добавьте его в \
+                             [mcp].mass_mode_tools (daemon.toml) либо передайте одиночный параметр",
+                            plural, request.name
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+        // Кэш результатов (встроенная форма прокси): ключ {repo}|{tool}|{hash}.
+        // Кэшируем только LOCAL-репо и кэшируемые инструменты (federation,
+        // health, get_stats минуют кэш — `cache_key_if_local` вернёт None).
+        // На промахе считаем как обычно и кладём результат в кэш на каждом
+        // пути возврата через `maybe_cache`.
+        let args_val = request
+            .arguments
+            .clone()
+            .map(serde_json::Value::Object)
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        // Имя репо (если есть) — для per-file свежести кэша и обратного индекса.
+        let repo_opt = args_val
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // Область сессионного отсева — «инструмент|репо». Без неё строки разных
+        // репо с одинаковым текстом гасят друг друга: первый же запрос к соседней
+        // базе приходит пустым (наблюдалось на `ut` против `ut-test`). Считаем до
+        // перемещения `request` в ToolCallContext.
+        let dedup_scope = format!(
+            "{}|{}",
+            request.name.as_ref(),
+            repo_opt.as_deref().unwrap_or("")
+        );
+        let cache_key = self.cache_key_if_local(request.name.as_ref(), &args_val);
+        // Поколение индекса на момент НАЧАЛА вычисления ответа (см. `maybe_cache`).
+        let epoch_before = self.cache.epoch(repo_opt.as_deref().unwrap_or(""));
+        if let Some(ref key) = cache_key {
+            if let Some(payload) = self.cache.get(key) {
+                // Per-file свежесть: не отдавать кэш, построенный на не догнавшем
+                // индексе (файл-источник «грязный»); иначе — отдать из кэша.
+                let repo = repo_opt.as_deref().unwrap_or("");
+                if !self.response_is_stale(repo, &payload) {
+                    if let Ok(res) = serde_json::from_str::<CallToolResult>(&payload) {
+                        return self.finish(&session_id, &dedup_scope, Ok(res));
+                    }
+                }
+            }
+        }
+
+        // 1. Сначала core-tools — они есть всегда.
+        if self.tool_router.has_route(request.name.as_ref()) {
+            let tcc = rmcp::handler::server::tool::ToolCallContext::new(
+                self,
+                request,
+                context,
+            );
+            let r = self.tool_router.call(tcc).await;
+            self.maybe_cache(
+                &cache_key,
+                repo_opt.as_deref().unwrap_or(""),
+                &r,
+                epoch_before,
+            );
+            return self.finish(&session_id, &dedup_scope, r);
+        }
+        // 2. Иначе — extension-tools. Ищем по имени.
+        let tool_name = request.name.as_ref();
+        let extension_snapshot = self.extension_tools.load();
+        let ext = extension_snapshot
+            .iter()
+            .find(|t| t.name() == tool_name)
+            .ok_or_else(|| ErrorData::invalid_params("tool not found", None))?
+            .clone();
+        drop(extension_snapshot);
+
+        // Извлечь параметры. У extension-tool `args` — это `serde_json::Value`,
+        // который мы передаём в `IndexTool::execute` как есть. Если клиент
+        // не передал arguments — подставляем пустой объект.
+        let args = request
+            .arguments
+            .map(serde_json::Value::Object)
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+        // Параметр `repo` обязателен у всех tools (см. ТЗ). Извлекаем его
+        // из аргументов, чтобы построить ToolContext с правильным RepoEntry.
+        let repo = args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "tool requires 'repo' parameter (string)",
+                    None,
+                )
+            })?
+            .to_string();
+
+        let entry = self.repos.load().get(&repo).cloned().ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("unknown repo '{}'. Available: {:?}", repo, self.repo_aliases()),
+                None,
+            )
+        })?;
+
+        // v0.8.1: federation для extension-tools.
+        //
+        // Если репо remote — форвардим вызов на удалённую ноду через
+        // универсальный route /federate/extension. Удалённый сервер
+        // получит {tool_name, args} и сам найдёт tool в своём
+        // extension_tools snapshot, выполнит и вернёт результат.
+        //
+        // Раньше (до 0.8.1) здесь стоял жёсткий Err «supports only local
+        // repos» — это делало BSL-tools (`get_object_structure` и т.д.)
+        // нерабочими для federation-репо (боевые базы на удалённой ноде).
+        if !entry.is_local {
+            let payload = serde_json::json!({
+                "tool_name": tool_name,
+                "args": args,
+            });
+            let body = crate::federation::dispatcher::dispatch_remote_value(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "extension",
+                payload,
+            )
+            .await;
+            let value: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
+            return self.finish(&session_id, &dedup_scope, Ok(CallToolResult::structured(value)));
+        }
+        let storage = entry.storage_pool();
+        let root_path: Option<&Path> = entry.root_path.as_deref();
+        let language: Option<&str> = entry.language.as_deref();
+
+        let ctx = crate::extension::ToolContext {
+            repo: &repo,
+            root_path,
+            language,
+            storage,
+        };
+
+        // Прогон через `IndexTool::execute` и обёртка результата.
+        let value = ext.execute(args, ctx).await;
+        let r = Ok(CallToolResult::structured(value));
+        self.maybe_cache(
+            &cache_key,
+            repo_opt.as_deref().unwrap_or(""),
+            &r,
+            epoch_before,
+        );
+        self.finish(&session_id, &dedup_scope, r)
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        if let Some(t) = self.tool_router.get(name) {
+            return Some(t.clone());
+        }
+        self.extension_tools
+            .load()
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| extension_tool_to_rmcp(t.as_ref()))
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        // Сохраняем peer этой сессии в self.peer, чтобы потом из
+        // `notify_tools_changed_if_peer()` можно было послать уведомление
+        // (например, после реактивного rebuild на file-watch). Если peer
+        // от предыдущей сессии уже сохранён — заменяем; rmcp гарантирует,
+        // что `on_initialized` приходит на каждую сессию.
+        {
+            let mut guard = self.peer.lock().await;
+            *guard = Some(context.peer.clone());
+        }
+        tracing::info!("client initialized");
+    }
+}
+
+/// Убрать из инструмента plural-параметр массового режима (`names`/`full_names`)
+/// и обрезать фразу про массовый режим из описания — когда инструмента нет в
+/// белом списке `[mcp].mass_mode_tools`. После этого модель не видит опцию
+/// пачки в `tools/list`. Plural-параметры массовых инструментов опциональны,
+/// поэтому из `required` они не удаляются (их там и нет), но на всякий случай
+/// фильтруем и `required`.
+/// Начало фразы про массовый режим в описании инструмента. Обрезка хвоста
+/// описания привязана к этой строке, поэтому она вынесена в одно место: тест
+/// `mass_mode_marker_present_in_descriptions` следит, чтобы описания массовых
+/// инструментов и эта константа не разошлись при переформулировке.
+const MASS_MODE_MARKER: &str = "МАССОВЫЙ РЕЖИМ";
+
+fn strip_mass_mode_param(tool: &mut Tool, plural: &str) {
+    let mut schema = tool.input_schema.as_ref().clone();
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
+        props.remove(plural);
+    }
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|v| v.as_str() != Some(plural));
+    }
+    tool.input_schema = Arc::new(schema);
+    // Фраза про массовый режим всегда в конце описаний массовых инструментов —
+    // обрезаем хвост, чтобы описание не обещало недоступную опцию.
+    if let Some(desc) = tool.description.as_ref() {
+        if let Some(idx) = desc.find(MASS_MODE_MARKER) {
+            let trimmed = desc[..idx].trim_end().to_string();
+            tool.description = Some(std::borrow::Cow::Owned(trimmed));
+        }
+    }
+}
+
+/// Конвертация `IndexTool` (наш trait) в `rmcp::model::Tool` (формат для
+/// `tools/list`). `input_schema` ожидаем как JSON-объект; если пришло не
+/// объект — оборачиваем в пустой объект, чтобы не сломать клиент.
+///
+/// `Tool` помечен `#[non_exhaustive]`, поэтому используем `Tool::default()`
+/// + мутацию полей вместо struct-expression.
+fn extension_tool_to_rmcp(t: &dyn IndexTool) -> Tool {
+    use std::borrow::Cow;
+    let schema = t.input_schema();
+    let schema_obj = match schema {
+        serde_json::Value::Object(map) => map,
+        _ => Default::default(),
+    };
+    let mut tool = Tool::default();
+    tool.name = Cow::Owned(t.name().to_string());
+    tool.description = Some(Cow::Owned(t.description().to_string()));
+    tool.input_schema = Arc::new(schema_obj);
+    tool
+}
+
+// ── Тесты заменяемой таблицы репозиториев ──────────────────────────────────
+
+#[cfg(test)]
+mod repo_snapshot_tests {
+    use super::*;
+
+    fn remote_entry(ip: &str) -> RepoEntry {
+        RepoEntry {
+            root_path: None,
+            storage: None,
+            ip: ip.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
+            is_local: false,
+            language: None,
+            processor: None,
+        }
+    }
+
+    #[test]
+    fn replacement_is_visible_to_existing_server_clone() {
+        let server = CodeIndexServer::with_repos(BTreeMap::from([(
+            "old".to_string(),
+            remote_entry("192.0.2.10"),
+        )]));
+        let existing_session = server.clone();
+
+        server.repos.store(Arc::new(BTreeMap::from([(
+            "new".to_string(),
+            remote_entry("192.0.2.20"),
+        )])));
+
+        assert_eq!(existing_session.repo_aliases(), vec!["new".to_string()]);
+        let entry = existing_session
+            .resolve_repo("new")
+            .expect("новый alias должен быть виден существующему клону");
+        assert_eq!(entry.ip, "192.0.2.20");
+        assert!(existing_session.resolve_repo("old").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolved_entry_survives_removal_from_table() {
+        let root = PathBuf::from("C:/repo-before-swap");
+        let storage = Storage::open_in_memory().expect("тестовая БД");
+        let server = CodeIndexServer::with_storage("kept", root.clone(), storage);
+        let entry = server
+            .resolve_repo("kept")
+            .expect("запись должна разрешиться до подмены");
+
+        server.repos.store(Arc::new(BTreeMap::new()));
+
+        assert_eq!(entry.local_root(), root.as_path());
+        assert!(entry.storage.is_some());
+        entry
+            .storage_pool()
+            .get()
+            .await
+            .expect("пул из принадлежащей копии должен оставаться жив");
+    }
+}
+
+// ── Тесты массового режима ([mcp].mass_mode_tools, v0.28.0) ────────────────
+
+#[cfg(test)]
+mod mass_mode_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn tool_with_plural(name: &str, plural: &str, desc: &str) -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "name": {"type": "string"},
+                plural: {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["repo"]
+        });
+        let map = match schema {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let mut t = Tool::default();
+        t.name = Cow::Owned(name.to_string());
+        t.description = Some(Cow::Owned(desc.to_string()));
+        t.input_schema = Arc::new(map);
+        t
+    }
+
+    #[test]
+    fn strip_removes_plural_keeps_single_and_trims_desc() {
+        let mut t = tool_with_plural(
+            "get_function",
+            "names",
+            "Тело функции по точному имени. МАССОВЫЙ РЕЖИМ: передайте список в 'names'.",
+        );
+        strip_mass_mode_param(&mut t, "names");
+        let props = t
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(!props.contains_key("names"), "plural удалён");
+        assert!(props.contains_key("name"), "одиночный параметр цел");
+        let desc = t.description.as_ref().unwrap();
+        assert!(!desc.contains("МАССОВ"), "фраза обрезана: {desc}");
+        assert!(desc.contains("Тело функции"), "полезная часть описания цела");
+    }
+
+    #[test]
+    fn strip_full_names_for_object_structure() {
+        let mut t = tool_with_plural(
+            "get_object_structure",
+            "full_names",
+            "Структура объекта. МАССОВЫЙ РЕЖИМ: передайте 'full_names'.",
+        );
+        strip_mass_mode_param(&mut t, "full_names");
+        let props = t
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(!props.contains_key("full_names"));
+    }
+
+    #[test]
+    fn apply_empty_disables_all() {
+        let server = CodeIndexServer::with_repos(Default::default()).apply_mass_mode_tools(&[]);
+        assert!(
+            server.mass_mode_tools.is_empty(),
+            "пустой список → массовый режим выключен у всех"
+        );
+    }
+
+    #[test]
+    fn apply_allowlist_sets_membership() {
+        let server = CodeIndexServer::with_repos(Default::default())
+            .apply_mass_mode_tools(&["get_object_structure".to_string()]);
+        assert!(server.mass_mode_tools.contains("get_object_structure"));
+        assert!(!server.mass_mode_tools.contains("get_function"));
+    }
+
+    #[test]
+    fn default_server_has_mass_mode_off() {
+        // Конструктор по умолчанию — массовый режим выключен (дефолт v0.28.0).
+        let server = CodeIndexServer::with_repos(Default::default());
+        assert!(server.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn mass_mode_params_cover_three_tools() {
+        let names: BTreeSet<&str> = MASS_MODE_PARAMS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains("get_function"));
+        assert!(names.contains("get_class"));
+        assert!(names.contains("get_object_structure"));
+        assert_eq!(MASS_MODE_PARAMS.len(), 3);
+    }
+
+    /// M-15: обрезка хвоста описания ищет [`MASS_MODE_MARKER`]. Стоит
+    /// переписать описание другими словами — параметр из схемы уберётся, а
+    /// обещание пачки в описании останется, и модель позовёт недоступный режим.
+    /// Тест держит описания и маркер вместе.
+    #[test]
+    fn mass_mode_marker_present_in_descriptions() {
+        let router = CodeIndexServer::tool_router();
+        for (name, _) in MASS_MODE_PARAMS {
+            // BSL-инструменты приходят из расширения — в core-роутере их нет.
+            let Some(tool) = router.get(name) else { continue };
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains(MASS_MODE_MARKER),
+                "описание '{name}' потеряло маркер '{MASS_MODE_MARKER}' — \
+                 обрезка массового режима перестанет работать: {desc}"
+            );
+        }
+    }
+
+    /// M-13: у ответа пачки должно быть общее `_meta` — объединение зависимых
+    /// файлов и их индексных mtime по всем элементам. Без него запись кэша не
+    /// привязана ни к одному файлу и точечная инвалидация до неё не достаёт.
+    #[test]
+    fn mass_results_carry_merged_meta() {
+        let rows = vec![
+            Ok(serde_json::json!({
+                "result": [{"name": "a"}],
+                "_meta": {
+                    "dependent_files": ["src/one.rs"],
+                    "file_mtimes": {"src/one.rs": 111},
+                },
+            })
+            .to_string()),
+            Ok(serde_json::json!({
+                "result": [{"name": "b"}],
+                "_meta": {
+                    // Второй элемент из того же файла плюс ещё один — в объединении
+                    // повторов быть не должно.
+                    "dependent_files": ["src/one.rs", "src/two.rs"],
+                    "file_mtimes": {"src/one.rs": 111, "src/two.rs": 222},
+                },
+            })
+            .to_string()),
+            Err("storage pool: закрыт".to_string()),
+        ];
+        let out: serde_json::Value =
+            serde_json::from_str(&mass_rows_to_results(rows)).expect("валидный JSON");
+
+        // Порядок и состав элементов не изменились, ошибка осталась на своём месте.
+        let results = out["results"].as_array().expect("массив результатов");
+        assert_eq!(results.len(), 3);
+        assert!(results[0].get("_meta").is_none(), "у элемента служебного поля нет");
+        assert_eq!(results[2]["error"], serde_json::json!("storage pool: закрыт"));
+
+        // Зависимости слиты и дедуплицированы.
+        assert_eq!(
+            out["_meta"]["dependent_files"],
+            serde_json::json!(["src/one.rs", "src/two.rs"])
+        );
+        assert_eq!(out["_meta"]["file_mtimes"]["src/one.rs"], serde_json::json!(111));
+        assert_eq!(out["_meta"]["file_mtimes"]["src/two.rs"], serde_json::json!(222));
+    }
+}
+
+// ── Тесты алиасов параметров ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod param_alias_tests {
+    use super::*;
+
+    #[test]
+    fn function_name_params_accepts_name_and_symbol_aliases() {
+        // Модели часто шлют 'name' в get_callers/get_callees (путают ключ с
+        // get_function). serde-alias принимает его как function_name — иначе
+        // слепой вызов падал «missing field function_name» (потерянный ход).
+        let by_name: FunctionNameParams =
+            serde_json::from_value(serde_json::json!({"repo": "ut", "name": "ПолучитьОписаниеWS"}))
+                .expect("alias 'name' должен приниматься");
+        assert_eq!(by_name.function_name, "ПолучитьОписаниеWS");
+
+        let by_symbol: FunctionNameParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "symbol": "ПолучитьОписаниеWS"}),
+        )
+        .expect("alias 'symbol' должен приниматься");
+        assert_eq!(by_symbol.function_name, "ПолучитьОписаниеWS");
+
+        // Канонический ключ по-прежнему работает.
+        let canon: FunctionNameParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "function_name": "X"}),
+        )
+        .expect("канонический ключ function_name");
+        assert_eq!(canon.function_name, "X");
+    }
+
+    // ── Сведение ключей grep_code/grep_text к одному выражению ──────────────
+
+    // Явное выражение сильнее обоих запасных ключей и не экранируется.
+    #[test]
+    fn regex_сильнее_query_и_pattern() {
+        let got = grep_regex_from_params(
+            Some(r"Функция\s+\w+".to_string()),
+            Some("иначе".to_string()),
+            Some("тоже иначе".to_string()),
+        );
+        assert_eq!(got.as_deref(), Some(r"Функция\s+\w+"));
+    }
+
+    // Пустые (и пробельные) ключи равносильны незаданным — иначе `regex: ""`
+    // маскировал бы заданный `pattern`.
+    #[test]
+    fn пустые_ключи_считаются_незаданными() {
+        assert!(grep_regex_from_params(Some("  ".into()), Some("".into()), None).is_none());
+        assert!(grep_regex_from_params(None, None, None).is_none());
+        let got = grep_regex_from_params(Some("".into()), None, Some("Тест".into()));
+        assert_eq!(got.as_deref(), Some("(?i)Тест"));
+    }
+
+    // `pattern` — буквальная подстрока: спецсимволы экранируются, регистр не
+    // учитывается. Иначе `Модуль.Метод(` падал бы на незакрытой скобке.
+    #[test]
+    fn pattern_экранируется_и_ищется_без_учёта_регистра() {
+        let got = grep_regex_from_params(None, None, Some("Модуль.Метод(".to_string()))
+            .expect("pattern даёт выражение");
+        assert_eq!(got, r"(?i)Модуль\.Метод\(");
+        let re = ::regex::Regex::new(&got).expect("выражение компилируется");
+        assert!(re.is_match("    модуль.метод(Параметр);"));
+        // Точка экранирована — произвольный символ на её месте не подходит.
+        assert!(!re.is_match("МодульXМетод("));
+    }
+
+    // Ключ `pattern` доходит до разбора у обоих инструментов — иначе serde
+    // отбросил бы неизвестное поле, и подсказка «укажите regex» вернулась бы
+    // на осмысленном вызове.
+    #[test]
+    fn grep_params_принимают_pattern() {
+        let code: GrepCodeParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "pattern": "ИмяФункции", "path_glob": "**/*.bsl"}),
+        )
+        .expect("grep_code должен принимать pattern");
+        assert_eq!(code.pattern.as_deref(), Some("ИмяФункции"));
+        assert!(code.regex.is_none());
+
+        let text: GrepTextParams =
+            serde_json::from_value(serde_json::json!({"repo": "ut", "pattern": "ИмяФункции"}))
+                .expect("grep_text должен принимать pattern");
+        assert_eq!(text.pattern.as_deref(), Some("ИмяФункции"));
+    }
+}
+
+// ── Тесты conditional registration ────────────────────────────────────────
+
+#[cfg(test)]
+mod conditional_registration_tests {
+    use super::*;
+    use crate::extension::{LanguageProcessor, ToolContext};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc as StdArc;
+
+    /// Минимальный фейк-tool — только то, что нужно реестру и сборщику
+    /// `collect_extension_tools`. `execute` возвращает пустой JSON.
+    struct FakeBslTool;
+    impl IndexTool for FakeBslTool {
+        fn name(&self) -> &str {
+            "fake_bsl_tool"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn applicable_languages(&self) -> Option<&'static [&'static str]> {
+            Some(&["bsl"])
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: ToolContext<'a>,
+        ) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
+            Box::pin(async { serde_json::json!({}) })
+        }
+    }
+
+    /// Фейковый процессор языка `bsl`, отдающий один фиктивный tool.
+    struct FakeBslProcessor;
+    impl LanguageProcessor for FakeBslProcessor {
+        fn name(&self) -> &str {
+            "bsl"
+        }
+        fn additional_tools(&self) -> Vec<StdArc<dyn IndexTool>> {
+            vec![StdArc::new(FakeBslTool)]
+        }
+    }
+
+    fn dummy_repo(language: Option<&str>) -> RepoEntry {
+        RepoEntry {
+            root_path: None,
+            storage: None,
+            ip: LEGACY_OWN_IP.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
+            is_local: false,
+            language: language.map(String::from),
+            processor: None,
+        }
+    }
+
+    #[test]
+    fn no_active_languages_means_no_extension_tools() {
+        let mut repos = BTreeMap::new();
+        repos.insert("a".to_string(), dummy_repo(Some("python")));
+
+        let mut reg = ProcessorRegistry::new();
+        reg.register(StdArc::new(FakeBslProcessor));
+
+        let server = CodeIndexServer::with_repos_and_registry(repos, reg);
+        // bsl не активен (есть только python-репо), tools нет.
+        assert!(server.active_language_names().contains(&"python".to_string()));
+        assert_eq!(server.extension_tools_count(), 0);
+    }
+
+    #[test]
+    fn bsl_repo_activates_bsl_extension_tools() {
+        let mut repos = BTreeMap::new();
+        repos.insert("ut".to_string(), dummy_repo(Some("bsl")));
+        repos.insert("py".to_string(), dummy_repo(Some("python")));
+
+        let mut reg = ProcessorRegistry::new();
+        reg.register(StdArc::new(FakeBslProcessor));
+
+        let server = CodeIndexServer::with_repos_and_registry(repos, reg);
+        // Активен и bsl, и python.
+        let names = server.active_language_names();
+        assert!(names.contains(&"bsl".to_string()));
+        assert!(names.contains(&"python".to_string()));
+        // BSL-процессор отдал один tool, python-процессора в реестре нет.
+        assert_eq!(server.extension_tools_count(), 1);
+        let snapshot = server.extension_tools.load();
+        assert_eq!(snapshot[0].name(), "fake_bsl_tool");
+    }
+
+    #[test]
+    fn legacy_constructor_has_no_extension_tools() {
+        let mut repos = BTreeMap::new();
+        // language=None — старый путь до auto-detect.
+        repos.insert("ut".to_string(), dummy_repo(None));
+        let server = CodeIndexServer::with_repos(repos);
+        assert!(server.active_language_names().is_empty());
+        assert_eq!(server.extension_tools_count(), 0);
+    }
+
+    #[test]
+    fn extension_tool_to_rmcp_carries_name_and_schema() {
+        let tool = FakeBslTool;
+        let rmcp_tool = extension_tool_to_rmcp(&tool);
+        assert_eq!(rmcp_tool.name, "fake_bsl_tool");
+        assert_eq!(
+            rmcp_tool.description.as_deref(),
+            Some("test"),
+            "description должен быть проброшен"
+        );
+    }
+
+    #[test]
+    fn get_tool_finds_extension_by_name() {
+        // Серверу даётся фейковый bsl-процессор; его tool должен быть
+        // доступен через `get_tool` наравне с core-tools.
+        let mut repos = BTreeMap::new();
+        repos.insert("ut".to_string(), dummy_repo(Some("bsl")));
+
+        let mut reg = ProcessorRegistry::new();
+        reg.register(StdArc::new(FakeBslProcessor));
+
+        let server = CodeIndexServer::with_repos_and_registry(repos, reg);
+        let tool = server.get_tool("fake_bsl_tool");
+        assert!(tool.is_some(), "extension-tool должен находиться по имени");
+
+        // Несуществующее имя — None.
+        assert!(server.get_tool("does_not_exist").is_none());
+
+        // Core-tool тоже должен находиться через тот же API
+        // (один из жёстко прописанных core-tools).
+        assert!(
+            server.get_tool("search_function").is_some(),
+            "core-tool search_function должен оставаться доступным"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_extensions_swaps_active_languages_and_tools() {
+        // Старт: bsl-репо не объявлен (только python).
+        let mut repos = BTreeMap::new();
+        repos.insert("py".to_string(), dummy_repo(Some("python")));
+
+        let mut reg = ProcessorRegistry::new();
+        reg.register(StdArc::new(FakeBslProcessor));
+
+        let server = CodeIndexServer::with_repos_and_registry(repos, reg);
+        assert_eq!(server.extension_tools_count(), 0);
+
+        // Имитация file-watch'а: пришёл новый набор активных языков,
+        // включая bsl.
+        let mut new_set = BTreeSet::new();
+        new_set.insert("python".to_string());
+        new_set.insert("bsl".to_string());
+        server.reload_extensions(new_set).await;
+
+        assert!(server
+            .active_language_names()
+            .contains(&"bsl".to_string()));
+        assert_eq!(
+            server.extension_tools_count(),
+            1,
+            "после rebuild bsl-tool должен появиться"
+        );
+
+        // Возврат к узкому набору — bsl-tool должен исчезнуть.
+        let mut shrunk = BTreeSet::new();
+        shrunk.insert("python".to_string());
+        server.reload_extensions(shrunk).await;
+        assert_eq!(server.extension_tools_count(), 0);
+    }
+}
+
+// ── Тесты политики кэширования (M-7, 0.49.4) ──────────────────────────────
+
+#[cfg(test)]
+mod cache_policy_tests {
+    use super::{extract_inner_value, is_cacheable_tool, is_transient_failure};
+    use serde_json::json;
+
+    /// Служебные отказы отдаются УСПЕШНЫМ результатом, поэтому распознаём их по
+    /// телу: `ToolUnavailable` по полю `status`, ошибки инструментов — по `error`.
+    #[test]
+    fn transient_failures_are_recognized() {
+        for status in [
+            "not_started",
+            "indexing",
+            "error",
+            "daemon_offline",
+            "unknown_repo",
+        ] {
+            let v = json!({ "status": status, "message": "..." });
+            assert!(is_transient_failure(&v), "статус {status} — отказ");
+        }
+        // Ответ инструмента об ошибке.
+        assert!(is_transient_failure(&json!({ "error": "Файл 'x' не найден" })));
+    }
+
+    /// Нормальные ответы под правило не подпадают — иначе кэш перестанет работать.
+    #[test]
+    fn normal_responses_are_not_failures() {
+        // Обычная обёртка данных.
+        assert!(!is_transient_failure(&json!({ "result": [1, 2, 3] })));
+        // Пустой результат — это данные, а не отказ (для него отдельное правило —
+        // короткий срок хранения, а не отказ от кэширования).
+        assert!(!is_transient_failure(&json!({ "result": [], "hint": "0 совпадений" })));
+        // Поле status со значением вне списка отказов.
+        assert!(!is_transient_failure(&json!({ "result": {}, "status": "ok" })));
+        // Плоский ответ stat_file.
+        assert!(!is_transient_failure(&json!({ "path": "a.rs", "exists": true })));
+    }
+
+    /// Содержательная часть достаётся из всех трёх форм ответа.
+    #[test]
+    fn inner_value_extracted_from_three_shapes() {
+        // 1) MCP: вложенный JSON в content[*].text
+        let inner = json!({ "status": "daemon_offline", "message": "демон не доступен" });
+        let mcp = json!({ "content": [{ "type": "text", "text": inner.to_string() }] }).to_string();
+        assert!(is_transient_failure(&extract_inner_value(&mcp).unwrap()));
+
+        // 2) structuredContent
+        let sc = json!({
+            "content": [],
+            "structuredContent": { "error": "storage pool: закрыт" }
+        })
+        .to_string();
+        assert!(is_transient_failure(&extract_inner_value(&sc).unwrap()));
+
+        // 3) плоский объект верхнего уровня
+        let top = json!({ "status": "indexing", "progress": 0.5 }).to_string();
+        assert!(is_transient_failure(&extract_inner_value(&top).unwrap()));
+
+        // Не JSON — None, вызывающая сторона просто не применяет правило.
+        assert!(extract_inner_value("не json").is_none());
+    }
+
+    /// `stat_file` объявлен некэшируемым в комментарии кода, но в списке его не
+    /// было — метаданные файла залипали на весь срок хранения.
+    #[test]
+    fn stat_file_is_not_cacheable() {
+        assert!(!is_cacheable_tool("stat_file"));
+        assert!(!is_cacheable_tool("health"));
+        assert!(!is_cacheable_tool("get_stats"));
+        // Инструменты данных кэшируются как прежде.
+        assert!(is_cacheable_tool("get_function"));
+        assert!(is_cacheable_tool("grep_code"));
+    }
+}
+
+#[cfg(test)]
+mod strip_meta_tests {
+    use super::{extract_meta_obj, meta_dependent_files, strip_meta};
+    use serde_json::json;
+
+    // MCP-форма: `_meta` во вложенном JSON content[*].text — должен сняться,
+    // `result` сохраниться.
+    #[test]
+    fn strips_meta_from_mcp_content_text() {
+        let inner = json!({"result": [1, 2, 3], "_meta": {"dependent_files": ["a.bsl"]}});
+        let payload = json!({
+            "content": [{"type": "text", "text": inner.to_string()}]
+        })
+        .to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(changed, "_meta должен быть снят");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let text = v["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.get("_meta").is_none(), "_meta остался во вложенном JSON");
+        assert_eq!(parsed["result"], json!([1, 2, 3]), "result должен сохраниться");
+    }
+
+    // structuredContent-форма (rmcp structured output, extension-tools): `_meta`
+    // дублируется здесь — тоже снимаем (ловилось на живом get_object_structure).
+    #[test]
+    fn strips_meta_from_structured_content() {
+        let payload = json!({
+            "content": [{"type": "text", "text": "{\"result\":{}}"}],
+            "structuredContent": {"result": {"full_name": "Catalog.X"}, "_meta": {"dependent_files": []}}
+        })
+        .to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(changed);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["structuredContent"].get("_meta").is_none());
+        assert_eq!(v["structuredContent"]["result"]["full_name"], "Catalog.X");
+    }
+
+    // Top-level форма (non-MCP): `_meta` рядом с `result`.
+    #[test]
+    fn strips_top_level_meta() {
+        let payload = json!({"result": [], "_meta": {"dependent_files": ["x"]}}).to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(changed);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("_meta").is_none());
+    }
+
+    // Нет `_meta` → payload не меняется (changed=false), без лишней пересборки.
+    #[test]
+    fn no_meta_is_unchanged() {
+        let payload = json!({"content": [{"type": "text", "text": "{\"result\":[1]}"}]}).to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(!changed, "без _meta changed должен быть false");
+        assert_eq!(out, payload);
+    }
+
+    // Невалидный JSON → возвращаем как есть, не паникуем.
+    #[test]
+    fn invalid_json_is_passthrough() {
+        let (out, changed) = strip_meta("не json");
+        assert!(!changed);
+        assert_eq!(out, "не json");
+    }
+
+    // extract_meta_obj достаёт _meta из всех трёх форм.
+    #[test]
+    fn extract_meta_obj_three_forms() {
+        // 1) MCP content[*].text (вложенный JSON)
+        let inner = json!({"result": [1], "_meta": {"file_mtimes": {"a.bsl": 100}}});
+        let mcp = json!({"content": [{"type": "text", "text": inner.to_string()}]}).to_string();
+        let m = extract_meta_obj(&mcp).expect("content-form _meta");
+        assert_eq!(m["file_mtimes"]["a.bsl"], 100);
+
+        // 2) structuredContent._meta
+        let sc = json!({
+            "content": [{"type": "text", "text": "{\"result\":{}}"}],
+            "structuredContent": {"result": {}, "_meta": {"file_mtimes": {"b.bsl": 200}}}
+        })
+        .to_string();
+        let m = extract_meta_obj(&sc).expect("structuredContent _meta");
+        assert_eq!(m["file_mtimes"]["b.bsl"], 200);
+
+        // 3) top-level _meta
+        let top = json!({"result": [], "_meta": {"file_mtimes": {"c.bsl": 300}}}).to_string();
+        let m = extract_meta_obj(&top).expect("top-level _meta");
+        assert_eq!(m["file_mtimes"]["c.bsl"], 300);
+
+        // нет _meta → None
+        assert!(extract_meta_obj("{\"content\":[]}").is_none());
+        assert!(extract_meta_obj("не json").is_none());
+    }
+
+    // meta_dependent_files читает список файлов-источников.
+    #[test]
+    fn meta_dependent_files_reads_list() {
+        let meta = json!({"dependent_files": ["src/X.bsl", "src/Y.bsl"], "file_mtimes": {}});
+        let deps = meta_dependent_files(&meta);
+        assert_eq!(deps, vec!["src/X.bsl".to_string(), "src/Y.bsl".to_string()]);
+        // нет поля → пусто
+        assert!(meta_dependent_files(&json!({})).is_empty());
+    }
+}

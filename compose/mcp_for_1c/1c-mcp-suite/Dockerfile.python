@@ -1,0 +1,117 @@
+FROM python:3.12-slim
+
+# Чтобы print() в stdout не буферизовался в Docker-логах.
+# Иначе сообщения от start.py (метрики, аудит) не видны до тех пор,
+# пока процесс не завершится (а uvicorn не завершается).
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Зависимости Python
+COPY requirements.txt requirements.lock.txt ./
+# TR-2: ставим из лок-файла, если он заполнен, иначе — по границам.
+# Пустой лок-файл не должен ломать сборку: он всего лишь означает, что
+# лок ещё не собирали (`make lock`, на Windows — `.\scripts\gen_lockfiles.ps1`).
+# Предупреждение в логе сборки видно сразу.
+RUN if grep -qE '^[a-zA-Z]' requirements.lock.txt; then \
+        echo "TR-2: ставим из requirements.lock.txt"; \
+        pip install --no-cache-dir -r requirements.lock.txt; \
+    else \
+        echo "TR-2: requirements.lock.txt пуст — ставим по границам из requirements.txt."; \
+        echo "      Пересборка может дать другие версии. Запустите:"; \
+        echo "        Linux/WSL:   make lock"; \
+        echo "        PowerShell:  .\\scripts\\gen_lockfiles.ps1"; \
+        pip install --no-cache-dir -r requirements.txt; \
+    fi
+
+# Точка входа и общие модули
+COPY start.py                        /app/start.py
+COPY mcp_pagination.py               /app/mcp_pagination.py
+COPY mcp_metrics.py                  /app/mcp_metrics.py
+COPY mcp_cache.py                    /app/mcp_cache.py
+COPY mcp_auth.py                     /app/mcp_auth.py
+# TR-1: общая точка входа Streamable HTTP
+COPY mcp_http.py                     /app/mcp_http.py
+# TOOL-1/TOOL-2/SEC-5: централизованный фильтр набора инструментов
+COPY mcp_tool_filter.py              /app/mcp_tool_filter.py
+# A-2: сверка «вход против выхода». Импортируется из metadata_xml,
+# bsl_parser, graph_writer и indexer — без этой строки индексер падает на
+# импорте при старте. Копируется в ДВА образа (см. Dockerfile.embeddings);
+# расхождение между ними ловит tests_shortfall.py.
+COPY shortfall.py                    /app/shortfall.py
+# OBS-1: единый словарь отказа (answerable / degraded / meaning).
+# Импортируется серверами metadata-graph, query-builder, platform-help и
+# bsl-checker. Копируется в ТРИ образа; расхождение ловит tests_refusal.py.
+COPY refusal.py                      /app/refusal.py
+# TOOL-1: счётчик вызовов инструментов (поле usage в *_stats).
+# Импортируется серверами metadata-graph, platform-help и bsl-checker;
+# копируется в ТРИ образа — расхождение ловит tests_delivery.py.
+COPY tool_usage.py                      /app/tool_usage.py
+# EVAL-7: журнал вызовов инструментов (трасса ручного прогона).
+# Выключен, пока не задан MCP_TOOL_JOURNAL; импортируется теми же
+# серверами, что и tool_usage.py, — расхождение ловит tests_delivery.py.
+COPY tool_journal.py                    /app/tool_journal.py
+# FIX-27: проверка целостности графа (у кода есть владелец или его нет).
+# Импортируется сервером metadata-graph, индексером и apply_changes —
+# без этой строки они падают на импорте при старте.
+COPY graph_integrity.py              /app/graph_integrity.py
+
+# Базовые серверы (metadata-graph: server.py + v3-расширения, индексер: v3)
+COPY mcp-metadata-graph/server.py             /app/mcp_metadata_graph.py
+COPY mcp-metadata-graph/graph_state.py        /app/graph_state.py
+# PERF-6: подготовка полнотекстового запроса. Импортируется из server.py
+# metadata-graph — без этой строки сервер падает на импорте при старте.
+COPY mcp-metadata-graph/search_fulltext.py    /app/search_fulltext.py
+# SCALE-1: границы подсистемы. Импортируется из server.py metadata-graph.
+COPY mcp-metadata-graph/subsystem_scope.py    /app/subsystem_scope.py
+COPY mcp-metadata-graph/server_v3_tools.py    /app/server_v3_tools.py
+COPY mcp-metadata-graph/server_v3_code_tools.py /app/server_v3_code_tools.py
+COPY mcp-metadata-graph/server_v3_watch_tools.py /app/server_v3_watch_tools.py
+COPY mcp-metadata-graph-neo4j/indexer.py      /app/mcp_metadata_indexer.py
+COPY mcp-metadata-graph-neo4j/metadata_xml.py /app/metadata_xml.py
+COPY mcp-metadata-graph-neo4j/graph_writer.py /app/graph_writer.py
+# PERF-5: прогресс-лог долгих этапов. Импортируется из graph_writer,
+# bsl_parser и bsl_resolver — без этой строки индексер падает на импорте
+# при старте. Та же грабля, что с graph_state.py в Заходе 2 и с
+# query_parser.py в Заходе 3: новый модуль появился, COPY забыли.
+COPY mcp-metadata-graph-neo4j/progress_log.py /app/progress_log.py
+# PERF-8: частичный fingerprint — что изменилось в выгрузке с прошлого раза.
+COPY mcp-metadata-graph-neo4j/partial_fingerprint.py /app/partial_fingerprint.py
+COPY mcp-metadata-graph-neo4j/what_changed.py /app/what_changed.py
+COPY mcp-metadata-graph-neo4j/apply_changes.py /app/apply_changes.py
+COPY mcp-metadata-graph-neo4j/bsl_parser.py    /app/bsl_parser.py
+COPY mcp-metadata-graph-neo4j/bsl_resolver.py /app/bsl_resolver.py
+COPY mcp-metadata-graph-neo4j/incremental.py  /app/incremental.py
+# B-6. Здесь была строка `COPY mcp-platform-help/server.py`. Она удалена, а
+# не дополнена, и вот почему.
+#
+# Общая проверка доставки (tests_delivery.py) на первом прогоне сказала:
+# сервер справки импортирует help_ranking, а COPY его в этот образ нет.
+# Первое побуждение — дописать недостающую строку. Оно неверно: в этом
+# образе нет ни qdrant-client, ни sentence-transformers (см.
+# requirements.txt против requirements-embeddings.txt), то есть поднять
+# platform-help отсюда нельзя в принципе. Сервер справки живёт в
+# Dockerfile.embeddings и собирается там со всей своей обвязкой.
+#
+# То есть строка была наследством тех времён, когда образ был один. Вреда
+# от неё не было ровно до тех пор, пока кто-нибудь не попробовал бы
+# запустить справку из этого образа и не получил ImportError вместо
+# внятного «такого сервера здесь нет».
+
+# v2: query-builder
+# FEAT-1/FEAT-2/QOPT-1: парсер и проверка вынесены из server.py отдельными
+# модулями, чтобы их можно было покрыть тестами без FastMCP и Neo4j.
+# Без этих трёх строк сервер падает на импорте при старте — ровно та же
+# грабля, что с graph_state.py в Заходе 2.
+COPY mcp-query-builder/server.py               /app/mcp_query_builder.py
+COPY mcp-query-builder/query_parser.py         /app/query_parser.py
+COPY mcp-query-builder/query_check.py          /app/query_check.py
+COPY mcp-query-builder/query_optimize_rules.py /app/query_optimize_rules.py
+
+# Watcher кодовой базы и XML-метаданных (задача 2.3)
+COPY workspace_watcher.py                /app/workspace_watcher.py
+
+# Каталоги данных
+RUN mkdir -p /data/1c-src /data/platform-help /data/templates
+
+EXPOSE 8001 8003 8009

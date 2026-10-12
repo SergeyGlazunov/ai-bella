@@ -1,0 +1,3008 @@
+// Реализации MCP-инструментов (v0.5+): read-only, с проверкой статуса папки у демона.
+//
+// Multi-repo: каждая функция принимает `&RepoEntry` (конкретный репозиторий, выбранный
+// через `resolve_repo` в mod.rs по параметру `repo`). Диагностические инструменты
+// `get_stats` и `health` принимают весь `&CodeIndexServer`, чтобы собрать сводку
+// по всем подключённым репо.
+//
+// Перед каждым data-tool функция спрашивает у демона статус `root_path` этого репо.
+// Если папка не `Ready` — возвращается `ToolUnavailable` JSON, и реальный запрос
+// к БД не выполняется.
+
+use super::{CodeIndexServer, RepoEntry};
+use crate::daemon_core::client;
+use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
+use crate::storage::models::{CallRecord, ClassRecord, FunctionRecord};
+
+/// Soft-cap: число строк в одном `read_file` (по умолчанию).
+pub(crate) const READ_FILE_SOFT_CAP_LINES: usize = 5_000;
+/// Soft-cap: размер ответа `read_file` в байтах (по умолчанию).
+pub(crate) const READ_FILE_SOFT_CAP_BYTES: usize = 500 * 1024;
+/// Hard-cap: абсолютный максимум для `read_file`, даже с line_start/line_end.
+pub(crate) const READ_FILE_HARD_CAP_BYTES: usize = 2 * 1024 * 1024;
+/// Hard-cap: суммарный размер ответа grep_text/grep_body.
+pub(crate) const GREP_TOTAL_BYTES_CAP: usize = 1 * 1024 * 1024;
+/// Default-limit grep_text если path_glob и language не заданы.
+pub(crate) const GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT: usize = 30;
+/// Default-limit grep_code по числу совпадений, если `limit` не передан.
+/// Занижен до 30 (раньше было 500 с фильтром): по статистике использования
+/// модель сама задаёт limit ~20-40, а 500 раздувал ответ вдвое против нативного
+/// Grep (head_limit 250). При обрезке в ответе выставляется `truncated=true`.
+pub(crate) const GREP_CODE_DEFAULT_LIMIT: usize = 30;
+
+/// Default-cap на размер графа вызовов (get_callers/get_callees) и списков
+/// импортов (get_imports). «Горячая» утилита вызывается из десятков тысяч мест →
+/// без капа ответ раздувается на мегабайты (упор в лимит MCP-результата). При
+/// обрезке в ответ добавляется {truncated, total, limit}. Перекрывается limit=.
+pub(crate) const CALL_GRAPH_DEFAULT_LIMIT: usize = 200;
+pub(crate) const IMPORTS_DEFAULT_LIMIT: usize = 200;
+
+/// Default-limit list_files по числу файлов, если `limit` не передан. При упоре
+/// в потолок ответ помечается `truncated` и несёт общее число файлов (M-12):
+/// раньше обрезка была молчаливой и 500 записей выглядели полным перечнем.
+pub(crate) const LIST_FILES_DEFAULT_LIMIT: usize = 500;
+
+// ── Подсказки на пустой результат ────────────────────────────────────────────
+//
+// По статистике прогона на УТ-11 (анализ сырых транскриптов): при пустом ответе
+// без подсказки модель повторяет тот же неподходящий вызов ×3, не понимая, что
+// инструмент не тот. Поле `hint` рядом с `result` направляет к правильному
+// инструменту (поле добавляется ТОЛЬКО при пустом результате — на непустых
+// форма ответа не меняется, JSON-потребители не ломаются).
+
+/// search_function / search_class вернул 0 — куда идти дальше.
+pub(crate) const HINT_SEARCH_EMPTY: &str = "0 совпадений. Это нечёткий FTS-поиск по словам (OR между словами) в имени/docstring/теле. \
+Для ТОЧНОГО имени символа — get_function/get_class/find_symbol. Для произвольного regex по коду — grep_code(regex=…). \
+Для текста xml/md/yaml — grep_text(regex=…). Попробуйте меньше слов или синонимы.";
+/// search_function вернул 0 на BSL-репо — дополнительно подсказываем search_terms
+/// (термы есть только у BSL; по находке бенча 11.06 модель до него сама не доходит).
+pub(crate) const HINT_SEARCH_EMPTY_BSL: &str = "0 совпадений. search_function ищет по словам, реально встречающимся \
+в имени/docstring/теле функции — он промахивается, если функционал назван по-английски, а ты ищешь русским смыслом, \
+либо словоформа не совпала. ▸ search_terms(query=…) идёт по ДРУГОМУ индексу — триграммному FTS по обогащённым термам, \
+куда механически добавлен СИНОНИМ объекта-владельца (русское представление ↔ английский идентификатор) и комментарий; \
+словоформы/регистр/ё неважны. Поэтому search_terms находит процедуру по смыслу там, где search_function по словам пуст. \
+Дай ему 1-3 слова. Для ТОЧНОГО имени — get_function/find_symbol; regex по коду — grep_code(regex=…).";
+
+/// Выбор hint'а пустого search_function по языку репо (search_terms есть только на BSL).
+pub(crate) fn search_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") {
+        HINT_SEARCH_EMPTY_BSL
+    } else {
+        HINT_SEARCH_EMPTY
+    }
+}
+/// get_function / get_class по точному имени вернул 0.
+pub(crate) const HINT_GET_EMPTY: &str = "0 символов с таким ТОЧНЫМ именем (регистр игнорируется). \
+Для нечёткого поиска по словам — search_function('<слова>') / search_class('<слова>'); универсально (функции+классы+переменные+импорты) — find_symbol('<имя>').";
+
+/// get_callers / get_callees вернул 0 рёбер.
+pub(crate) const HINT_CALL_GRAPH_EMPTY: &str = "0 рёбер в графе вызовов. Имя должно быть ТОЧНЫМ \
+(без скобок и имени модуля-владельца) — проверьте через get_function/find_symbol. \
+Пусто также когда функцию реально никто не вызывает / она ничего не вызывает. \
+ВАЖНО: 0 вызовов ≠ мёртвый код — функция может вызываться ДИНАМИЧЕСКИ \
+(Выполнить/Вычислить со сборкой имени из строк, типовой паттерн диспетчеров) — \
+проверьте grep_code по фрагменту имени: он найдёт и строковые литералы.";
+
+/// get_callers вернул декларативные привязки — записи с полем `kind`.
+pub(crate) const HINT_DECLARATIVE_CALLERS: &str = "Часть записей — декларативные привязки \
+(поле kind): вызова в коде у них нет, процедуру выполняет платформа по записи в описании \
+объекта. Строка привязки — в файле из поля path.";
+
+/// list_files вернул 0 файлов.
+pub(crate) const HINT_LIST_FILES_EMPTY: &str = "0 файлов. pattern — glob от корня репо \
+(например '**/*.bsl', '**/Documents/**'). Проверьте path_prefix=/language=; \
+файлы без расширения не индексируются.";
+
+/// get_imports(file_id=…): у файла нет import-конструкций.
+pub(crate) const HINT_IMPORTS_FILE_EMPTY: &str = "0 импортов: в файле нет import-конструкций. \
+Для BSL это норма — в языке нет импортов; зависимости кода — get_callers/get_callees/get_file_summary.";
+
+/// get_imports(module=…): никто не импортирует модуль с таким именем.
+pub(crate) const HINT_IMPORTS_MODULE_EMPTY: &str = "0 импортов. module — ИМЯ импортируемого \
+модуля как в import-операторе ('os', 'serde_json'), НЕ путь к файлу. Импорты внутри \
+конкретного файла — get_imports(file_id=…) или get_file_summary(path). Для BSL импортов \
+нет в принципе — зависимости через get_callers/get_callees.";
+
+/// get_function/get_class: совпадений больше порога MULTI_DEF_THRESHOLD — тела опущены
+/// (иначе на горячем имени ответ раздувается телами всех совпадений до сотен K токенов).
+pub(crate) const HINT_GET_MULTI: &str = "Совпадений больше порога — тела опущены, показаны локации \
+(имя/путь/строки/сигнатура). Тело конкретного — ОБЯЗАТЕЛЬНО get_function/get_class с path_glob \
+к нужному файлу (read_file для тел функций запрещён — перегружает контекст). Навигация без тел — find_symbol.";
+
+/// Порог числа одноимённых определений, выше которого get_function/get_class
+/// опускают тела и возвращают локации (защита от взрыва токенов на горячих именах).
+pub(crate) const MULTI_DEF_THRESHOLD: usize = 5;
+/// Максимум ЛОКАЦИЙ в ответе get_function/get_class(multi)/find_symbol. На
+/// сверхгорячем имени (сотни одноимённых определений) даже локации без тел
+/// раздувают ответ (352 шт ≈ 32K токенов). Показываем первые, число всего — в totals.
+pub(crate) const LOCATION_CAP: usize = 50;
+/// find_symbol вернул 0 по всем категориям.
+pub(crate) const HINT_FIND_SYMBOL_EMPTY: &str = "Символ не найден среди функций/классов/переменных/импортов (точное имя, регистр игнорируется). \
+Для нечёткого поиска по словам — search_function/search_class; по коду — grep_code(regex=…).";
+/// grep_code вернул 0 совпадений.
+pub(crate) const HINT_GREP_CODE_EMPTY: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
+Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
+СТРОГО ЗАПРЕЩАЕТСЯ вызывать grep_code повторно с другими path_glob/language — немедленно меняйте стратегию \
+(search_function/search_class; regex по телам — grep_body). Oversize-файлы пропускаются.";
+/// grep_body вернул 0 совпадений.
+pub(crate) const HINT_GREP_BODY_EMPTY: &str = "0 совпадений в телах функций/классов. \
+Для module-level кода, комментариев и идентификаторов ВНЕ тел — grep_code(regex=…); по xml/md/yaml — grep_text. \
+Параметры: pattern= (подстрока) или regex= (regexp). Проверьте language=. \
+СОСТАВНОЕ имя (Объект.Поле): в коде и особенно в тексте запроса 1С части и точка бывают разорваны \
+переносами/пробелами/символом | — возьмите КОРОТКИЙ якорь (только Объект ИЛИ только Поле) либо \
+regex с гибким пробелом, напр. Объект\\s*\\.\\s*Поле. Тексты запросов внутри строк — это тоже тело, \
+ищите по одному слову, не по всей цепочке.";
+/// grep_text вернул 0 совпадений.
+pub(crate) const HINT_GREP_TEXT_EMPTY: &str = "0 совпадений в text-файлах (md/yaml/json/toml и прочий текст). \
+Для кода .bsl/.py/.rs и т.п. — grep_code(regex=…) или grep_body. Проверьте path_glob=/language=. \
+▸ XML ОБЪЕКТОВ 1С (справочники, документы, регистры, роли, определяемые типы, формы) с 0.51.0 \
+разбирается как КОД — по ним ищет grep_code(regex=…). Здесь же остаются оглавление конфигурации \
+(Configuration.xml) и прочие XML без объекта метаданных.";
+/// search_text вернул 0 совпадений.
+pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str = "0 совпадений в text-файлах. Это нечёткий FTS-поиск по словам. \
+Для regex по тексту — grep_text(regex=…); для кода — grep_code(regex=…)/grep_body.";
+
+// ── BSL-варианты пустых hint'ов поиска процедур (бенч 11.06) ────────────────
+// Пустой поиск процедуры по имени/тексту на BSL-репо часто означает, что код
+// живёт в общем модуле БСП и привязан подпиской — точный поиск его не находит.
+// Хвост `▸ search_terms…` приклеен к каждому такому пустому ответу (НЕ только
+// первому: hint выдаётся всякий раз, когда результат пуст), чтобы оборвать
+// серию слепых grep'ов (наблюдение test03: ходы 17/20/21 ушли вслепую, т.к.
+// пустой grep_body не звал в search_terms). std::concat! требует литералы —
+// поэтому хвост выписан в каждой константе целиком (без внешних крейтов).
+pub(crate) const HINT_GREP_CODE_EMPTY_BSL: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
+Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
+СТРОГО ЗАПРЕЩАЕТСЯ вызывать grep_code повторно с другими path_glob/language — немедленно переходите к search_terms. \
+▸ grep ищет ТОЧНЫЙ текст в файлах — он пуст, если слово в другой форме/регистре или код в общем модуле БСП. \
+search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
+по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точный grep пропускает. Дай 1-3 слова.";
+pub(crate) const HINT_GREP_BODY_EMPTY_BSL: &str = "0 совпадений в телах функций/классов. \
+Для module-level кода, комментариев и идентификаторов ВНЕ тел — grep_code(regex=…); по xml/md/yaml — grep_text. \
+Параметры: pattern= (подстрока) или regex= (regexp). Проверьте language=. \
+СОСТАВНОЕ имя (Объект.Поле): в коде и особенно в тексте запроса 1С части и точка бывают разорваны \
+переносами/пробелами/символом | — возьмите КОРОТКИЙ якорь (только Объект ИЛИ только Поле) либо \
+regex с гибким пробелом, напр. Объект\\s*\\.\\s*Поле. Тексты запросов внутри строк — это тоже тело, \
+ищите по одному слову, не по всей цепочке. \
+▸ grep_body ищет ТОЧНЫЙ текст в телах — он пуст, если слово в другой форме/регистре или код в общем модуле БСП. \
+search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
+по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точный grep пропускает. Дай 1-3 слова.";
+pub(crate) const HINT_FIND_SYMBOL_EMPTY_BSL: &str = "Символ не найден среди функций/классов/переменных/импортов (точное имя, регистр игнорируется). \
+Для нечёткого поиска по словам — search_function/search_class; по коду — grep_code(regex=…). \
+▸ find_symbol ищет ТОЧНОЕ имя символа — он пуст, если функционал назван иначе/в другой словоформе или код в общем модуле БСП. \
+search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
+по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точное имя пропускает. Дай 1-3 слова.";
+
+/// Выбор hint'а пустого grep_code по языку репо.
+pub(crate) fn grep_code_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") { HINT_GREP_CODE_EMPTY_BSL } else { HINT_GREP_CODE_EMPTY }
+}
+/// Выбор hint'а пустого grep_body по языку репо.
+pub(crate) fn grep_body_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") { HINT_GREP_BODY_EMPTY_BSL } else { HINT_GREP_BODY_EMPTY }
+}
+/// Выбор hint'а пустого find_symbol по языку репо.
+pub(crate) fn find_symbol_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") { HINT_FIND_SYMBOL_EMPTY_BSL } else { HINT_FIND_SYMBOL_EMPTY }
+}
+
+/// Сериализовать `ToolUnavailable` в JSON-строку.
+pub fn format_unavailable(value: ToolUnavailable) -> String {
+    match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(e) => format!("{{\"status\":\"error\",\"message\":\"Сериализация: {}\"}}", e),
+    }
+}
+
+/// Проверить у демона статус папки репо. `None` — папка Ready, можно продолжать.
+/// `Some(json)` — нужно отдать клиенту этот ToolUnavailable-ответ вместо данных.
+pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
+    let root = entry.local_root();
+    match client::path_status_async(root).await {
+        Ok(resp) => match resp.status {
+            PathStatus::Ready => None,
+            PathStatus::InitialIndexing | PathStatus::ReindexingBatch => Some(format_unavailable(
+                ToolUnavailable::Indexing {
+                    progress: resp.progress.unwrap_or_default(),
+                    message: match resp.status {
+                        PathStatus::InitialIndexing => "Первичная индексация в процессе".into(),
+                        _ => "Применяется батч изменений".into(),
+                    },
+                },
+            )),
+            PathStatus::NotStarted => Some(format_unavailable(ToolUnavailable::NotStarted {
+                message: format!(
+                    "Путь {} не отслеживается демоном. Добавьте его в daemon.toml и вызовите 'code-index daemon reload'.",
+                    root.display()
+                ),
+            })),
+            PathStatus::Error => Some(format_unavailable(ToolUnavailable::Error {
+                message: resp
+                    .error
+                    .unwrap_or_else(|| "Неизвестная ошибка индексации".into()),
+            })),
+        },
+        Err(e) => Some(format_unavailable(ToolUnavailable::DaemonOffline {
+            message: format!(
+                "Демон code-index не доступен ({}). Запустите 'code-index daemon run' или Scheduled Task / systemd user unit.",
+                e
+            ),
+        })),
+    }
+}
+
+/// Макрос-хелпер: если папка не Ready — вернуть unavailable JSON немедленно.
+macro_rules! bail_if_not_ready {
+    ($entry:expr) => {{
+        if let Some(json) = crate::mcp::tools::check_path_status($entry).await {
+            return json;
+        }
+    }};
+}
+
+/// Макрос-хелпер: взять read-only соединение из пула репо. При ошибке открытия
+/// (битый/недоступный файл индекса) — немедленно вернуть error-JSON. Заменяет
+/// прежний `entry.local_storage().lock().await` (один мьютекс → пул соединений).
+macro_rules! acquire_storage {
+    ($entry:expr) => {
+        match $entry.storage_pool().get().await {
+            Ok(s) => s,
+            Err(e) => return format!("{{\"error\": \"storage pool: {}\"}}", e),
+        }
+    };
+}
+
+/// Конкуррентное исполнение mass-mode (`names[]`/`full_names[]`): на каждый
+/// элемент — checkout соединения из пула + `spawn_blocking` (rusqlite синхронный,
+/// блокировать общий async-runtime нельзя). Параллелизм естественно ограничен
+/// семафором пула (`max_size`). Порядок результатов = порядок `items`: задачи
+/// запускаются конкуррентно, а handles собираются последовательно.
+pub async fn mass_map<T, R, F>(
+    pool: &std::sync::Arc<crate::storage::StoragePool>,
+    items: Vec<T>,
+    f: F,
+) -> Vec<Result<R, String>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(&crate::storage::Storage, T) -> R + Send + Sync + 'static,
+{
+    let f = std::sync::Arc::new(f);
+    let handles: Vec<_> = items
+        .into_iter()
+        .map(|it| {
+            let pool = pool.clone();
+            let f = f.clone();
+            tokio::spawn(async move {
+                let storage = pool
+                    .get()
+                    .await
+                    .map_err(|e| format!("storage pool: {}", e))?;
+                tokio::task::spawn_blocking(move || f(&storage, it))
+                    .await
+                    .map_err(|e| format!("task join: {}", e))
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        out.push(match h.await {
+            Ok(r) => r,
+            Err(e) => Err(format!("task join: {}", e)),
+        });
+    }
+    out
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> String {
+    // Второй (помимо `wrap_with_meta_extra`) путь сериализации модель-facing
+    // ответов: stat_file/get_stats/health/local_stats отдают плоский JSON без
+    // `{result, _meta}`-обёртки. Срезаем те же внутренние техполя, чтобы охват
+    // класса A был исчерпывающим (stat_file несёт content_hash/indexed_at).
+    let mut v = match serde_json::to_value(value) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\": \"Сериализация: {}\"}}", e),
+    };
+    strip_plumbing_recursive(&mut v);
+    serde_json::to_string(&v).unwrap_or_else(|e| format!("{{\"error\": \"Сериализация: {}\"}}", e))
+}
+
+// ── Event-based invalidation helpers (Phase 2) ──────────────────────────────
+
+/// Завернуть результат tool'а в `{result, _meta: {dependent_files: [...]}}`.
+///
+/// Целевой потребитель — `mcp-cache-ci`: при cache-fill он парсит payload и
+/// регистрирует связи `cache_key → file_path` в `reverse_index`. По
+/// последующему `POST /invalidate {file_paths: [...]}` от daemon после
+/// `transaction.commit()` SQLite (этап 3) cache-ci мгновенно сносит ровно те
+/// entries, что зависят от изменённых файлов — не задевая соседних.
+///
+/// `dependent_files` пустой → entry попадёт в кэш без file-зависимостей и будет
+/// чиститься только по TTL (как раньше). Это нормально для tools без явной
+/// привязки к файлам (часть BSL-инструментов).
+///
+/// Дубликаты в `dependent_files` дедуплицируются (HashSet → Vec, без гарантии
+/// порядка — cache-ci порядок не использует).
+///
+/// Дополнительно в `_meta` кладётся `file_mtimes: {<rel_path>: <i64>}` — индексный
+/// mtime (unix-секунды) каждого зависимого файла. Это вход для write-triggered
+/// ленивой ревалидации в `mcp-cache-ci`: прокси сверяет его с observed-mtime из
+/// `mark-dirty` и кладёт ответ в кэш только когда индекс реально догнал диск
+/// (`index_mtime >= observed_mtime`). См. карточку #1471. Файлы, для которых mtime
+/// в индексе отсутствует, просто не попадают в карту (cache-ci трактует это как
+/// «не могу сверить» → продолжает форвардить, пока путь dirty).
+pub(crate) fn wrap_with_meta<T: serde::Serialize>(
+    storage: &crate::storage::Storage,
+    result: &T,
+    dependent_files: Vec<String>,
+) -> String {
+    wrap_with_meta_hint(storage, result, dependent_files, None)
+}
+
+/// Как [`wrap_with_meta`], но с опциональной подсказкой `hint` на верхнем уровне.
+/// Используется, когда результат ПУСТ: модель часто повторяет тот же неподходящий
+/// вызов ×3. На непустом результате `hint=None` — форма ответа не меняется.
+pub(crate) fn wrap_with_meta_hint<T: serde::Serialize>(
+    storage: &crate::storage::Storage,
+    result: &T,
+    dependent_files: Vec<String>,
+    hint: Option<&str>,
+) -> String {
+    let extra = hint.map(|h| serde_json::json!({ "hint": h }));
+    wrap_with_meta_extra(storage, result, dependent_files, extra)
+}
+
+/// Базовая обёртка `{result, _meta, <extra…>}`. `extra` (если задан — объект)
+/// подмешивает свои ключи на верхний уровень рядом с `result`/`_meta`.
+/// Используется для `hint` (пустой результат) и для `{truncated,total,limit}`
+/// (cap на крупных списках — get_callers/get_callees/get_imports).
+pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
+    storage: &crate::storage::Storage,
+    result: &T,
+    dependent_files: Vec<String>,
+    extra: Option<serde_json::Value>,
+) -> String {
+    use std::collections::HashSet;
+    let deps: Vec<String> = dependent_files
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut file_mtimes = serde_json::Map::with_capacity(deps.len());
+    for p in &deps {
+        if let Some(m) = storage.mtime_for_path(p) {
+            file_mtimes.insert(p.clone(), serde_json::json!(m));
+        }
+    }
+    let mut result_value = match serde_json::to_value(result) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\": \"Сериализация result: {}\"}}", e),
+    };
+    // Срез внутренних техполей (класс A: id/хэши/таймстемпы) ДО пристёгивания
+    // `_meta`. Бесполезны модели в любом core-инструменте, амплифицируются
+    // cache_read'ом каждый ход. `_meta` собирается отдельно ниже — не задет.
+    strip_plumbing_recursive(&mut result_value);
+    let mut wrapped = serde_json::json!({
+        "result": result_value,
+        "_meta": { "dependent_files": deps, "file_mtimes": file_mtimes },
+    });
+    if let (Some(serde_json::Value::Object(m)), Some(obj)) = (extra, wrapped.as_object_mut()) {
+        for (k, v) in m {
+            obj.insert(k, v);
+        }
+    }
+    serde_json::to_string(&wrapped)
+        .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
+}
+
+/// Рекурсивно удалить внутренние «плумбинг»-поля из сериализованного результата
+/// ДО пристёгивания `_meta`. Эти 6 ключей (внутренние id, хэши узла/контента/AST,
+/// таймстемп индексации) бесполезны модели в любом core-инструменте и
+/// амплифицируются cache_read'ом каждый ход. Обходит и объекты, и массивы —
+/// верхний уровень многих tool'ов это `Vec<Record>` (get_function/get_class/
+/// get_callers сериализуются в JSON-массив, а не объект). `mtime`/`file_size`
+/// НЕ трогаем намеренно — их смысл несёт stat_file.
+fn strip_plumbing_recursive(v: &mut serde_json::Value) {
+    const PLUMBING_KEYS: [&str; 5] = [
+        "id",
+        "file_id",
+        "node_hash",
+        "content_hash",
+        "indexed_at",
+    ];
+    match v {
+        serde_json::Value::Object(map) => {
+            for k in PLUMBING_KEYS {
+                map.remove(k);
+            }
+            for child in map.values_mut() {
+                strip_plumbing_recursive(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_plumbing_recursive(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Собрать `dependent_files` из vec'а записей через extractor file_id.
+/// Применяется к Vec<FunctionRecord>, Vec<ClassRecord>, Vec<CallRecord> и т.п.
+/// Дубликаты не нужно дедуплицировать здесь — `wrap_with_meta` сам сделает.
+pub(crate) fn collect_paths_via<R>(
+    storage: &crate::storage::Storage,
+    records: &[R],
+    extract: impl Fn(&R) -> i64,
+) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| lookup_path(storage, extract(r)))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+// ── Phase 1 helpers ─────────────────────────────────────────────────────────
+
+/// Скомпилировать образец пути в набор сопоставителей через `globset`.
+/// Применяется к результатам после SQL-выборки в search_*/get_*.
+///
+/// Образец сначала раскрывается тем же способом, что и для SQL-пушдауна
+/// (`storage::expand_glob_variants`: brace-альтернативы `{a,b}` и сегменты
+/// `**/`), и только потом каждый вариант нормализуется под семантику `*`.
+/// Без раскрытия `**/` пост-фильтр терял файлы в корне репозитория так же,
+/// как их терял SQL-фильтр (находка M-6).
+pub(crate) fn build_path_matcher(glob: &str) -> Result<globset::GlobSet, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for variant in crate::storage::expand_glob_variants(glob) {
+        let normalized = crate::storage::normalize_glob(&variant);
+        let compiled = globset::Glob::new(&normalized)
+            .map_err(|e| format!("невалидный glob '{}': {}", glob, e))?;
+        builder.add(compiled);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("невалидный glob '{}': {}", glob, e))
+}
+
+/// Спросить у процессора языка декларативные привязки процедуры — вызовы,
+/// которых нет в графе вызовов кода (обработчик события формы и т.п.).
+/// Для репо без процессора (remote, неизвестный язык) — пусто.
+pub(crate) fn declarative_callers_of(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    function_name: &str,
+) -> Vec<serde_json::Value> {
+    match entry.processor.as_ref() {
+        Some(p) => p.declarative_callers(storage, function_name),
+        None => Vec::new(),
+    }
+}
+
+/// Вызовы с квалификатором от процессора репо (1С). Для репо без процессора — пусто.
+pub(crate) fn qualified_callers_of(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    function_name: &str,
+) -> Vec<CallRecord> {
+    match entry.processor.as_ref() {
+        Some(p) => p.qualified_callers(storage, function_name),
+        None => Vec::new(),
+    }
+}
+
+/// Все вызовы процедуры `caller` из файла `caller_path` с адресом определения
+/// (`ОбработкаОбъект.Метод`), который знает граф вызовов языка процессора.
+/// Для репо без процессора — пустая карта.
+pub(crate) fn bound_callees_of(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    caller_path: &str,
+    caller: &str,
+) -> std::collections::HashMap<String, (String, String)> {
+    match entry.processor.as_ref() {
+        Some(p) => p.bound_callees(storage, caller_path, caller),
+        None => std::collections::HashMap::new(),
+    }
+}
+
+/// Подсказка для поисковых инструментов: найдено одно-два вхождения имени, и
+/// это выглядит как «процедура нигде не используется», хотя у неё есть
+/// декларативная привязка вне кода. Возвращает `None`, если `candidate` — не
+/// голое имя (регулярное выражение со спецсимволами) или привязок нет.
+pub(crate) fn declarative_binding_hint(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    candidate: &str,
+) -> Option<String> {
+    if entry.processor.is_none() || !is_plain_identifier(candidate) {
+        return None;
+    }
+    let found = declarative_callers_of(entry, storage, candidate);
+    let first = found.first()?;
+    // Имя неоднозначно — расширение само назвало следующий шаг (обработчики
+    // конкретной формы), повторять его своими словами незачем.
+    if let Some(next) = first.get("hint").and_then(|v| v.as_str()) {
+        return Some(format!(
+            "У «{}» есть привязка вне кода, вызова в коде нет. {}",
+            candidate, next
+        ));
+    }
+    Some(format!(
+        "У «{}» есть привязка вне кода: процедуру выполняет платформа по записи в описании \
+         объекта, вызова в коде нет. Кто и по какому событию — \
+         get_callers(function_name='{}').",
+        candidate, candidate
+    ))
+}
+
+/// Порог «мало совпадений» для подсказки о декларативных привязках. Одно-два
+/// вхождения имени — типичная картина обработчика: только объявление в модуле.
+/// На массовой выдаче подсказка не нужна и стоила бы лишнего запроса.
+pub(crate) const DECLARATIVE_HINT_MAX_HITS: usize = 3;
+
+/// Голое имя без спецсимволов регулярного выражения: буква/подчёркивание в
+/// начале, дальше буквы, цифры и подчёркивания. Кириллица считается буквой.
+fn is_plain_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Lookup пути по file_id через storage. Любая ошибка/отсутствие → пустая строка
+/// (она не пройдёт ни один matcher, так что результат честно отбросится).
+/// Storage уже заблокирован вызывающей стороной (передаётся через `&MutexGuard`).
+pub(crate) fn lookup_path(
+    storage: &crate::storage::Storage,
+    file_id: i64,
+) -> String {
+    storage
+        .get_path_by_file_id(file_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub(crate) fn matches_with(matcher: &globset::GlobSet, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    matcher.is_match(path)
+}
+
+/// Добавка к ПУСТОМУ ответу поиска (M-8).
+///
+/// `path_glob` в `search_*` фильтрует уже отобранные по релевантности записи:
+/// из индекса берётся `sql_limit` штук, и только потом применяется путь. Если
+/// предвыборка упёрлась в свой потолок, а после фильтрации не осталось ничего —
+/// «пусто» НЕ означает «совпадений нет»: подходящее могло стоять ниже в
+/// ранжировании. Без этой пометки такой ответ неотличим от честного нуля.
+///
+/// Когда потолок не достигнут (или сужения по пути не было) — обычная подсказка.
+fn empty_search_extra(
+    base_hint: &str,
+    has_glob: bool,
+    prefetched: usize,
+    sql_limit: usize,
+) -> serde_json::Value {
+    if has_glob && prefetched >= sql_limit {
+        serde_json::json!({
+            "hint": format!(
+                "{} ▸ ВАЖНО: сужение по path_glob применялось к первым {} записям, \
+                 отобранным по релевантности, и все они отсеялись по пути — \
+                 совпадения могут быть ниже в ранжировании. Уточните query, \
+                 поднимите limit либо возьмите grep_code/grep_text с тем же \
+                 path_glob: они фильтруют путь в самом запросе, а не после выборки.",
+                base_hint, sql_limit
+            ),
+            "prefilter_exhausted": true,
+            "prefetched": prefetched,
+        })
+    } else {
+        serde_json::json!({ "hint": base_hint })
+    }
+}
+
+/// Добавка к НЕПУСТОМУ ответу поиска, когда сужение по пути применялось к
+/// исчерпанной предвыборке (M-11).
+///
+/// [`empty_search_extra`] помечает только пустую выдачу. Но неполнота ничем не
+/// отличается от полноты и когда что-то нашлось: в ответе может оказаться
+/// горстка записей из многих сотен, потому что путь фильтровался ПОСЛЕ выборки
+/// первых `sql_limit` штук по релевантности. Такой ответ выглядит как полный —
+/// на нём строят вывод «в этом каталоге всего N таких функций», который неверен.
+///
+/// Признак кладётся рядом с `result`, а НЕ в `_meta`: служебное поле снимается
+/// с ответа перед отдачей клиенту (`strip_meta` в `CodeIndexServer::finish`),
+/// и всё, что туда положено, до модели не доходит.
+fn prefilter_exhausted_extra(prefetched: usize, sql_limit: usize, shown: usize) -> serde_json::Value {
+    serde_json::json!({
+        "prefilter_exhausted": true,
+        "prefetched": prefetched,
+        "shown": shown,
+        "hint": format!(
+            "ВНИМАНИЕ: показано {} записей, но это НЕ весь результат. Сужение по path_glob \
+             применялось к первым {} записям, отобранным по релевантности, и предвыборка \
+             упёрлась в свой потолок — подходящие совпадения могут быть ниже в ранжировании. \
+             Поднимите limit либо возьмите grep_code/grep_text с тем же path_glob: они \
+             фильтруют путь в самом запросе, а не после выборки.",
+            shown, sql_limit
+        ),
+    })
+}
+
+/// Выбор добавки к ответу поиска с сужением по пути: пусто → подсказка M-8,
+/// непусто на исчерпанной предвыборке → признак неполноты M-11, иначе ничего.
+fn search_extra(
+    base_hint: &str,
+    has_glob: bool,
+    prefetched: usize,
+    sql_limit: usize,
+    shown: usize,
+) -> Option<serde_json::Value> {
+    if shown == 0 {
+        return Some(empty_search_extra(base_hint, has_glob, prefetched, sql_limit));
+    }
+    if has_glob && prefetched >= sql_limit {
+        return Some(prefilter_exhausted_extra(prefetched, sql_limit, shown));
+    }
+    None
+}
+
+/// Приклеить `next_hint` к уже собранному `extra` (или создать новый объект).
+fn merge_next_hint(
+    extra: Option<serde_json::Value>,
+    next_hint: Option<&str>,
+) -> Option<serde_json::Value> {
+    let Some(hint) = next_hint else {
+        return extra;
+    };
+    match extra {
+        None => Some(serde_json::json!({ "next_hint": hint })),
+        Some(serde_json::Value::Object(mut m)) => {
+            m.insert("next_hint".into(), serde_json::json!(hint));
+            Some(serde_json::Value::Object(m))
+        }
+        Some(other) => Some(other),
+    }
+}
+
+// ── Реализации инструментов ─────────────────────────────────────────────────
+
+/// Обрезка docstring для компактных выдач (карта файла, поисковые hit'ы):
+/// схлопывание пробелов + ограничение DOC_CAP символов. Тело символа не входит.
+pub(crate) fn truncate_doc(d: &Option<String>) -> Option<String> {
+    const DOC_CAP: usize = 200;
+    d.as_ref().map(|raw| {
+        let one = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one.chars().count() > DOC_CAP {
+            let cut: String = one.chars().take(DOC_CAP).collect();
+            format!("{cut}…")
+        } else {
+            one
+        }
+    })
+}
+
+/// Облегчённая проекция функции для ПОИСКОВОЙ выдачи (search_function): без тела
+/// (body), docstring обрезан, добавлен file_path. Тело конкретной функции агент
+/// берёт точечным get_function(name)/read_file. Без этого search_function отдавал
+/// до 20 полных тел = 20-45K символов на запрос и раздувал контекст (УТ-11).
+fn function_search_hit(fr: &FunctionRecord, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": fr.name,
+        "qualified_name": fr.qualified_name,
+        "file_path": path,
+        "line_start": fr.line_start,
+        "line_end": fr.line_end,
+        "args": fr.args,
+        "return_type": fr.return_type,
+        "docstring": truncate_doc(&fr.docstring),
+        "override_type": fr.override_type,
+        "override_target": fr.override_target,
+    })
+}
+
+/// Облегчённая проекция класса/структуры для ПОИСКОВОЙ выдачи (search_class):
+/// без тела, docstring обрезан, добавлен file_path.
+fn class_search_hit(cr: &ClassRecord, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": cr.name,
+        "file_path": path,
+        "line_start": cr.line_start,
+        "line_end": cr.line_end,
+        "bases": cr.bases,
+        "docstring": truncate_doc(&cr.docstring),
+    })
+}
+
+pub async fn search_function(
+    entry: &RepoEntry,
+    query: String,
+    limit: Option<usize>,
+    language: Option<String>,
+    path_glob: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(20);
+    // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
+    // потом обрезаем до want. Это компромисс между точностью и нагрузкой.
+    let sql_limit = if path_glob.is_some() {
+        (want.saturating_mul(5)).min(500)
+    } else {
+        want
+    };
+    match storage.search_functions(&query, sql_limit, language.as_deref()) {
+        Ok(mut r) => {
+            // Размер предвыборки ДО сужения по пути — вход для пометки M-8.
+            let prefetched = r.len();
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
+                r.truncate(want);
+            }
+            let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
+            // W-бенч 11.06: на BSL-репо пустой результат ведёт в search_terms.
+            // M-8: плюс признак, что пусто из-за исчерпанной предвыборки.
+            // M-11: и то же самое, когда результат непуст, но неполон.
+            let extra = search_extra(
+                search_empty_hint(entry.language.as_deref()),
+                path_glob.is_some(),
+                prefetched,
+                sql_limit,
+                r.len(),
+            );
+            // Одно-два совпадения по имени процедуры — типичная картина
+            // обработчика: только объявление. Подсказываем про привязку вне кода.
+            let extra = extra.or_else(|| {
+                (r.len() <= DECLARATIVE_HINT_MAX_HITS)
+                    .then(|| declarative_binding_hint(entry, &storage, &query))
+                    .flatten()
+                    .map(|h| serde_json::json!({ "hint": h }))
+            });
+            // Поисковая выдача БЕЗ тел функций: только имя/путь/строки/сигнатура +
+            // обрезанный docstring. Полные тела 20 результатов раздували ответ до
+            // 20-45K символов (слабое место прогона УТ-11). Тело — get_function.
+            let hits: Vec<serde_json::Value> = r
+                .iter()
+                .map(|fr| function_search_hit(fr, &lookup_path(&storage, fr.file_id)))
+                .collect();
+            // BSL: на непустой выдаче сразу указываем следующий эффективный шаг —
+            // иначе модель часто уходит в read_file/grep вместо get_function /
+            // investigate_object.
+            let extra = merge_next_hint(
+                extra,
+                (!hits.is_empty() && entry.language.as_deref() == Some("bsl")).then_some(
+                    "Тело процедуры — get_function(name=…). Обзор объекта-владельца \
+                     (структура+влияние+точки входа) — investigate_object(full_name=… \
+                     или query=подстрока имени). Не читайте тела через read_file.",
+                ),
+            );
+            wrap_with_meta_extra(&storage, &hits, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
+    }
+}
+
+pub async fn search_class(
+    entry: &RepoEntry,
+    query: String,
+    limit: Option<usize>,
+    language: Option<String>,
+    path_glob: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(20);
+    let sql_limit = if path_glob.is_some() {
+        (want.saturating_mul(5)).min(500)
+    } else {
+        want
+    };
+    match storage.search_classes(&query, sql_limit, language.as_deref()) {
+        Ok(mut r) => {
+            // Размер предвыборки ДО сужения по пути — вход для пометки M-8.
+            let prefetched = r.len();
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
+                r.truncate(want);
+            }
+            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            let extra = search_extra(
+                HINT_SEARCH_EMPTY,
+                path_glob.is_some(),
+                prefetched,
+                sql_limit,
+                r.len(),
+            );
+            // Поисковая выдача БЕЗ тел классов: имя/путь/строки/базы + обрезанный
+            // docstring. Тело — get_class/read_file.
+            let hits: Vec<serde_json::Value> = r
+                .iter()
+                .map(|cr| class_search_hit(cr, &lookup_path(&storage, cr.file_id)))
+                .collect();
+            wrap_with_meta_extra(&storage, &hits, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
+    }
+}
+
+/// Навигационный кап тела записи (function/class): если тело длиннее порога
+/// `cap::function_body_cap()` символов — заменить полное тело стабом
+/// «голова + хвост + маркер + точный диапазон строк для read_file» и добавить
+/// поля `body_truncated`/`body_lines_total`/`body_chars_total`. Иначе — запись
+/// как есть. Тело — связный код, поэтому НЕ режем серединой (потеря логики):
+/// голова сохраняет сигнатуру/начало, хвост — финал (часто запись движений),
+/// а полный текст/середина достаются точечным `read_file(line_start..line_end)`.
+/// Цель — не отдавать клиенту громадный tool_result, который harness сбросит в
+/// файл на диск (порог MAX_MCP_OUTPUT_TOKENS).
+fn cap_record_body(
+    mut record: serde_json::Value,
+    body: &str,
+    path: &str,
+    line_start: usize,
+    line_end: usize,
+) -> serde_json::Value {
+    const HEAD_LINES: usize = 60;
+    const TAIL_LINES: usize = 40;
+    let cap = crate::mcp::cap::function_body_cap();
+    let chars = body.chars().count();
+    if cap == 0 || chars <= cap {
+        return record;
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let total = lines.len();
+    // Если строк не больше, чем голова+хвост — усекать нечего (всё равно показали бы целиком).
+    if total <= HEAD_LINES + TAIL_LINES {
+        return record;
+    }
+    let head = lines[..HEAD_LINES].join("\n");
+    let tail = lines[total - TAIL_LINES..].join("\n");
+    let stub = format!(
+        "{head}\n\n…[ТЕЛО УСЕЧЕНО до головы+хвоста: всего {total} строк ({chars} симв.). \
+         Показаны первые {HEAD_LINES} и последние {TAIL_LINES}. Нужен фрагмент середины: \
+         по СМЫСЛУ (надёжнее — работает и без #Область) — grep_body(repo=<этот repo>, \
+         regex=\"<ключевое слово>\", path_glob=\"{path}\", context_lines=20); по СТРОКАМ — \
+         read_file(repo=<этот repo>, path=\"{path}\", line_start={line_start}, \
+         line_end={line_end}) (сузьте диапазон, иначе вернётся всё тело).]…\n\n{tail}"
+    );
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("body".to_string(), serde_json::json!(stub));
+        obj.insert("body_truncated".to_string(), serde_json::json!(true));
+        obj.insert("body_lines_total".to_string(), serde_json::json!(total));
+        obj.insert("body_chars_total".to_string(), serde_json::json!(chars));
+    }
+    record
+}
+
+pub async fn get_function(
+    entry: &RepoEntry,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    get_function_with(&storage, name, path_glob)
+}
+
+/// Sync-ядро get_function: вся работа на уже взятом соединении. Вызывается
+/// inline одиночным путём и из `spawn_blocking` массовым (`mass_map`).
+pub fn get_function_with(
+    storage: &crate::storage::Storage,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
+    match storage.get_function_by_name(&name) {
+        Ok(mut r) => {
+            // Точное совпадение пусто → регистронезависимый fallback (кириллица:
+            // точный поиск побайтовый, регистр не фолдит). Частый класс ошибок
+            // на BSL-репо: lowercase-имя из памяти модели. См. get_function_by_name_ci.
+            if r.is_empty() {
+                if let Ok(ci) = storage.get_function_by_name_ci(&name) {
+                    r = ci;
+                }
+            }
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|fr| matches_with(&matcher, &lookup_path(storage, fr.file_id)));
+            }
+            let deps = collect_paths_via(storage, &r, |fr| fr.file_id);
+            // Горячее имя (много одноимённых определений): тела опускаем — иначе ответ
+            // раздувается телами всех совпадений до сотен K токенов. Возвращаем локации.
+            if r.len() > MULTI_DEF_THRESHOLD {
+                let total = r.len();
+                let hits: Vec<serde_json::Value> = r
+                    .iter()
+                    .take(LOCATION_CAP)
+                    .map(|fr| function_search_hit(fr, &lookup_path(storage, fr.file_id)))
+                    .collect();
+                let extra = serde_json::json!({
+                    "hint": HINT_GET_MULTI,
+                    "total": total,
+                    "shown": hits.len(),
+                    "truncated": total > hits.len(),
+                });
+                return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
+            }
+            if r.is_empty() {
+                // 0 после точного и ci-поиска → did_you_mean с похожими именами
+                // (префикс-LIKE + FTS, ранжирование Левенштейном). Экономит модели
+                // повторные слепые вызовы с вариациями имени.
+                let sugg = storage.suggest_function_names(&name, 5).unwrap_or_default();
+                let mut extra = serde_json::json!({ "hint": HINT_GET_EMPTY });
+                if !sugg.is_empty() {
+                    extra["did_you_mean"] = serde_json::json!(sugg);
+                }
+                return wrap_with_meta_extra(storage, &r, deps, Some(extra));
+            }
+            // Навигационный кап оверсайз-тел (защита от disk-offload у клиента).
+            let records: Vec<serde_json::Value> = r
+                .iter()
+                .map(|fr| {
+                    cap_record_body(
+                        serde_json::to_value(fr).unwrap_or_else(|_| serde_json::json!({})),
+                        &fr.body,
+                        &lookup_path(storage, fr.file_id),
+                        fr.line_start,
+                        fr.line_end,
+                    )
+                })
+                .collect();
+            wrap_with_meta_hint(storage, &records, deps, None)
+        }
+        Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
+    }
+}
+
+pub async fn get_class(
+    entry: &RepoEntry,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    get_class_with(&storage, name, path_glob)
+}
+
+/// Sync-ядро get_class — зеркало [`get_function_with`].
+pub fn get_class_with(
+    storage: &crate::storage::Storage,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
+    match storage.get_class_by_name(&name) {
+        Ok(mut r) => {
+            // Точное совпадение пусто → регистронезависимый fallback (зеркало
+            // get_function_with). См. get_class_by_name_ci.
+            if r.is_empty() {
+                if let Ok(ci) = storage.get_class_by_name_ci(&name) {
+                    r = ci;
+                }
+            }
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|cr| matches_with(&matcher, &lookup_path(storage, cr.file_id)));
+            }
+            let deps = collect_paths_via(storage, &r, |cr| cr.file_id);
+            if r.len() > MULTI_DEF_THRESHOLD {
+                let total = r.len();
+                let hits: Vec<serde_json::Value> = r
+                    .iter()
+                    .take(LOCATION_CAP)
+                    .map(|cr| class_search_hit(cr, &lookup_path(storage, cr.file_id)))
+                    .collect();
+                let extra = serde_json::json!({
+                    "hint": HINT_GET_MULTI,
+                    "total": total,
+                    "shown": hits.len(),
+                    "truncated": total > hits.len(),
+                });
+                return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
+            }
+            if r.is_empty() {
+                // did_you_mean — зеркало get_function_with.
+                let sugg = storage.suggest_class_names(&name, 5).unwrap_or_default();
+                let mut extra = serde_json::json!({ "hint": HINT_GET_EMPTY });
+                if !sugg.is_empty() {
+                    extra["did_you_mean"] = serde_json::json!(sugg);
+                }
+                return wrap_with_meta_extra(storage, &r, deps, Some(extra));
+            }
+            // Навигационный кап оверсайз-тел (защита от disk-offload у клиента).
+            let records: Vec<serde_json::Value> = r
+                .iter()
+                .map(|cr| {
+                    cap_record_body(
+                        serde_json::to_value(cr).unwrap_or_else(|_| serde_json::json!({})),
+                        &cr.body,
+                        &lookup_path(storage, cr.file_id),
+                        cr.line_start,
+                        cr.line_end,
+                    )
+                })
+                .collect();
+            wrap_with_meta_hint(storage, &records, deps, None)
+        }
+        Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
+    }
+}
+
+pub async fn get_callers(
+    entry: &RepoEntry,
+    function_name: String,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    match storage.get_callers(&function_name, language.as_deref()) {
+        Ok(mut r) => {
+            // Вызовы с квалификатором (1С: `Модуль.Метод`, `Справочники.X.Метод`,
+            // `ОбработкаОбъект.Метод` из формы): точный поиск по голому имени их не
+            // видит. Дубли по id отбрасываем, порядок — сначала точные совпадения.
+            if language.as_deref().map_or(true, |l| l == "bsl") {
+                let mut seen: std::collections::HashSet<i64> =
+                    r.iter().filter_map(|c| c.id).collect();
+                for c in qualified_callers_of(entry, &storage, &function_name) {
+                    if c.id.map_or(true, |id| seen.insert(id)) {
+                        r.push(c);
+                    }
+                }
+            }
+            let cap = limit.unwrap_or(CALL_GRAPH_DEFAULT_LIMIT);
+            let total = r.len();
+            let truncated = total > cap;
+            if truncated {
+                r.truncate(cap);
+            }
+            let mut deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            // Обогащаем каждую запись путём файла-источника (file_id → path):
+            // различает одноимённые функции из разных модулей.
+            let mut enriched: Vec<serde_json::Value> = r
+                .iter()
+                .map(|cr| {
+                    serde_json::json!({
+                        "caller": cr.caller,
+                        "callee": cr.callee,
+                        "line": cr.line,
+                        // `file_id` не кладём: общий срез служебных полей
+                        // (strip_plumbing_recursive) всё равно удаляет этот ключ
+                        // перед отдачей — файл-источник несёт `path` (M-9).
+                        "path": lookup_path(&storage, cr.file_id),
+                    })
+                })
+                .collect();
+            // Декларативные привязки: процедуру зовёт платформа по записи в
+            // описании объекта (обработчик события формы), ребра в графе
+            // вызовов кода у неё нет и быть не может. Лимитом не режем —
+            // записей единицы: на неоднозначном имени расширение отдаёт не
+            // список, а одну запись с подсказкой.
+            let declarative = declarative_callers_of(entry, &storage, &function_name);
+            deps.extend(
+                declarative
+                    .iter()
+                    .filter_map(|d| d.get("path").and_then(|v| v.as_str()).map(str::to_string)),
+            );
+            let declarative_count = declarative.len();
+            enriched.extend(declarative);
+
+            let mut extra = serde_json::Map::new();
+            if truncated {
+                extra.insert("truncated".into(), serde_json::json!(true));
+                extra.insert("total".into(), serde_json::json!(total));
+                extra.insert("limit".into(), serde_json::json!(cap));
+                extra.insert("hint".into(), serde_json::json!(
+                    "Показаны первые N вызывателей (горячая функция). Уточните limit= для большего числа или сузьте language=."
+                ));
+            }
+            if declarative_count > 0 {
+                if !extra.contains_key("hint") {
+                    extra.insert("hint".into(), serde_json::json!(HINT_DECLARATIVE_CALLERS));
+                }
+            } else if r.is_empty() {
+                // На пустом результате — hint (модель повторяет тот же вызов).
+                extra.insert("hint".into(), serde_json::json!(HINT_CALL_GRAPH_EMPTY));
+            }
+            let extra = (!extra.is_empty()).then(|| serde_json::Value::Object(extra));
+            wrap_with_meta_extra(&storage, &enriched, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
+    }
+}
+
+pub async fn get_callees(
+    entry: &RepoEntry,
+    function_name: String,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    match storage.get_callees(&function_name, language.as_deref()) {
+        Ok(mut r) => {
+            let cap = limit.unwrap_or(CALL_GRAPH_DEFAULT_LIMIT);
+            let total = r.len();
+            let truncated = total > cap;
+            if truncated {
+                r.truncate(cap);
+            }
+            let mut deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            // Место ОПРЕДЕЛЕНИЯ вызываемой процедуры. Без него модель добирала
+            // его отдельным поиском на каждое имя: в замере 28.08.2026 один
+            // вопрос «что вызывает процедура, с файлами» стоил 25+ лишних
+            // вызовов find_symbol. Разрешаем только однозначные имена — на
+            // тёзках место определения неизвестно, и врать нельзя.
+            // У BSL вызов хранится склеенно (`Модуль.Метод`), поэтому ищем по
+            // последнему сегменту имени.
+            let mut defs: std::collections::HashMap<String, Option<(String, usize)>> =
+                std::collections::HashMap::new();
+            for cr in r.iter() {
+                if defs.contains_key(&cr.callee) {
+                    continue;
+                }
+                // Квалификатор перед точкой — имя модуля (`СтроковыеФункции.Подставить`).
+                // На тёзках из разных модулей он и решает, какое определение наше:
+                // без него однозначных имён в 1С почти не бывает и поле не
+                // появлялось бы никогда.
+                let (module, short) = match cr.callee.rsplit_once('.') {
+                    Some((m, s)) => (Some(m), s.to_string()),
+                    None => (None, cr.callee.clone()),
+                };
+                let candidates = storage.get_function_by_name(&short).unwrap_or_default();
+                let with_paths: Vec<(String, usize)> = candidates
+                    .iter()
+                    .map(|f| (lookup_path(&storage, f.file_id), f.line_start))
+                    .collect();
+                let narrowed: Vec<&(String, usize)> = match module {
+                    Some(m) if !m.is_empty() => with_paths
+                        .iter()
+                        .filter(|(p, _)| p.contains(&format!("/{}/", m)))
+                        .collect(),
+                    _ => with_paths.iter().collect(),
+                };
+                let found = if narrowed.len() == 1 {
+                    Some(narrowed[0].clone())
+                } else {
+                    None
+                };
+                defs.insert(cr.callee.clone(), found);
+            }
+            // Привязки графа спрашиваем ОДИН раз на процедуру-источник: у неё
+            // обычно десятки вызовов с точкой, а отдельный запрос на каждый
+            // вызов стоил тысячи запросов на обходе графа.
+            let mut bound_cache: std::collections::HashMap<
+                (i64, String),
+                std::collections::HashMap<String, (String, String)>,
+            > = std::collections::HashMap::new();
+            // Обогащаем каждую запись путём файла-источника (file_id → path).
+            let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(r.len());
+            for cr in r.iter() {
+                let mut rec = serde_json::json!({
+                    "caller": cr.caller,
+                    "callee": cr.callee,
+                    "line": cr.line,
+                    // `file_id` не кладём: общий срез служебных полей
+                    // (strip_plumbing_recursive) всё равно удаляет этот ключ
+                    // перед отдачей — файл-источник несёт `path` (M-9).
+                    "path": lookup_path(&storage, cr.file_id),
+                });
+                // Граф точнее эвристики по имени, поэтому спрашиваем первым:
+                // вызов с приёмником (`ОбработкаОбъект.Метод`) он уже привязал
+                // к модулю объекта формы.
+                let bound = bound_cache
+                    .entry((cr.file_id, cr.caller.clone()))
+                    .or_insert_with(|| {
+                        bound_callees_of(
+                            entry,
+                            &storage,
+                            &lookup_path(&storage, cr.file_id),
+                            &cr.caller,
+                        )
+                    })
+                    .get(&cr.callee)
+                    .cloned();
+                if let Some((def_path, def_name)) = bound {
+                    if let Some(obj) = rec.as_object_mut() {
+                        // Строка — из определения этой же процедуры в том
+                        // файле, куда указал граф. Не нашлась — путь всё
+                        // равно ставим, а строку не выдумываем.
+                        let def_line = storage
+                            .get_function_by_name(&def_name)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|f| lookup_path(&storage, f.file_id) == def_path)
+                            .map(|f| f.line_start);
+                        obj.insert("callee_path".into(), serde_json::json!(def_path));
+                        if let Some(def_line) = def_line {
+                            obj.insert("callee_line".into(), serde_json::json!(def_line));
+                        }
+                    }
+                    // Строка определения читается из другого файла: без него в
+                    // зависимостях ответ из кэша пережил бы правку этого файла.
+                    deps.push(def_path);
+                } else if let Some(Some((def_path, def_line))) = defs.get(&cr.callee) {
+                    if let Some(obj) = rec.as_object_mut() {
+                        obj.insert("callee_path".into(), serde_json::json!(def_path));
+                        obj.insert("callee_line".into(), serde_json::json!(def_line));
+                    }
+                    deps.push(def_path.clone());
+                }
+                enriched.push(rec);
+            }
+            let extra = if truncated {
+                Some(serde_json::json!({
+                    "truncated": true, "total": total, "limit": cap,
+                    "hint": "Показаны первые N вызываемых. Уточните limit= для большего числа или сузьте language=.",
+                }))
+            } else if r.is_empty() {
+                Some(serde_json::json!({ "hint": HINT_CALL_GRAPH_EMPTY }))
+            } else {
+                None
+            };
+            wrap_with_meta_extra(&storage, &enriched, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
+    }
+}
+
+pub async fn find_path(
+    entry: &RepoEntry,
+    from: String,
+    to: String,
+    max_depth: Option<i64>,
+    language: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let depth = max_depth.unwrap_or(5);
+    let storage = acquire_storage!(entry);
+    // Для 1С вызов с приёмником (`ОбработкаОбъект.Метод`) разворачиваем тем, к
+    // чему его привязал граф, — иначе BFS обрывается на точном сравнении имён.
+    // Проверяем именно язык: процессор есть и у других языков.
+    let bsl_bound = entry.language.as_deref() == Some("bsl")
+        && matches!(language.as_deref(), None | Some("bsl"));
+    let outcome = if bsl_bound {
+        // Привязки берём ЦЕЛИКОМ на процедуру и файл — один запрос на узел
+        // обхода вместо запроса на каждый вызов с точкой.
+        let bound: std::cell::RefCell<
+            std::collections::HashMap<(i64, String), std::collections::HashMap<String, String>>,
+        > = Default::default();
+        storage.find_call_path_with(
+            &from,
+            &to,
+            depth,
+            language.as_deref(),
+            &|file_id, caller, callee| {
+                let mut cache = bound.borrow_mut();
+                let map = cache.entry((file_id, caller.to_string())).or_insert_with(|| {
+                    bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
+                        .into_iter()
+                        .map(|(written, (_, name))| (written, name))
+                        .collect()
+                });
+                map.get(callee).cloned()
+            },
+        )
+    } else {
+        storage.find_call_path(&from, &to, depth, language.as_deref())
+    };
+    match outcome {
+        Ok(outcome) => {
+            let found = outcome.path.is_some();
+            let path = outcome.path.unwrap_or_default();
+            // Зависимые файлы — источники рёбер найденного пути (M-7). Без них
+            // ответ не попадал в обратный индекс и точечной инвалидацией не
+            // вытеснялся: после правки кода обход графа отдавал старую картину.
+            let deps: Vec<String> = path.iter().filter_map(|e| e.path.clone()).collect();
+            let mut result = serde_json::json!({
+                "from": from,
+                "to": to,
+                "found": found,
+                "path": path,
+                "max_depth": depth.clamp(1, 10),
+            });
+            // Обход мог оборваться — тогда «не найден» означает лишь «не
+            // досмотрели». Признаки ставим только на пустом результате: на
+            // найденном пути они ничего не значат.
+            if !found {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("walk_depth_exhausted".to_string(),
+                               serde_json::json!(outcome.depth_exhausted));
+                    if outcome.nodes_capped {
+                        obj.insert("walk_nodes_capped".to_string(), serde_json::json!(true));
+                    }
+                }
+            }
+            // На пустом результате — hint (модель часто повторяет тот же вызов).
+            let hint = (!found).then(|| {
+                if outcome.nodes_capped {
+                    "Обход остановлен на потолке узлов графа — «пути нет» отсюда НЕ следует. \
+                     Сузьте поиск: задайте language= или возьмите более специфичный конец пути."
+                } else if outcome.depth_exhausted {
+                    "Пути в пределах max_depth нет, но обход упёрся в эту границу — \
+                     «пути не существует» отсюда НЕ следует. Увеличьте max_depth."
+                } else {
+                    "Путь не найден: обход исчерпал достижимый подграф целиком (не обрывался). \
+                     Проверьте точные имена функций (get_function) или снимите language=."
+                }
+            });
+            wrap_with_meta_hint(&storage, &result, deps, hint)
+        }
+        Err(e) => format!("{{\"error\": \"find_path: {}\"}}", e),
+    }
+}
+
+pub async fn get_call_tree(
+    entry: &RepoEntry,
+    root: String,
+    direction: Option<String>,
+    max_depth: Option<i64>,
+    max_nodes: Option<i64>,
+    language: Option<String>,
+    max_response_bytes: Option<usize>,
+    repo: &str,
+) -> String {
+    bail_if_not_ready!(entry);
+    // direction: callees|down (что вызывает root, вглубь) | callers|up (кто вызывает root).
+    let down = !matches!(direction.as_deref(), Some("callers") | Some("up"));
+    let depth = max_depth.unwrap_or(3);
+    let cap = max_nodes.unwrap_or(200);
+    let storage = acquire_storage!(entry);
+    // Для 1С дерево строит обход по уровням: вверх добавляет вызовы с
+    // квалификатором, вниз — разворачивает их по привязке графа. Проверяем
+    // именно язык: процессор есть и у других языков, а их дерево строит CTE.
+    let bsl_bound = entry.language.as_deref() == Some("bsl")
+        && matches!(language.as_deref(), None | Some("bsl"));
+    let tree = if bsl_bound {
+        // Привязки берём целиком на процедуру и файл — см. find_path.
+        let bound: std::cell::RefCell<
+            std::collections::HashMap<(i64, String), std::collections::HashMap<String, String>>,
+        > = Default::default();
+        storage.call_tree_walk(
+            &root,
+            down,
+            depth,
+            cap,
+            &|name| qualified_callers_of(entry, &storage, name),
+            &|file_id, caller, callee| {
+                let mut cache = bound.borrow_mut();
+                let map = cache.entry((file_id, caller.to_string())).or_insert_with(|| {
+                    bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
+                        .into_iter()
+                        .map(|(written, (_, name))| (written, name))
+                        .collect()
+                });
+                map.get(callee).cloned()
+            },
+        )
+    } else {
+        storage.get_call_tree(&root, down, depth, cap, language.as_deref())
+    };
+    match tree {
+        Ok((edges, truncated)) => {
+            // Бюджет ответа — своя константа у get_call_tree (см. call_tree_budget),
+            // подсказка бюджет поднять не предлагает. Дальние рёбра, не уместившиеся
+            // в бюджет, отбрасываются; дерево отдаётся только в целом ответе.
+            let budget = call_tree_budget(max_response_bytes);
+            let edges_total = edges.len();
+            // Сколько уровней реально пришло: у горячей процедуры max_nodes
+            // кончается на первом уровне, и совет «меньше уровней» там пуст.
+            let levels = edges.iter().map(|e| e.depth).max().unwrap_or(1);
+            let (edges, tree) = fit_call_tree_to_budget(&root, down, edges, budget);
+            let size_cut = edges.len() < edges_total;
+            // Признак берём до того, как дерево переместится в result: опущенное
+            // дерево отмечаем в ответе, даже если рёбер осталось столько же.
+            let tree_omitted = tree.is_none();
+            let empty = edges.is_empty();
+            // Зависимые файлы — источники рёбер дерева (M-7), см. find_path.
+            let deps: Vec<String> = edges.iter().filter_map(|e| e.path.clone()).collect();
+            let mut result = serde_json::json!({
+                "root": root,
+                "direction": if down { "callees" } else { "callers" },
+                "max_depth": depth.clamp(1, 10),
+                "edge_count": edges.len(),
+                "edges": edges,
+            });
+            // В сокращённом ответе дерева нет: оно повторяет рёбра и занимает
+            // около четверти ответа — место отдано рёбрам.
+            if let Some(t) = tree {
+                result["tree"] = t;
+            }
+            let extra = if size_cut {
+                let d = levels.clamp(1, 10);
+                let mut o = serde_json::json!({
+                    "truncated": true,
+                    "edges_total": edges_total,
+                    "edges_shown": edges.len(),
+                    "hint": call_tree_cut_hint(repo, &root, down, d, edges.len(), edges_total),
+                });
+                if truncated {
+                    o["limit"] = serde_json::json!(cap.clamp(1, 5000));
+                    // Иначе «показано N из max_nodes» читается как полный счёт рёбер.
+                    o["hint"] = serde_json::json!(format!(
+                        "Обход остановлен на max_nodes={}: рёбер в графе больше. {}",
+                        cap.clamp(1, 5000),
+                        call_tree_cut_hint(repo, &root, down, d, edges.len(), edges_total)
+                    ));
+                }
+                Some(o)
+            } else if tree_omitted {
+                if truncated {
+                    Some(serde_json::json!({
+                        "truncated": true,
+                        "limit": cap.clamp(1, 5000),
+                        "tree_omitted": true,
+                        "hint": format!(
+                            "Дерево обрезано по max_nodes. Уменьшите max_depth или увеличьте max_nodes. {}",
+                            CALL_TREE_OMITTED_HINT
+                        ),
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "tree_omitted": true,
+                        "hint": CALL_TREE_OMITTED_HINT,
+                    }))
+                }
+            } else if truncated {
+                Some(serde_json::json!({
+                    "truncated": true,
+                    "limit": cap.clamp(1, 5000),
+                    "hint": "Дерево обрезано по max_nodes. Уменьшите max_depth или увеличьте max_nodes.",
+                }))
+            } else if empty {
+                Some(serde_json::json!({
+                    "hint": "Дерево пустое: у корня нет рёбер в этом направлении. Проверьте точное имя (get_function) или смените direction.",
+                }))
+            } else {
+                None
+            };
+            wrap_with_meta_extra(&storage, &result, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"get_call_tree: {}\"}}", e),
+    }
+}
+
+/// Запас бюджета `get_call_tree` под шапку ответа, служебные поля и подсказку.
+const CALL_TREE_OVERHEAD_BYTES: usize = 2_000;
+
+/// Подсказка `get_call_tree`, когда поле `tree` опущено по размеру ответа.
+const CALL_TREE_OMITTED_HINT: &str = "Поле tree опущено по размеру ответа: все рёбра — в edges, уровень каждого — в depth.";
+
+/// Бюджет ответа `get_call_tree`, когда клиент его не передал. Не больше
+/// серверного бюджета: выключенный конфигом страж (0) остаётся выключенным.
+const CALL_TREE_DEFAULT_BUDGET_BYTES: usize = 48_000;
+
+/// Бюджет одного вызова `get_call_tree` в байтах (0 — не сокращать).
+/// Параметр клиента (кроме 0) разрешается как у остальных инструментов;
+/// без параметра — серверный бюджет, но не больше `CALL_TREE_DEFAULT_BUDGET_BYTES`.
+fn call_tree_budget(requested: Option<usize>) -> usize {
+    let b = crate::mcp::cap::resolve_request_budget(requested);
+    match requested {
+        None | Some(0) => b.applied.min(CALL_TREE_DEFAULT_BUDGET_BYTES),
+        Some(_) => b.applied,
+    }
+}
+
+/// Подсказка сокращённого по размеру ответа `get_call_tree`: как сузить запрос.
+/// Намеренно не предлагает поднять бюджет — это уводит ответ в файл клиента.
+fn call_tree_cut_hint(
+    repo: &str,
+    root: &str,
+    down: bool,
+    depth: i64,
+    shown: usize,
+    total: usize,
+) -> String {
+    let dir = if down { "callees" } else { "callers" };
+    let mut steps: Vec<String> = Vec::new();
+    if depth > 1 {
+        steps.push(format!(
+            "меньше уровней — {}",
+            crate::mcp::cap::next_call_hint(
+                "get_call_tree",
+                &[
+                    ("repo", serde_json::json!(repo)),
+                    ("root", serde_json::json!(root)),
+                    ("direction", serde_json::json!(dir)),
+                    ("max_depth", serde_json::json!(depth - 1)),
+                ],
+            )
+        ));
+    }
+    steps.push("дальние уровни от нужного узла — get_call_tree с root = этот узел из edges".to_string());
+    steps.push("цепочка до конкретной функции — find_path".to_string());
+    steps.push(if down {
+        "все вызываемые одного узла — get_callees с limit".to_string()
+    } else {
+        "все вызывающие одного узла — get_callers с limit".to_string()
+    });
+    format!(
+        "Ответ сокращён по размеру: показано {shown} из {total} рёбер, ближние уровни — первыми; поля tree нет. Сузить запрос: {}.",
+        steps.join("; ")
+    )
+}
+
+/// Уложить рёбра и дерево `get_call_tree` в бюджет `budget` байт.
+///
+/// Уместилось — рёбра, их порядок и дерево не меняются. Не уместилось — рёбра
+/// упорядочиваются по глубине (устойчиво) и берётся наибольшее начало списка,
+/// которое укладывается в бюджет: ближние уровни идут первыми, ребро глубины d+1
+/// не остаётся без рёбер глубины d. Не уместилось вместе с деревом — дерево
+/// опускается, и размер дальше считается по одним рёбрам; если все рёбра без
+/// дерева укладываются, возвращаются все рёбра без дерева. Минимум одно ребро: пустой ответ означал бы «рёбер нет», а не
+/// «не поместилось». `budget == 0` — страж выключен конфигом сервера, ничего не
+/// сокращается.
+fn fit_call_tree_to_budget(
+    root: &str,
+    down: bool,
+    mut edges: Vec<crate::storage::models::CallTreeEdge>,
+    budget: usize,
+) -> (Vec<crate::storage::models::CallTreeEdge>, Option<serde_json::Value>) {
+    let size = |edges: &[crate::storage::models::CallTreeEdge], tree: &serde_json::Value| -> usize {
+        serde_json::to_vec(&serde_json::json!({ "edges": edges, "tree": tree }))
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+    };
+    let tree = build_call_tree_json(root, down, &edges);
+    if budget == 0 || edges.len() <= 1 {
+        return (edges, Some(tree));
+    }
+    let limit = budget.saturating_sub(CALL_TREE_OVERHEAD_BYTES);
+    if size(&edges, &tree) <= limit {
+        return (edges, Some(tree));
+    }
+    edges.sort_by_key(|e| e.depth);
+    let (mut lo, mut hi) = (1usize, edges.len());
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        let fits = serde_json::to_vec(&edges[..mid])
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+            <= limit;
+        if fits {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    edges.truncate(lo);
+    (edges, None)
+}
+
+/// Собрать вложенное дерево `{name, children:[...]}` из плоских рёбер
+/// `get_call_tree`. Обход строго по уровням глубины (ребёнок узла на глубине d —
+/// это ребро глубины d+1 с этим узлом в роли родителя), поэтому дерево не глубже
+/// `max_depth` и циклы невозможны (глубина строго растёт). `down=true` — дети
+/// узла его callee; `down=false` — его caller.
+fn build_call_tree_json(
+    root: &str,
+    down: bool,
+    edges: &[crate::storage::models::CallTreeEdge],
+) -> serde_json::Value {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    // by_depth: глубина → родитель → отсортированное множество (ребёнок, line).
+    let mut by_depth: HashMap<i64, HashMap<&str, BTreeSet<(&str, i64)>>> = HashMap::new();
+    for e in edges {
+        let (parent, child) = if down {
+            (e.caller.as_str(), e.callee.as_str())
+        } else {
+            (e.callee.as_str(), e.caller.as_str())
+        };
+        by_depth
+            .entry(e.depth)
+            .or_default()
+            .entry(parent)
+            .or_default()
+            .insert((child, e.line));
+    }
+    let max_d = edges.iter().map(|e| e.depth).max().unwrap_or(0);
+
+    // expanded: узлы, уже развёрнутые в дереве. Повтор узла (несколько родителей
+    // на разных путях) НЕ разворачивается заново → {name, repeated:true}. Иначе
+    // при большой глубине дерево раздувается экспоненциально дублированием
+    // поддеревьев (get_call_tree callers depth=5 на горячей функции = 178K токенов).
+    fn build(
+        node: &str,
+        depth: i64,
+        max_d: i64,
+        by_depth: &HashMap<i64, HashMap<&str, BTreeSet<(&str, i64)>>>,
+        expanded: &mut HashSet<String>,
+    ) -> serde_json::Value {
+        let first_time = expanded.insert(node.to_string());
+        let mut children = Vec::new();
+        if first_time && depth < max_d {
+            if let Some(kids) = by_depth.get(&(depth + 1)).and_then(|m| m.get(node)) {
+                for (child, line) in kids {
+                    let mut sub = build(child, depth + 1, max_d, by_depth, expanded);
+                    if let Some(obj) = sub.as_object_mut() {
+                        obj.insert("line".to_string(), serde_json::json!(line));
+                    }
+                    children.push(sub);
+                }
+            }
+        }
+        if first_time {
+            serde_json::json!({ "name": node, "children": children })
+        } else {
+            serde_json::json!({ "name": node, "repeated": true })
+        }
+    }
+
+    let mut expanded = HashSet::new();
+    build(root, 0, max_d, &by_depth, &mut expanded)
+}
+
+pub async fn find_symbol(
+    entry: &RepoEntry,
+    name: String,
+    language: Option<String>,
+    path_glob: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    match storage.find_symbol(&name, language.as_deref()) {
+        Ok(mut r) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.functions
+                    .retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
+                r.classes
+                    .retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
+                r.variables
+                    .retain(|vr| matches_with(&matcher, &lookup_path(&storage, vr.file_id)));
+                r.imports
+                    .retain(|ir| matches_with(&matcher, &lookup_path(&storage, ir.file_id)));
+            }
+            let mut deps = collect_paths_via(&storage, &r.functions, |fr| fr.file_id);
+            deps.extend(collect_paths_via(&storage, &r.classes, |cr| cr.file_id));
+            deps.extend(collect_paths_via(&storage, &r.variables, |vr| vr.file_id));
+            deps.extend(collect_paths_via(&storage, &r.imports, |ir| ir.file_id));
+            let empty = r.functions.is_empty()
+                && r.classes.is_empty()
+                && r.variables.is_empty()
+                && r.imports.is_empty();
+            let hint = if empty { Some(find_symbol_empty_hint(entry.language.as_deref())) } else { None };
+            // Навигационная выдача БЕЗ тел (как search_function/search_class): локации символа.
+            // Тело конкретного — get_function/get_class. Иначе на горячем имени find_symbol
+            // раздувался телами всех совпадений (десятки-сотни K токенов).
+            // Cap на ЧИСЛО локаций по каждой категории: на сверхгорячем имени
+            // даже локации без тел раздувают ответ. Показываем первые LOCATION_CAP.
+            let (f_total, c_total, v_total, i_total) =
+                (r.functions.len(), r.classes.len(), r.variables.len(), r.imports.len());
+            let functions: Vec<serde_json::Value> = r
+                .functions
+                .iter()
+                .take(LOCATION_CAP)
+                .map(|fr| function_search_hit(fr, &lookup_path(&storage, fr.file_id)))
+                .collect();
+            let classes: Vec<serde_json::Value> = r
+                .classes
+                .iter()
+                .take(LOCATION_CAP)
+                .map(|cr| class_search_hit(cr, &lookup_path(&storage, cr.file_id)))
+                .collect();
+            let variables: Vec<&_> = r.variables.iter().take(LOCATION_CAP).collect();
+            let imports: Vec<&_> = r.imports.iter().take(LOCATION_CAP).collect();
+            let truncated = f_total > LOCATION_CAP
+                || c_total > LOCATION_CAP
+                || v_total > LOCATION_CAP
+                || i_total > LOCATION_CAP;
+            let mut payload = serde_json::Map::new();
+            payload.insert("functions".into(), serde_json::Value::Array(functions));
+            payload.insert("classes".into(), serde_json::Value::Array(classes));
+            payload.insert(
+                "variables".into(),
+                serde_json::to_value(&variables).unwrap_or(serde_json::Value::Null),
+            );
+            payload.insert(
+                "imports".into(),
+                serde_json::to_value(&imports).unwrap_or(serde_json::Value::Null),
+            );
+            let payload = serde_json::Value::Object(payload);
+            let extra = if let Some(h) = hint {
+                Some(serde_json::json!({ "hint": h }))
+            } else if truncated {
+                Some(serde_json::json!({
+                    "truncated": true,
+                    "shown_cap": LOCATION_CAP,
+                    "totals": { "functions": f_total, "classes": c_total, "variables": v_total, "imports": i_total },
+                    "hint": "Локаций больше cap — показаны первые по каждой категории. Сузьте path_glob к нужному файлу.",
+                }))
+            } else if f_total + c_total + v_total + i_total <= DECLARATIVE_HINT_MAX_HITS {
+                declarative_binding_hint(entry, &storage, &name)
+                    .map(|h| serde_json::json!({ "hint": h }))
+            } else {
+                None
+            };
+            wrap_with_meta_extra(&storage, &payload, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
+    }
+}
+
+pub async fn get_imports(
+    entry: &RepoEntry,
+    file_id: Option<i64>,
+    module: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let cap = limit.unwrap_or(IMPORTS_DEFAULT_LIMIT);
+    let cap_extra = |total: usize| {
+        (total > cap).then(|| serde_json::json!({ "truncated": true, "total": total, "limit": cap }))
+    };
+    if let Some(fid) = file_id {
+        return match storage.get_imports_by_file(fid) {
+            Ok(mut r) => {
+                let extra = cap_extra(r.len()).or_else(|| {
+                    r.is_empty()
+                        .then(|| serde_json::json!({ "hint": HINT_IMPORTS_FILE_EMPTY }))
+                });
+                r.truncate(cap);
+                let deps = collect_paths_via(&storage, &r, |ir| ir.file_id);
+                wrap_with_meta_extra(&storage, &r, deps, extra)
+            }
+            Err(e) => format!("{{\"error\": \"get_imports_by_file: {}\"}}", e),
+        };
+    }
+    if let Some(ref m) = module {
+        return match storage.get_imports_by_module(m, language.as_deref()) {
+            Ok(mut r) => {
+                let extra = cap_extra(r.len()).or_else(|| {
+                    r.is_empty()
+                        .then(|| serde_json::json!({ "hint": HINT_IMPORTS_MODULE_EMPTY }))
+                });
+                r.truncate(cap);
+                let deps = collect_paths_via(&storage, &r, |ir| ir.file_id);
+                wrap_with_meta_extra(&storage, &r, deps, extra)
+            }
+            Err(e) => format!("{{\"error\": \"get_imports_by_module: {}\"}}", e),
+        };
+    }
+    "{\"error\": \"Укажите file_id или module\"}".to_string()
+}
+
+pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    match storage.get_file_summary(&path) {
+        Ok(Some(s)) => {
+            // Это КАРТА/оглавление файла, а не исходник: тела функций/классов
+            // НЕ включаем. На больших BSL-модулях (десятки тысяч строк) полный
+            // summary с телами раздувал ответ до мегабайт и упирался в лимит
+            // одного MCP-результата — слабое место #4 прогона УТ-11
+            // («get_file_summary ОШИБКА на больших модулях»). docstring
+            // обрезаем. Тело конкретной функции — get_function(name)
+            // (read_file для тел методов не рекомендуется — перегружает контекст).
+            //
+            // Зависимость одна и явная — путь из args; при изменении файла сюда
+            // придёт invalidate от daemon.
+            // docstring обрезаем общим helper'ом truncate_doc (см. выше).
+            // На гигантских модулях 1С (ОбщегоНазначения, ПроведениеДокументов —
+            // сотни процедур) даже карта без тел раздувается до 22-34K символов
+            // (слабое место прогона УТ-11). Выше порога — компактная форма: только
+            // имя + строки + признак переопределения, без сигнатур и docstring.
+            // Все имена видны (навигация сохранена); детали/тело — get_function.
+            const MAP_DETAIL_CAP: usize = 120;
+            let compact_fn = s.functions.len() > MAP_DETAIL_CAP;
+            let compact_cls = s.classes.len() > MAP_DETAIL_CAP;
+            let functions: Vec<serde_json::Value> = s
+                .functions
+                .iter()
+                .map(|f| {
+                    if compact_fn {
+                        serde_json::json!({
+                            "name": f.name,
+                            "line_start": f.line_start,
+                            "line_end": f.line_end,
+                            "override_type": f.override_type,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "name": f.name,
+                            "qualified_name": f.qualified_name,
+                            "line_start": f.line_start,
+                            "line_end": f.line_end,
+                            "args": f.args,
+                            "return_type": f.return_type,
+                            "is_async": f.is_async,
+                            "docstring": truncate_doc(&f.docstring),
+                            "override_type": f.override_type,
+                            "override_target": f.override_target,
+                        })
+                    }
+                })
+                .collect();
+            let classes: Vec<serde_json::Value> = s
+                .classes
+                .iter()
+                .map(|c| {
+                    if compact_cls {
+                        serde_json::json!({
+                            "name": c.name,
+                            "line_start": c.line_start,
+                            "line_end": c.line_end,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "name": c.name,
+                            "bases": c.bases,
+                            "line_start": c.line_start,
+                            "line_end": c.line_end,
+                            "docstring": truncate_doc(&c.docstring),
+                        })
+                    }
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "file": s.file,
+                "functions": functions,
+                "functions_total": s.functions.len(),
+                "classes": classes,
+                "classes_total": s.classes.len(),
+                "imports": s.imports,
+                "variables": s.variables,
+                "note": if compact_fn || compact_cls {
+                    "большой модуль: компактная карта (только имена+строки); для чтения тела метода ОБЯЗАТЕЛЬНО get_function(name). read_file для функций запрещён (перегружает контекст); read_file — только для кода вне функций/классов"
+                } else {
+                    "карта файла без тел функций/классов; для чтения тела метода ОБЯЗАТЕЛЬНО используйте get_function(name). Использование read_file(line_start, line_end) для функций сильно расходует контекст и не рекомендуется"
+                },
+            });
+            // Core-инструмент сам лимитируется по размеру (cap к core-wrap не
+            // применяется). На гигантских модулях 1С (УправлениеДоступомСлужебный —
+            // сотни процедур) даже компактная карта без тел превышает лимит одного
+            // tool_result у клиента и уходит в disk-offload (поймано прогоном УТ-11,
+            // Q08 RLS: 100 164 симв). Режем самый тяжёлый массив (functions/classes)
+            // до бюджета [mcp].max_response_bytes: остаётся sample + `<ключ>_total`
+            // (исходное число) + `<ключ>_truncated`. Полный перечень не нужен —
+            // конкретную функцию бери get_function(name) / grep_body.
+            let (payload, _capped) =
+                crate::mcp::cap::cap_response(payload, crate::mcp::cap::response_cap());
+            wrap_with_meta(&storage, &payload, vec![path.clone()])
+        }
+        Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
+        Err(e) => format!("{{\"error\": \"get_file_summary: {}\"}}", e),
+    }
+}
+
+/// Статистика по одному репо: читает локальный SQLite. Для remote — паника
+/// (диспатчер не должен сюда попадать). get_stats остаётся диагностическим:
+/// возвращает данные даже если папка не Ready.
+async fn local_stats(alias: &str, entry: &RepoEntry) -> serde_json::Value {
+    let root = entry.local_root();
+    let path_info = client::path_status_async(root).await.ok();
+    let storage = match entry.storage_pool().get().await {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({
+                "repo": alias,
+                "error": format!("storage pool: {}", e),
+                "path": root.display().to_string(),
+            });
+        }
+    };
+    match storage.get_stats() {
+        Ok(mut stats) => {
+            stats.indexing_status = None;
+            serde_json::json!({
+                "repo": alias,
+                "db": stats,
+                "path": root.display().to_string(),
+                "daemon": path_info,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "repo": alias,
+            "error": format!("get_stats: {}", e),
+            "path": root.display().to_string(),
+        }),
+    }
+}
+
+/// Запрос статистики у удалённого serve через `/federate/get_stats` с таймаутом.
+async fn remote_stats(
+    server: &CodeIndexServer,
+    alias: &str,
+    entry: &RepoEntry,
+) -> serde_json::Value {
+    use tokio::time::{timeout, Duration};
+
+    let fut = crate::federation::dispatcher::dispatch_remote_value(
+        &server.clients,
+        &entry.ip,
+        entry.port,
+        "get_stats",
+        serde_json::json!({ "repo": alias }),
+    );
+    let body = match timeout(Duration::from_secs(5), fut).await {
+        Ok(b) => b,
+        Err(_) => {
+            return serde_json::json!({
+                "repo": alias,
+                "ip": entry.ip,
+                "status": "unreachable",
+                "error": "timeout 5s",
+            });
+        }
+    };
+    // Удалённый сервер отвечает строкой JSON (тот же формат, что local_stats).
+    // Если парсинг падает — остаётся хотя бы raw для диагностики.
+    serde_json::from_str::<serde_json::Value>(&body).unwrap_or_else(|_| {
+        serde_json::json!({
+            "repo": alias,
+            "ip": entry.ip,
+            "status": "parse_error",
+            "raw": body,
+        })
+    })
+}
+
+/// Диспатч одного запроса по `repo` (с учётом is_local). Используется и через
+/// MCP-tool, и через `/federate/get_stats` для конкретного алиаса.
+pub async fn one_stats(
+    server: &CodeIndexServer,
+    alias: &str,
+    entry: &RepoEntry,
+) -> serde_json::Value {
+    if entry.is_local {
+        local_stats(alias, entry).await
+    } else {
+        remote_stats(server, alias, entry).await
+    }
+}
+
+pub(crate) async fn stats_for_entry(
+    server: &CodeIndexServer,
+    alias: &str,
+    entry: &RepoEntry,
+) -> String {
+    to_json(&one_stats(server, alias, entry).await)
+}
+
+/// Полная сводка: для одного `repo` или fan-out по всем подключённым.
+pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String {
+    if let Some(alias) = repo {
+        let entry = server.repos.load().get(&alias).cloned();
+        return match entry {
+            Some(entry) => stats_for_entry(server, &alias, &entry).await,
+            None => format_unavailable(ToolUnavailable::UnknownRepo {
+                message: format!(
+                    "Неизвестный repo '{}'. Доступные: {:?}.",
+                    alias,
+                    server.repo_aliases()
+                ),
+            }),
+        };
+    }
+
+    // Fan-out по всем репо. Параллельно через JoinSet, удалённые с таймаутом 5с.
+    let mut set = tokio::task::JoinSet::new();
+    let repos: Vec<_> = server
+        .repos
+        .load()
+        .iter()
+        .map(|(alias, entry)| (alias.clone(), entry.clone()))
+        .collect();
+    for (alias, entry) in repos {
+        let server_clone = server.clone();
+        set.spawn(async move {
+            one_stats(&server_clone, &alias, &entry).await
+        });
+    }
+
+    let mut all = Vec::new();
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(v) => all.push(v),
+            Err(e) => all.push(serde_json::json!({
+                "status": "join_error",
+                "error": e.to_string(),
+            })),
+        }
+    }
+    // JoinSet не сохраняет порядок — сортируем по `repo` для стабильности вывода.
+    all.sort_by(|a, b| {
+        let ka = a.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        let kb = b.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        ka.cmp(kb)
+    });
+    to_json(&serde_json::json!({ "repos": all }))
+}
+
+pub async fn search_text(
+    entry: &RepoEntry,
+    query: String,
+    limit: Option<usize>,
+    language: Option<String>,
+    path_glob: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(20);
+    let sql_limit = if path_glob.is_some() {
+        (want.saturating_mul(5)).min(500)
+    } else {
+        want
+    };
+    match storage.search_text(&query, sql_limit, language.as_deref()) {
+        Ok(mut results) => {
+            // Размер предвыборки ДО сужения по пути — вход для пометки M-8.
+            let prefetched = results.len();
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                results.retain(|(p, _)| matches_with(&matcher, p));
+                results.truncate(want);
+            }
+            let deps: Vec<String> = results.iter().map(|(p, _)| p.clone()).collect();
+            let items: Vec<serde_json::Value> = results
+                .into_iter()
+                .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
+                .collect();
+            let extra = search_extra(
+                HINT_SEARCH_TEXT_EMPTY,
+                path_glob.is_some(),
+                prefetched,
+                sql_limit,
+                items.len(),
+            );
+            wrap_with_meta_extra(&storage, &items, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"search_text: {}\"}}", e),
+    }
+}
+
+pub async fn grep_body(
+    entry: &RepoEntry,
+    pattern: Option<String>,
+    regex: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+    path_glob: Option<String>,
+    context_lines: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    // Если есть либо path_glob, либо context_lines — идём через grep_body_with_options
+    // (он отдаёт флаг обрезки). Иначе старый grep_body для обратной совместимости с
+    // CHANGELOG / тестами; там байтового потолка нет, поэтому truncated выводим из
+    // того, что выборка упёрлась в limit.
+    let ctx = context_lines.unwrap_or(0);
+    let want = limit.unwrap_or(30);
+    let result = if path_glob.is_some() || ctx > 0 {
+        storage.grep_body_with_options(
+            pattern.as_deref(),
+            regex.as_deref(),
+            language.as_deref(),
+            path_glob.as_deref(),
+            want,
+            ctx,
+            GREP_TOTAL_BYTES_CAP,
+        )
+    } else {
+        storage
+            .grep_body(
+                pattern.as_deref(),
+                regex.as_deref(),
+                language.as_deref(),
+                // M-14: берём на одну находку больше потолка. Если лишняя пришла —
+                // совпадений действительно больше и обрезка честная. Раньше признак
+                // выводился из `len >= want` и срабатывал ложно, когда находок
+                // оказалось ровно столько, сколько запросили.
+                want.saturating_add(1),
+            )
+            .map(|mut r| {
+                let truncated = r.len() > want;
+                r.truncate(want);
+                (r, truncated)
+            })
+    };
+    match result {
+        Ok((matches, truncated)) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
+            let shown = matches.len();
+            // Компактная выдача: значение files[path] — массив локаторных строк
+            // "<name> (<kind>) L<start>-<end>: <строки>(+N)" (см. compact_body_matches).
+            let files = compact_body_matches(&matches);
+            let payload = serde_json::json!({
+                "files": files,
+                "shown": shown,
+                "limit": want,
+                "truncated": truncated,
+            });
+            let declarative = (1..=DECLARATIVE_HINT_MAX_HITS)
+                .contains(&shown)
+                .then(|| {
+                    let candidate = regex.as_deref().or(pattern.as_deref()).unwrap_or_default();
+                    declarative_binding_hint(entry, &storage, candidate)
+                })
+                .flatten();
+            let hint = if shown == 0 {
+                Some(grep_body_empty_hint(entry.language.as_deref()))
+            } else {
+                declarative.as_deref()
+            };
+            wrap_with_meta_hint(&storage, &payload, deps, hint)
+        }
+        Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
+    }
+}
+
+// ── Phase 1 tool-handlers ───────────────────────────────────────────────────
+
+pub async fn stat_file(entry: &RepoEntry, path: String) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    // stat_file намеренно НЕ заворачиваем в `_meta` — он non-cacheable по
+    // policy (всегда быстрая прямая выборка, к тому же быстро меняется на
+    // тонких операциях типа `oversize` после реиндексации). Прокси даже не
+    // увидит этот ответ в кэше.
+    match storage.stat_file_meta(&path) {
+        Ok(r) => to_json(&r),
+        Err(e) => format!("{{\"error\": \"stat_file: {}\"}}", e),
+    }
+}
+
+pub async fn list_files(
+    entry: &RepoEntry,
+    pattern: Option<String>,
+    path_prefix: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(LIST_FILES_DEFAULT_LIMIT);
+    match storage.list_files_filtered(
+        pattern.as_deref(),
+        path_prefix.as_deref(),
+        language.as_deref(),
+        want,
+    ) {
+        Ok(r) => {
+            let deps: Vec<String> = r.iter().map(|lf| lf.path.clone()).collect();
+            // Компактная выдача: каждый файл — строка "path | lang | N lines | size"
+            // (mtime не дублируем — он в _meta.file_mtimes).
+            let listed = compact_listed_files(&r);
+            // M-12: выборка упёрлась в свой потолок — значит список, возможно,
+            // неполон. Узнаём, сколько файлов подходит под фильтры на самом деле,
+            // и говорим об этом. Лишний проход по таблице делается ТОЛЬКО здесь:
+            // если нашлось меньше потолка, ответ заведомо полон.
+            let extra = if r.len() >= want {
+                let total = storage
+                    .count_files_filtered(
+                        pattern.as_deref(),
+                        path_prefix.as_deref(),
+                        language.as_deref(),
+                    )
+                    .unwrap_or(r.len());
+                (total > r.len()).then(|| {
+                    serde_json::json!({
+                        "truncated": true,
+                        "total": total,
+                        "shown": r.len(),
+                        "limit": want,
+                        // Подсказка в момент неверного пути: перебор списков ради
+                        // подсчёта — самый дорогой из наблюдавшихся сценариев
+                        // (замер 28.08.2026: 90 вызовов list_files подряд там,
+                        // где ответ даёт один запрос с группировкой).
+                        "hint": "Показаны первые файлы по алфавиту — это НЕ весь список. \
+                                 Поднимите limit= либо сузьте pattern=/path_prefix=/language=. \
+                                 Если считаете количество (сколько объектов какого вида, сколько \
+                                 модулей или форм) — НЕ листайте страницы: в репозитории 1С это \
+                                 один запрос bsl_sql с GROUP BY по metadata_objects / \
+                                 metadata_modules / metadata_forms.",
+                    })
+                })
+            } else if r.is_empty() {
+                Some(serde_json::json!({ "hint": HINT_LIST_FILES_EMPTY }))
+            } else {
+                None
+            };
+            wrap_with_meta_extra(&storage, &listed, deps, extra)
+        }
+        Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
+    }
+}
+
+pub async fn read_file(
+    entry: &RepoEntry,
+    path: String,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    match storage.read_file_text(
+        &path,
+        line_start,
+        line_end,
+        READ_FILE_SOFT_CAP_LINES,
+        READ_FILE_SOFT_CAP_BYTES,
+        READ_FILE_HARD_CAP_BYTES,
+        // size_limit_bytes для hint в oversize-ответе. MCP-слой не знает per-repo
+        // лимит daemon'а — передаём None, hint будет короткий «файл превышает лимит».
+        // file_size в ответе всё равно показывается, оператор может сравнить.
+        None,
+    ) {
+        Ok(Some(r)) => wrap_with_meta(&storage, &r, vec![path.clone()]),
+        Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
+        Err(e) => format!("{{\"error\": \"read_file: {}\"}}", e),
+    }
+}
+
+pub async fn grep_text(
+    entry: &RepoEntry,
+    regex: String,
+    path_glob: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or_else(|| {
+        // Без path_glob и language full-scan может быть тяжёлым — занижаем default.
+        if path_glob.is_none() && language.is_none() {
+            GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT
+        } else {
+            100
+        }
+    });
+    match storage.grep_text_filtered(
+        &regex,
+        path_glob.as_deref(),
+        language.as_deref(),
+        want,
+        context_lines.unwrap_or(0),
+        GREP_TOTAL_BYTES_CAP,
+    ) {
+        Ok((matches, truncated, unreadable)) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+            let shown = matches.len();
+            // Компактная выдача: значение files[path] — плоский массив строк
+            // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
+            let files = compact_text_matches(&matches);
+            let mut payload = serde_json::json!({
+                "files": files,
+                "shown": shown,
+                "limit": want,
+                "truncated": truncated,
+            });
+            annotate_unreadable(&mut payload, unreadable);
+            let hint = if shown == 0 { Some(HINT_GREP_TEXT_EMPTY) } else { None };
+            wrap_with_meta_hint(&storage, &payload, deps, hint)
+        }
+        Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
+    }
+}
+
+// ── Компактная сборка выдачи grep_*/list_files (строки вместо объектов) ──
+//
+// Структурный JSON-оверхед (повторяющиеся ключи line/content на каждом из
+// тысяч совпадений) — основная статья расхода токенов. Здесь находки
+// сворачиваются в плоские строки "N: content", сгруппированные по файлу. `_meta`
+// (dependent_files/file_mtimes) собирается отдельно в wrap_with_meta_* и не затрагивается.
+
+/// grep_code/grep_text: значение files[path] — плоский, отсортированный по номеру
+/// строки, дедуплицированный массив строк "N: content". Совпадения и их контекст
+/// сливаются; строка-совпадение перекрывает context-строку с тем же номером.
+fn compact_text_matches(
+    matches: &[crate::storage::models::GrepTextMatch],
+) -> serde_json::Map<String, serde_json::Value> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<String, BTreeMap<usize, String>> = BTreeMap::new();
+    for m in matches {
+        let lines = acc.entry(m.path.clone()).or_default();
+        lines.insert(m.line, m.content.clone());
+        for c in &m.context {
+            lines.entry(c.line).or_insert_with(|| c.content.clone());
+        }
+    }
+    acc.into_iter()
+        .map(|(path, lines)| {
+            let arr: Vec<serde_json::Value> = lines
+                .into_iter()
+                .map(|(n, c)| serde_json::Value::String(format!("{}: {}", n, c)))
+                .collect();
+            (path, serde_json::Value::Array(arr))
+        })
+        .collect()
+}
+
+/// grep_body: значение files[path] — массив строк, по одной на функцию/класс:
+/// "<name> (<kind>) L<start>-<end>: <строки-совпадения>(+N)". При context_lines>0
+/// строки контекста "N: content" дописываются следом (локаторная строка
+/// самоидентифицируется по "(function)"/"(class)").
+fn compact_body_matches(
+    matches: &[crate::storage::models::GrepBodyMatch],
+) -> serde_json::Map<String, serde_json::Value> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for m in matches {
+        let mut mls: String = m
+            .match_lines
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Some(total) = m.match_count {
+            mls.push_str(&format!(" (+{})", total.saturating_sub(m.match_lines.len())));
+        }
+        let locator = format!(
+            "{} ({}) L{}-{}: {}",
+            m.name, m.kind, m.line_start, m.line_end, mls
+        );
+        let arr = acc.entry(m.file_path.clone()).or_default();
+        arr.push(serde_json::Value::String(locator));
+        for c in &m.context {
+            arr.push(serde_json::Value::String(format!("{}: {}", c.line, c.content)));
+        }
+    }
+    acc.into_iter()
+        .map(|(path, arr)| (path, serde_json::Value::Array(arr)))
+        .collect()
+}
+
+/// list_files: каждый файл — строка "<path> | <lang> | <N> lines | <size>".
+/// mtime НЕ включаем — он уже в _meta.file_mtimes (дублировать = лишние токены).
+fn compact_listed_files(
+    files: &[crate::storage::models::ListedFile],
+) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .map(|lf| {
+            let size = lf
+                .size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            serde_json::Value::String(format!(
+                "{} | {} | {} lines | {}",
+                lf.path, lf.language, lf.lines_total, size
+            ))
+        })
+        .collect()
+}
+
+/// grep_code (Phase 2, v0.8.0): regex-поиск по содержимому **code-файлов** через
+/// `file_contents` (zstd). Закрывает слепые зоны `grep_body` (ищет только в телах
+/// функций/классов): module-level код, имена символов как идентификаторы,
+/// комментарии вне тел, макросы, use-импорты. Файлы с `oversize=true` пропускаются —
+/// для них нет content в индексе, нужно увеличить `max_code_file_size_bytes` либо
+/// читать с диска.
+pub async fn grep_code(
+    entry: &RepoEntry,
+    regex: String,
+    path_glob: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(GREP_CODE_DEFAULT_LIMIT);
+    match storage.grep_code_filtered(
+        &regex,
+        path_glob.as_deref(),
+        language.as_deref(),
+        want,
+        context_lines.unwrap_or(0),
+        GREP_TOTAL_BYTES_CAP,
+    ) {
+        Ok((matches, truncated, unreadable)) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+            let shown = matches.len();
+            // Компактная выдача: значение files[path] — плоский массив строк
+            // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
+            let files = compact_text_matches(&matches);
+            let mut payload = serde_json::json!({
+                "files": files,
+                "shown": shown,
+                "limit": want,
+                "truncated": truncated,
+            });
+            annotate_unreadable(&mut payload, unreadable);
+            let declarative = (1..=DECLARATIVE_HINT_MAX_HITS)
+                .contains(&shown)
+                .then(|| declarative_binding_hint(entry, &storage, &regex))
+                .flatten();
+            let hint = if shown == 0 {
+                Some(grep_code_empty_hint(entry.language.as_deref()))
+            } else {
+                declarative.as_deref()
+            };
+            wrap_with_meta_hint(&storage, &payload, deps, hint)
+        }
+        Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
+    }
+}
+
+/// Дописать в ответ поиска признак непрочитанных файлов. Молчаливый пропуск
+/// битого/не-UTF-8 содержимого делал неполную выдачу неотличимой от честного
+/// «ничего не найдено» — при нуле пропусков поле не появляется вовсе.
+fn annotate_unreadable(payload: &mut serde_json::Value, unreadable: usize) {
+    if unreadable == 0 {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("files_unreadable".to_string(), serde_json::json!(unreadable));
+        obj.insert(
+            "files_unreadable_hint".to_string(),
+            serde_json::json!(format!(
+                "{} файл(ов) не прочитано (повреждённое или не-UTF-8 содержимое) — \
+                 результат НЕПОЛНЫЙ. Пустой ответ здесь не означает «совпадений нет».",
+                unreadable
+            )),
+        );
+    }
+}
+
+/// Живость MCP + демон по каждому репо.
+pub async fn health(server: &CodeIndexServer) -> String {
+    let daemon_info = client::runtime_info();
+    let config_reload = server
+        .config_reload
+        .load_full()
+        .map(|result| serde_json::to_value(result.as_ref()).unwrap_or(serde_json::Value::Null));
+    let repo_entries: Vec<_> = server
+        .repos
+        .load()
+        .iter()
+        .map(|(alias, entry)| (alias.clone(), entry.clone()))
+        .collect();
+    let repo_aliases: Vec<_> = repo_entries.iter().map(|(alias, _)| alias.clone()).collect();
+
+    // Сводка по репо: для local — статус пути у демона; для remote —
+    // короткая запись без HTTP-ping (ping вне rc6).
+    let mut repos = Vec::new();
+    for (alias, entry) in repo_entries {
+        if !entry.is_local {
+            repos.push(serde_json::json!({
+                "repo": alias,
+                "ip": entry.ip,
+                "kind": "remote",
+            }));
+            continue;
+        }
+        let root = entry.local_root();
+        let path_status = match client::path_status_async(root).await {
+            Ok(s) => serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        repos.push(serde_json::json!({
+            "repo": alias,
+            "root_path": root.display().to_string(),
+            "path_status": path_status,
+        }));
+    }
+
+    let daemon_health = match daemon_info {
+        Some(_) => serde_json::json!({ "status": "online" }),
+        None => serde_json::json!({
+            "status": "offline",
+            "message": client::daemon_unavailable_hint(),
+        }),
+    };
+
+    let obj = serde_json::json!({
+        "mcp": {
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "repos": repo_aliases,
+        },
+        "daemon": daemon_health,
+        "repos": repos,
+        "config_reload": config_reload,
+    });
+    to_json(&obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{PoolConfig, Storage, StoragePool};
+    use std::time::{Duration, Instant};
+
+    /// M-6: пост-фильтр по образцу пути обязан находить файлы в КОРНЕ репо.
+    /// До правки `**/` схлопывался в `*/`, разделитель оставался обязательным,
+    /// и `CHANGELOG.md` не совпадал — пустая выдача была неотличима от «нет».
+    #[test]
+    fn path_matcher_matches_repository_root() {
+        let m = build_path_matcher("**/*.md").expect("образец должен компилироваться");
+        assert!(matches_with(&m, "CHANGELOG.md"), "файл в корне");
+        assert!(matches_with(&m, "docs/audit.md"), "файл в подкаталоге");
+        assert!(matches_with(&m, "a/b/c/deep.md"), "глубокая вложенность");
+        assert!(!matches_with(&m, "src/main.rs"), "другое расширение");
+        assert!(!matches_with(&m, ""), "пустой путь");
+
+        // Образец с сегментом в середине: обе глубины.
+        let m2 = build_path_matcher("crates/**/mod.rs").expect("образец должен компилироваться");
+        assert!(matches_with(&m2, "crates/mod.rs"), "без промежуточных каталогов");
+        assert!(matches_with(&m2, "crates/core/src/mod.rs"), "с каталогами");
+
+        // Brace-альтернативы вместе с `**/` — и корень, и вложенность.
+        let m3 = build_path_matcher("**/*.{md,toml}").expect("образец должен компилироваться");
+        assert!(matches_with(&m3, "Cargo.toml"), "корневой toml");
+        assert!(matches_with(&m3, "crates/core/Cargo.toml"), "вложенный toml");
+    }
+
+    /// M-8: пустая выдача поиска, где сужение по пути съело всю предвыборку,
+    /// помечается отдельно — иначе она неотличима от честного «совпадений нет».
+    #[test]
+    fn empty_search_extra_marks_exhausted_prefilter() {
+        // Предвыборка упёрлась в потолок, после фильтра пусто → пометка есть.
+        let v = empty_search_extra("база", true, 100, 100);
+        assert_eq!(v["prefilter_exhausted"], serde_json::json!(true));
+        assert_eq!(v["prefetched"], serde_json::json!(100));
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.starts_with("база"), "исходная подсказка сохранена");
+        assert!(hint.contains("path_glob"), "объяснено, почему пусто");
+
+        // Потолок не достигнут — значит отсеял действительно путь, пометки нет.
+        let v2 = empty_search_extra("база", true, 7, 100);
+        assert!(v2.get("prefilter_exhausted").is_none());
+        assert_eq!(v2["hint"], serde_json::json!("база"));
+
+        // Без сужения по пути пометка не появляется никогда.
+        let v3 = empty_search_extra("база", false, 100, 100);
+        assert!(v3.get("prefilter_exhausted").is_none());
+    }
+
+    /// M-11: НЕпустая, но неполная выдача помечается так же, как пустая.
+    /// Раньше признак висел на условии «результат пуст», и урезанный ответ
+    /// выглядел как полный.
+    #[test]
+    fn search_extra_marks_incomplete_nonempty_result() {
+        // Предвыборка упёрлась в потолок, после фильтра осталось 12 из многих —
+        // признак обязан быть, несмотря на непустой результат.
+        let v = search_extra("база", true, 100, 100, 12).expect("признак неполноты");
+        assert_eq!(v["prefilter_exhausted"], serde_json::json!(true));
+        assert_eq!(v["prefetched"], serde_json::json!(100));
+        assert_eq!(v["shown"], serde_json::json!(12));
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.contains("НЕ весь результат"), "сказано, что выдача неполна");
+
+        // Потолок не достигнут — выдача честно полная, признака нет.
+        assert!(search_extra("база", true, 7, 100, 7).is_none());
+
+        // Без сужения по пути предвыборки нет вовсе — признака нет.
+        assert!(search_extra("база", false, 100, 100, 20).is_none());
+
+        // Пустой результат по-прежнему идёт через empty_search_extra.
+        let empty = search_extra("база", true, 100, 100, 0).expect("подсказка на пусто");
+        assert_eq!(empty["prefilter_exhausted"], serde_json::json!(true));
+        assert!(empty["hint"].as_str().unwrap().starts_with("база"));
+    }
+
+    /// Срез плумбинга: 5 ключей исчезают на объекте, на элементах массива и
+    /// во вложенности; полезные поля (name/body/path и пр.) сохраняются.
+    #[test]
+    fn strip_plumbing_removes_internal_keys_recursively() {
+        // массив записей (как Vec<FunctionRecord>) + вложенный объект
+        let mut v = serde_json::json!([
+            {
+                "id": 1,
+                "file_id": 42,
+                "node_hash": "abc",
+                "name": "ПолучитьСумму",
+                "body": "тело",
+                "nested": { "node_hash": "z", "content_hash": "c", "keep": 7 }
+            },
+            {
+                "indexed_at": "2026-06-22",
+                "path": "src/x.bsl",
+                "lines_total": 100
+            }
+        ]);
+        strip_plumbing_recursive(&mut v);
+
+        let arr = v.as_array().unwrap();
+        let first = arr[0].as_object().unwrap();
+        // плумбинг срезан
+        for k in ["id", "file_id", "node_hash"] {
+            assert!(!first.contains_key(k), "ключ {k} должен быть срезан");
+        }
+        // полезное сохранено
+        assert_eq!(first["name"], "ПолучитьСумму");
+        assert_eq!(first["body"], "тело");
+        // вложенный объект тоже очищен, но keep остался
+        let nested = first["nested"].as_object().unwrap();
+        assert!(!nested.contains_key("node_hash"));
+        assert!(!nested.contains_key("content_hash"));
+        assert_eq!(nested["keep"], 7);
+
+        let second = arr[1].as_object().unwrap();
+        assert!(!second.contains_key("indexed_at"));
+        assert_eq!(second["path"], "src/x.bsl");
+        assert_eq!(second["lines_total"], 100);
+    }
+
+    /// Навигационный кап тела: оверсайз → голова+хвост+маркеры; малое — без
+    /// изменений; cap=0 → выключено. Один тест (не параллелить глобальный статик).
+    #[test]
+    fn cap_record_body_behaviour() {
+        // 1) оверсайз → голова + хвост + маркеры, середина выкинута
+        crate::mcp::cap::set_function_body_cap(Some(200));
+        let big: String = (0..300)
+            .map(|i| format!("строка_{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = cap_record_body(
+            serde_json::json!({ "body": big.clone() }),
+            &big,
+            "base/X/Module.bsl",
+            10,
+            310,
+        );
+        assert_eq!(out["body_truncated"], serde_json::json!(true));
+        assert_eq!(out["body_lines_total"], serde_json::json!(300));
+        let b = out["body"].as_str().unwrap();
+        assert!(b.contains("строка_0") && b.contains("строка_299"), "голова+хвост");
+        assert!(!b.contains("строка_150"), "середина выкинута");
+        assert!(b.contains("ТЕЛО УСЕЧЕНО") && b.contains("read_file") && b.contains("base/X/Module.bsl"));
+        assert!(b.len() < big.len(), "стаб реально короче тела");
+        // 2) малое тело — без изменений
+        let small = "малое тело\nвторая".to_string();
+        let out2 = cap_record_body(serde_json::json!({ "body": small.clone() }), &small, "p", 1, 2);
+        assert!(out2.get("body_truncated").is_none());
+        assert_eq!(out2["body"], serde_json::json!(small));
+        // 3) cap=0 → выключено (тело целиком)
+        crate::mcp::cap::set_function_body_cap(Some(0));
+        let out3 = cap_record_body(serde_json::json!({ "body": big.clone() }), &big, "p", 1, 300);
+        assert!(out3.get("body_truncated").is_none());
+        // вернуть дефолт, чтобы не влиять на другие тесты
+        crate::mcp::cap::set_function_body_cap(None);
+    }
+
+    #[test]
+    fn hint_get_multi_forbids_read_file_for_bodies() {
+        assert!(HINT_GET_MULTI.contains("get_function"));
+        assert!(HINT_GET_MULTI.contains("запрещён") || HINT_GET_MULTI.contains("ОБЯЗАТЕЛЬНО"));
+        // «либо read_file» больше не должно предлагаться как равноправный путь к телу.
+        assert!(
+            !HINT_GET_MULTI.contains("либо read_file"),
+            "HINT_GET_MULTI не должен предлагать read_file как альтернативу телу"
+        );
+    }
+
+    #[test]
+    fn merge_next_hint_attaches_or_creates() {
+        let created = merge_next_hint(None, Some("дальше X")).unwrap();
+        assert_eq!(created["next_hint"], serde_json::json!("дальше X"));
+        let with = merge_next_hint(
+            Some(serde_json::json!({"hint": "база"})),
+            Some("дальше Y"),
+        )
+        .unwrap();
+        assert_eq!(with["hint"], "база");
+        assert_eq!(with["next_hint"], "дальше Y");
+        assert!(merge_next_hint(Some(serde_json::json!({"a": 1})), None).is_some());
+    }
+
+    /// На BSL-репо пустые поиски процедур (search_function, grep_body, grep_code,
+    /// find_symbol) подсказывают search_terms; на прочих языках — старый hint.
+    #[test]
+    fn search_empty_hint_mentions_search_terms_only_for_bsl() {
+        // search_function
+        assert!(search_empty_hint(Some("bsl")).contains("search_terms"));
+        assert!(!search_empty_hint(Some("rust")).contains("search_terms"));
+        assert!(!search_empty_hint(None).contains("search_terms"));
+        assert_eq!(search_empty_hint(Some("rust")), HINT_SEARCH_EMPTY);
+        // grep_body / grep_code / find_symbol — то же правило (бенч test03:
+        // слепые grep_body на BSL должны звать в search_terms).
+        for h in [
+            grep_body_empty_hint(Some("bsl")),
+            grep_code_empty_hint(Some("bsl")),
+            find_symbol_empty_hint(Some("bsl")),
+        ] {
+            assert!(h.contains("search_terms"), "BSL grep/find hint должен звать search_terms");
+        }
+        assert!(
+            grep_code_empty_hint(Some("bsl")).contains("СТРОГО ЗАПРЕЩАЕТСЯ"),
+            "пустой grep_code на BSL должен запрещать повтор с другими путями"
+        );
+        assert!(
+            grep_code_empty_hint(None).contains("СТРОГО ЗАПРЕЩАЕТСЯ"),
+            "пустой grep_code должен запрещать повтор с другими путями"
+        );
+        assert_eq!(grep_body_empty_hint(Some("rust")), HINT_GREP_BODY_EMPTY);
+        assert_eq!(grep_code_empty_hint(None), HINT_GREP_CODE_EMPTY);
+        assert_eq!(find_symbol_empty_hint(Some("python")), HINT_FIND_SYMBOL_EMPTY);
+        assert!(!HINT_GREP_BODY_EMPTY.contains("search_terms"));
+    }
+
+    /// Главное свойство mass_map: элементы исполняются КОНКУРРЕНТНО (каждый со
+    /// своим соединением из пула), а порядок результатов = порядку items.
+    /// 4 элемента по 100мс на пуле из 4 соединений обязаны уложиться сильно
+    /// быстрее последовательных 400мс.
+    #[tokio::test]
+    async fn mass_map_runs_concurrently_and_preserves_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap(); // создать файл + схему
+
+        let cfg = PoolConfig {
+            max_size: 4,
+            cache_kib: 4096,
+            busy_timeout_ms: 1000,
+        };
+        let pool = StoragePool::open_file_readonly(&db_path, cfg).unwrap();
+
+        let start = Instant::now();
+        let rows = mass_map(&pool, vec![0usize, 1, 2, 3], |_st, it| {
+            std::thread::sleep(Duration::from_millis(100));
+            it
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        let values: Vec<usize> = rows.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(values, vec![0, 1, 2, 3], "порядок = порядку items");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "4×100мс заняли {}мс — mass_map исполняет последовательно (ожидалась параллель)",
+            elapsed.as_millis()
+        );
+    }
+
+    /// Пул из одного соединения (StoragePool::single) — деградация до
+    /// последовательного исполнения, но корректность и порядок сохраняются.
+    #[tokio::test]
+    async fn mass_map_on_single_pool_stays_correct() {
+        let storage = Storage::open_in_memory().unwrap();
+        let pool = StoragePool::single(storage);
+        let rows = mass_map(&pool, vec!["a".to_string(), "b".to_string()], |_st, it| it).await;
+        let values: Vec<String> = rows.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(values, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    use crate::storage::models::{ContextLine, GrepBodyMatch, GrepTextMatch, ListedFile};
+
+    /// compact_text_matches без контекста: "N: content", группировка по файлу,
+    /// сортировка по номеру строки; несколько файлов — порядок по пути.
+    #[test]
+    fn compact_text_matches_no_context() {
+        let matches = vec![
+            GrepTextMatch { path: "b.rs".into(), line: 10, content: "ten".into(), context: vec![] },
+            GrepTextMatch { path: "a.rs".into(), line: 5, content: "five".into(), context: vec![] },
+            GrepTextMatch { path: "a.rs".into(), line: 2, content: "two".into(), context: vec![] },
+        ];
+        let files = compact_text_matches(&matches);
+        let a = files.get("a.rs").unwrap().as_array().unwrap();
+        assert_eq!(a, &vec![serde_json::json!("2: two"), serde_json::json!("5: five")]);
+        let b = files.get("b.rs").unwrap().as_array().unwrap();
+        assert_eq!(b, &vec![serde_json::json!("10: ten")]);
+        let keys: Vec<&str> = files.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["a.rs", "b.rs"]);
+    }
+
+    /// compact_text_matches с контекстом: слияние match+context, дедуп по строке,
+    /// строка-совпадение перекрывает context-строку того же номера.
+    #[test]
+    fn compact_text_matches_with_context_merges_and_dedups() {
+        let matches = vec![GrepTextMatch {
+            path: "f.rs".into(),
+            line: 3,
+            content: "MATCH".into(),
+            context: vec![
+                ContextLine { line: 2, content: "before".into() },
+                ContextLine { line: 3, content: "ctx-dup".into() },
+                ContextLine { line: 4, content: "after".into() },
+            ],
+        }];
+        let files = compact_text_matches(&matches);
+        let f = files.get("f.rs").unwrap().as_array().unwrap();
+        assert_eq!(
+            f,
+            &vec![
+                serde_json::json!("2: before"),
+                serde_json::json!("3: MATCH"),
+                serde_json::json!("4: after"),
+            ]
+        );
+    }
+
+    /// compact_body_matches: локаторная строка, "(+N)" при match_count>3,
+    /// контекст-строки дописаны при наличии.
+    #[test]
+    fn compact_body_matches_locator_and_context() {
+        let matches = vec![
+            GrepBodyMatch {
+                file_path: "doc.bsl".into(),
+                name: "Провести".into(),
+                kind: "function".into(),
+                line_start: 120,
+                line_end: 340,
+                match_lines: vec![125, 130, 200],
+                match_count: Some(8),
+                context: vec![],
+            },
+            GrepBodyMatch {
+                file_path: "doc.bsl".into(),
+                name: "Отменить".into(),
+                kind: "function".into(),
+                line_start: 400,
+                line_end: 410,
+                match_lines: vec![405],
+                match_count: None,
+                context: vec![ContextLine { line: 405, content: "x = 1;".into() }],
+            },
+        ];
+        let files = compact_body_matches(&matches);
+        let arr = files.get("doc.bsl").unwrap().as_array().unwrap();
+        assert_eq!(arr[0], serde_json::json!("Провести (function) L120-340: 125,130,200 (+5)"));
+        assert_eq!(arr[1], serde_json::json!("Отменить (function) L400-410: 405"));
+        assert_eq!(arr[2], serde_json::json!("405: x = 1;"));
+    }
+
+    /// compact_listed_files: строка без mtime; size=None → "?".
+    #[test]
+    fn compact_listed_files_format() {
+        let files = vec![
+            ListedFile { path: "src/foo.rs".into(), language: "rust".into(), lines_total: 724, size: Some(28504), mtime: Some(123) },
+            ListedFile { path: "bar.md".into(), language: "markdown".into(), lines_total: 3, size: None, mtime: None },
+        ];
+        let out = compact_listed_files(&files);
+        assert_eq!(out[0], serde_json::json!("src/foo.rs | rust | 724 lines | 28504"));
+        assert_eq!(out[1], serde_json::json!("bar.md | markdown | 3 lines | ?"));
+    }
+
+    fn tree_edge(caller: &str, callee: &str, depth: i64) -> crate::storage::models::CallTreeEdge {
+        crate::storage::models::CallTreeEdge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            line: 1,
+            depth,
+            path: Some("base/CommonModules/ОбщийМодуль/Ext/Module.bsl".to_string()),
+        }
+    }
+
+    /// Дерево «вниз»: корень → 30 детей → у каждого 30 внуков (930 рёбер).
+    fn wide_tree() -> Vec<crate::storage::models::CallTreeEdge> {
+        let mut v = Vec::new();
+        for i in 0..30 {
+            v.push(tree_edge("Корень", &format!("Ребёнок{i}"), 1));
+        }
+        for i in 0..30 {
+            for j in 0..30 {
+                v.push(tree_edge(&format!("Ребёнок{i}"), &format!("Внук{i}_{j}"), 2));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn call_tree_within_budget_unchanged() {
+        let edges = wide_tree();
+        let before = serde_json::to_string(&edges).unwrap();
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, 10_000_000);
+        assert_eq!(serde_json::to_string(&kept).unwrap(), before, "в бюджете рёбра и порядок не меняются");
+        assert_eq!(tree, Some(build_call_tree_json("Корень", true, &kept)));
+    }
+
+    #[test]
+    fn call_tree_zero_budget_disables_cut() {
+        let edges = wide_tree();
+        let n = edges.len();
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, 0);
+        assert_eq!(kept.len(), n, "бюджет 0 — страж выключен");
+        assert!(tree.is_some(), "целый ответ отдаётся вместе с деревом");
+    }
+
+    #[test]
+    fn call_tree_cut_fits_and_keeps_near_levels() {
+        let edges = wide_tree();
+        let total = edges.len();
+        let budget = 20_000;
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
+        assert!(kept.len() < total, "ответ сокращён: {} из {}", kept.len(), total);
+        assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
+        let size = serde_json::to_vec(&kept).unwrap().len();
+        assert!(size <= budget - CALL_TREE_OVERHEAD_BYTES, "уложилось в бюджет: {size}");
+        let d1 = kept.iter().filter(|e| e.depth == 1).count();
+        assert!(kept.iter().all(|e| e.depth == 1) || d1 == 30, "ребро глубины 2 не остаётся без рёбер глубины 1");
+    }
+
+    #[test]
+    fn call_tree_cut_keeps_at_least_one_edge() {
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, wide_tree(), 100);
+        assert_eq!(kept.len(), 1, "пустой ответ читался бы как «рёбер нет»");
+        assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
+    }
+
+    /// Сокращённый ответ без дерева вмещает больше рёбер, чем ответ с деревом
+    /// (ради этого дерево и убрано): сверяем с наибольшим префиксом, который
+    /// уложился бы вместе с деревом.
+    #[test]
+    fn call_tree_cut_without_tree_keeps_more_edges() {
+        let budget = 20_000usize;
+        let mut edges = wide_tree();
+        edges.sort_by_key(|e| e.depth);
+        let mut n_with_tree = 0usize;
+        for k in 1..=edges.len() {
+            let tree = build_call_tree_json("Корень", true, &edges[..k]);
+            let size = serde_json::to_vec(&serde_json::json!({ "edges": &edges[..k], "tree": tree }))
+                .unwrap()
+                .len();
+            if size <= 18_000 {
+                n_with_tree = k;
+            }
+        }
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
+        assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
+        assert!(
+            kept.len() > n_with_tree,
+            "без дерева рёбер помещается больше: {} против {}",
+            kept.len(),
+            n_with_tree
+        );
+    }
+
+    /// Дерево опускается и тогда, когда все рёбра без него уложились целиком:
+    /// рёбра не режутся, но в ответе появляется пометка об опущенном дереве.
+    #[test]
+    fn call_tree_drops_tree_before_edges() {
+        let edges = wide_tree();
+        let edges_only = serde_json::to_vec(&edges).unwrap().len();
+        let with_tree = serde_json::to_vec(&serde_json::json!({
+            "edges": &edges,
+            "tree": build_call_tree_json("Корень", true, &edges),
+        }))
+        .unwrap()
+        .len();
+        let budget = CALL_TREE_OVERHEAD_BYTES + edges_only + (with_tree - edges_only) / 2;
+        assert!(with_tree > edges_only);
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
+        assert_eq!(kept.len(), 930, "все рёбра без дерева уложились");
+        assert!(tree.is_none(), "дерево опущено по размеру ответа");
+    }
+
+    #[test]
+    fn call_tree_cut_hint_suggests_narrowing() {
+        let s = call_tree_cut_hint("ut", "Корень", false, 3, 10, 200);
+        assert!(s.contains("показано 10 из 200"), "{s}");
+        assert!(s.contains("max_depth"), "{s}");
+        assert!(s.contains("find_path"), "{s}");
+        assert!(s.contains("root = этот узел"), "{s}");
+        assert!(s.contains("get_callers"), "{s}");
+        assert!(!s.contains("max_response_bytes"), "{s}");
+        assert!(!s.contains("192000"), "{s}");
+        let s = call_tree_cut_hint("ut", "Корень", true, 1, 1, 5);
+        assert!(s.contains("get_callees"), "{s}");
+        assert!(!s.contains("get_call_tree("), "{s}");
+    }
+
+    #[test]
+    fn call_tree_budget_default_not_above_constant() {
+        assert!(call_tree_budget(None) <= CALL_TREE_DEFAULT_BUDGET_BYTES);
+        assert_eq!(call_tree_budget(None), call_tree_budget(Some(0)));
+        assert_eq!(
+            call_tree_budget(Some(10_000)),
+            crate::mcp::cap::resolve_request_budget(Some(10_000)).applied
+        );
+    }
+}

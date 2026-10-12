@@ -1,0 +1,54 @@
+{
+  "name": "@regsorm/code-index-mcp",
+  "version": "0.11.0",
+  "description": "Rust code index MCP server (BSL/1C-aware). Static binary auto-downloaded for your OS. Tree-sitter AST, federation, sub-ms search.",
+  "mcpName": "io.github.Regsorm/code-index",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "code-index",
+    "code-search",
+    "tree-sitter",
+    "rust",
+    "bsl",
+    "1c",
+    "1c-enterprise",
+    "ai-agent",
+    "claude",
+    "claude-code",
+    "cursor",
+    "ai"
+  ],
+  "homepage": "https://github.com/Regsorm/code-index-mcp",
+  "bugs": {
+    "url": "https://github.com/Regsorm/code-index-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Regsorm/code-index-mcp.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "code-index-mcp": "bin/cli.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/cli.js",
+    "scripts/postinstall.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

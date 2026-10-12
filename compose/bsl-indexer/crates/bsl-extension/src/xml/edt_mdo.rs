@@ -1,0 +1,1634 @@
+// Парсер формата 1C:EDT (`.mdo`) — аналог парсеров формата Конфигуратора
+// (configuration.rs / object_attributes.rs), но под раскладку и схему EDT.
+//
+// Отличия EDT от выгрузки Конфигуратора (DumpConfigToFiles):
+//   * объект лежит в ПОДКАТАЛОГЕ: `Catalogs/<Имя>/<Имя>.mdo` (а не `Catalogs/<Имя>.xml`);
+//   * корневой тег — `mdclass:Catalog` (ns `g5.1c.ru/v8/dt/metadata/mdclass`),
+//     а не `MetaDataObject><Catalog`;
+//   * теги camelCase: `<attributes>`/`<dimensions>`/`<resources>`/`<tabularSections>`/
+//     `<enumValues>`/`<type>`/`<types>`/`<name>`/`<synonym>`/`<fillChecking>`;
+//   * реквизит БЕЗ обёртки `<Properties>`; ТЧ-реквизиты — это `<attributes>`
+//     ВНУТРИ `<tabularSections>`;
+//   * синоним — `<synonym><key>ru</key><value>...</value></synonym>` (рядом
+//     `<toolTip>` с такой же формой — берём value только из synonym);
+//   * тип в платформенной нотации БЕЗ префикса `cfg:`: `CatalogRef.Номенклатура`,
+//     `String`, `Number`, `Date`, `Boolean`, `DefinedType.X`, `AnyRef`;
+//   * движения документа — `<registerRecords>AccumulationRegister.X</registerRecords>`
+//     (значение уже каноническое имя регистра).
+//
+// Результат пишется в ТЕ ЖЕ структуры (ObjectStructure / DataLinkEdge) и таблицы,
+// что и формат Конфигуратора — поэтому все downstream-инструменты
+// (get_object_structure / get_data_links / get_register_writers / find_references /
+// get_object_profile / bsl_sql) работают без изменений.
+
+use anyhow::Result;
+use quick_xml::events::Event;
+use quick_xml::Reader;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+use super::forms::FormHandler;
+
+use super::object_attributes::{
+    classify_type, pretty_types, DataLinkEdge, ObjectStructure, StructField, StructTabular,
+};
+
+/// Имя тега без namespace-префикса (`mdclass:Catalog` → `Catalog`).
+fn local_name(name: &str) -> &str {
+    match name.rfind(':') {
+        Some(i) => &name[i + 1..],
+        None => name,
+    }
+}
+
+/// Нормализовать тип `.mdo` (платформенная нотация без `cfg:`) в вид, который
+/// понимают существующие `pretty_one_type` / `classify_type` (`cfg:`/`xs:`).
+/// Так EDT-парсер переиспользует и человекочитаемое имя типа (русская нотация
+/// для `attributes_json`), и классификацию ссылок (для `data_links`).
+pub(crate) fn edt_type_to_cfg(t: &str) -> String {
+    let t = t.trim();
+    match t {
+        "String" => return "xs:string".to_string(),
+        "Number" => return "xs:decimal".to_string(),
+        "Boolean" => return "xs:boolean".to_string(),
+        "Date" | "DateTime" | "Time" => return "xs:dateTime".to_string(),
+        _ => {}
+    }
+    // Ссылочные и определяемые типы → префикс `cfg:` (classify_type/pretty_one_type
+    // ждут именно его). `CatalogRef.X`, `DocumentRef.X`, `EnumRef.X`, `AnyRef`,
+    // `DefinedType.X`, обобщённый `CatalogRef` (без имени).
+    if t == "AnyRef" || t.ends_with("Ref") || t.contains("Ref.") || t.starts_with("DefinedType.")
+    {
+        return format!("cfg:{}", t);
+    }
+    // Прочие платформенные типы (UUID, ValueStorage, ...) — как есть: для
+    // структуры покажутся как есть, для data_links classify_type вернёт None.
+    t.to_string()
+}
+
+/// Привести имя свойства из EDT-нотации (camelCase: `realTimePosting`) к
+/// PascalCase Конфигуратора (`RealTimePosting`) — чтобы ключи секций
+/// posting/properties совпадали с форматом выгрузки.
+fn cap_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum FieldKind {
+    Attribute,
+    TabAttr,
+    Dimension,
+    Resource,
+    EnumValue,
+    Command,
+}
+
+struct FieldBuild {
+    kind: FieldKind,
+    name: Option<String>,
+    types: Vec<String>,
+    synonym: Option<String>,
+    required: bool,
+    /// `<indexing>`, если не DontIndex.
+    indexing: Option<String>,
+}
+
+impl FieldBuild {
+    fn new(kind: FieldKind) -> Self {
+        FieldBuild {
+            kind,
+            name: None,
+            types: Vec::new(),
+            synonym: None,
+            required: false,
+            indexing: None,
+        }
+    }
+}
+
+/// Распарсить `.mdo` объекта в полную структуру (реквизиты/ТЧ/измерения/ресурсы/
+/// значения перечисления/свойства проведения/команды) — для `attributes_json`.
+pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut out = ObjectStructure::default();
+    let mut buf = Vec::new();
+
+    #[derive(PartialEq)]
+    enum T {
+        None,
+        FieldName,
+        TabName,
+        TypeValue,
+        SynValue,
+        FillChecking,
+        Indexing,
+        PostingProp,
+        HeaderProp,
+        Owner,
+        PredefName,
+        ValueType,
+    }
+
+    let mut in_std = false;
+    let mut in_tabular = false;
+    let mut cur_tab: Option<usize> = None;
+    let mut expecting_tab_name = false;
+    let mut field: Option<FieldBuild> = None;
+    let mut in_type = false;
+    let mut in_synonym = false;
+    // Предопределённые элементы: `<predefined><items><name>...</name>...`.
+    // Внутри `<items>` берём только первый `<name>` (дальше идут description/code).
+    let mut in_predefined = false;
+    let mut in_predef_item = false;
+    let mut took_predef_name = false;
+    // `<type>` на уровне САМОГО объекта (не поля) — тип значения ПВХ/константы.
+    let mut in_obj_type = false;
+    // Глубина вложенности: корневой тег объекта — 1, его прямые дети — 2.
+    // Нужна, чтобы `owners`/`predefined`/`type` брались только у самого объекта:
+    // у ПВХ такие же теги есть внутри предопределённых элементов, и без границы
+    // тип значения объекта смешивается с типами каждого предопределённого вида.
+    let mut depth: usize = 0;
+    let mut tt = T::None;
+    let mut cur_posting_prop: Option<String> = None;
+    let mut cur_header_prop: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                depth += 1;
+                if local == "standardAttributes" {
+                    in_std = true;
+                    buf.clear();
+                    continue;
+                }
+                if in_std {
+                    buf.clear();
+                    continue;
+                }
+                match local.as_str() {
+                    "tabularSections" => {
+                        in_tabular = true;
+                        expecting_tab_name = true;
+                        out.tabular_sections.push(StructTabular {
+                            name: String::new(),
+                            attributes: Vec::new(),
+                        });
+                        cur_tab = Some(out.tabular_sections.len() - 1);
+                    }
+                    "attributes" => {
+                        field = Some(FieldBuild::new(if in_tabular {
+                            FieldKind::TabAttr
+                        } else {
+                            FieldKind::Attribute
+                        }));
+                    }
+                    "dimensions" => field = Some(FieldBuild::new(FieldKind::Dimension)),
+                    "resources" => field = Some(FieldBuild::new(FieldKind::Resource)),
+                    "enumValues" => field = Some(FieldBuild::new(FieldKind::EnumValue)),
+                    "commands" => field = Some(FieldBuild::new(FieldKind::Command)),
+                    "name" => {
+                        if let Some(f) = field.as_ref() {
+                            if f.name.is_none() {
+                                tt = T::FieldName;
+                            }
+                        } else if expecting_tab_name {
+                            tt = T::TabName;
+                        } else if in_predef_item && !took_predef_name {
+                            tt = T::PredefName;
+                        }
+                    }
+                    // Владельцы подчинённого справочника: `<owners>Catalog.X</owners>`.
+                    "owners" => {
+                        if field.is_none() && depth == 2 {
+                            tt = T::Owner;
+                        }
+                    }
+                    // Тип значения плана счетов — виды субконто:
+                    // `<extDimensionTypes>ChartOfCharacteristicTypes.X</...>`.
+                    "extDimensionTypes" => {
+                        if field.is_none() && depth == 2 {
+                            tt = T::ValueType;
+                        }
+                    }
+                    "predefined" => {
+                        if depth == 2 {
+                            in_predefined = true;
+                        }
+                    }
+                    "items" => {
+                        // Только прямые элементы блока `<predefined>` (depth 3):
+                        // вложенные `<items>` внутри них — не предопределённые.
+                        if in_predefined && depth == 3 {
+                            in_predef_item = true;
+                            took_predef_name = false;
+                        }
+                    }
+                    "synonym" => {
+                        if field.is_some() {
+                            in_synonym = true;
+                        }
+                    }
+                    "type" => {
+                        if field.is_some() {
+                            in_type = true;
+                        } else if depth == 2 {
+                            // `<type>` прямо под корнем — тип значения самого
+                            // объекта (ПВХ, константа, определяемый тип). Такие
+                            // же теги внутри предопределённых элементов лежат
+                            // глубже и сюда не попадают.
+                            in_obj_type = true;
+                        }
+                    }
+                    "types" => {
+                        if field.is_some() && in_type {
+                            tt = T::TypeValue;
+                        } else if field.is_none() && in_obj_type {
+                            tt = T::ValueType;
+                        }
+                    }
+                    "value" => {
+                        if field.is_some() && in_synonym {
+                            tt = T::SynValue;
+                        }
+                    }
+                    "fillChecking" => {
+                        if field.is_some() {
+                            tt = T::FillChecking;
+                        }
+                    }
+                    "indexing" => {
+                        if field.is_some() {
+                            tt = T::Indexing;
+                        }
+                    }
+                    "posting" | "realTimePosting" | "registerRecordsDeletion"
+                    | "registerRecordsWritingOnPost" => {
+                        if field.is_none() {
+                            cur_posting_prop = Some(cap_first(&local));
+                            tt = T::PostingProp;
+                        }
+                    }
+                    "informationRegisterPeriodicity" | "writeMode" | "registerType"
+                    | "numberType" | "numberLength" | "numberPeriodicity" | "checkUnique"
+                    | "autonumbering" | "hierarchical" | "codeLength" | "descriptionLength" => {
+                        if field.is_none() {
+                            cur_header_prop = Some(cap_first(&local));
+                            tt = T::HeaderProp;
+                        }
+                    }
+                    // Свойства адресации задачи — только у самого объекта:
+                    // внутри реквизитов адресации есть свои теги адресации.
+                    "addressing" | "mainAddressingAttribute" | "currentPerformer" => {
+                        if field.is_none() && depth == 2 {
+                            cur_header_prop = Some(cap_first(&local));
+                            tt = T::HeaderProp;
+                        }
+                    }
+                    // Регламентное задание: вызываемая процедура и параметры
+                    // перезапуска. `predefined` сюда не входит: в EDT это имя
+                    // занято блоком предопределённых элементов справочника.
+                    "methodName" | "use" | "restartCountOnFailure"
+                    | "restartIntervalOnFailure" => {
+                        if field.is_none() && depth == 2 {
+                            cur_header_prop = Some(cap_first(&local));
+                            tt = T::HeaderProp;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if tt == T::None {
+                    buf.clear();
+                    continue;
+                }
+                let txt = t
+                    .unescape()
+                    .map(|s| s.into_owned())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                match tt {
+                    T::FieldName => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() {
+                                f.name = Some(txt);
+                            }
+                        }
+                    }
+                    T::TabName => {
+                        if !txt.is_empty() {
+                            if let Some(i) = cur_tab {
+                                out.tabular_sections[i].name = txt;
+                            }
+                            expecting_tab_name = false;
+                        }
+                    }
+                    T::TypeValue => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() {
+                                f.types.push(edt_type_to_cfg(&txt));
+                            }
+                        }
+                    }
+                    T::SynValue => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() && f.synonym.is_none() {
+                                f.synonym = Some(txt);
+                            }
+                        }
+                    }
+                    T::FillChecking => {
+                        if let Some(f) = field.as_mut() {
+                            f.required = txt == "ShowError";
+                        }
+                    }
+                    // Индексирование: DontIndex (и пустое) не сохраняем.
+                    T::Indexing => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() && txt != "DontIndex" {
+                                f.indexing = Some(txt);
+                            }
+                        }
+                    }
+                    T::PostingProp => {
+                        if let Some(p) = cur_posting_prop.take() {
+                            if !txt.is_empty() {
+                                out.posting.push((p, txt));
+                            }
+                        }
+                    }
+                    T::Owner => {
+                        if !txt.is_empty() {
+                            out.owners.push(txt);
+                        }
+                    }
+                    T::PredefName => {
+                        if !txt.is_empty() {
+                            out.predefined.push(txt);
+                            took_predef_name = true;
+                        }
+                    }
+                    T::ValueType => {
+                        if !txt.is_empty() {
+                            let cfg = edt_type_to_cfg(&txt);
+                            out.value_types.push(pretty_types(std::slice::from_ref(&cfg)));
+                        }
+                    }
+                    T::HeaderProp => {
+                        if let Some(p) = cur_header_prop.take() {
+                            if !txt.is_empty() {
+                                out.properties.push((p, txt));
+                            }
+                        }
+                    }
+                    T::None => {}
+                }
+                tt = T::None;
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                depth = depth.saturating_sub(1);
+                if local == "standardAttributes" {
+                    in_std = false;
+                    buf.clear();
+                    continue;
+                }
+                if in_std {
+                    buf.clear();
+                    continue;
+                }
+                match local.as_str() {
+                    "attributes" | "dimensions" | "resources" | "enumValues" | "commands" => {
+                        if let Some(fb) = field.take() {
+                            if let Some(name) = fb.name.filter(|n| !n.is_empty()) {
+                                match fb.kind {
+                                    FieldKind::EnumValue => {
+                                        if let Some(s) = fb.synonym {
+                                            if !s.is_empty() && s != name {
+                                                out.enum_synonyms.push((name.clone(), s));
+                                            }
+                                        }
+                                        out.enum_values.push(name);
+                                    }
+                                    FieldKind::Command => {
+                                        let syn = fb.synonym.filter(|s| !s.is_empty() && s != &name);
+                                        out.commands.push((name, syn));
+                                    }
+                                    _ => {
+                                        let f = StructField {
+                                            name,
+                                            type_str: pretty_types(&fb.types),
+                                            synonym: fb.synonym,
+                                            required: fb.required,
+                                            indexing: fb.indexing,
+                                        };
+                                        match fb.kind {
+                                            FieldKind::Dimension => out.dimensions.push(f),
+                                            FieldKind::Resource => out.resources.push(f),
+                                            FieldKind::TabAttr => match cur_tab {
+                                                Some(i) => out.tabular_sections[i].attributes.push(f),
+                                                None => out.attributes.push(f),
+                                            },
+                                            _ => out.attributes.push(f),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        in_type = false;
+                        in_synonym = false;
+                    }
+                    "tabularSections" => {
+                        in_tabular = false;
+                        cur_tab = None;
+                        expecting_tab_name = false;
+                    }
+                    "synonym" => in_synonym = false,
+                    "type" => {
+                        in_type = false;
+                        in_obj_type = false;
+                    }
+                    "predefined" => in_predefined = false,
+                    "items" => in_predef_item = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow::anyhow!("mdo structure: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// Распарсить `.mdo` объекта в рёбра графа связей данных (`data_links`):
+/// ссылочные реквизиты/измерения → рёбра, плюс движения документа
+/// (`<registerRecords>` → `recorder`).
+pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut edges: Vec<DataLinkEdge> = Vec::new();
+    let mut buf = Vec::new();
+
+    #[derive(PartialEq)]
+    enum T {
+        None,
+        FieldName,
+        TabName,
+        TypeValue,
+        RegisterRec,
+        OwnerRef,
+    }
+
+    let mut in_std = false;
+    let mut in_tabular = false;
+    let mut cur_tab_name: Option<String> = None;
+    let mut expecting_tab_name = false;
+    let mut field: Option<FieldBuild> = None;
+    let mut in_type = false;
+    let mut tt = T::None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                if local == "standardAttributes" {
+                    in_std = true;
+                    buf.clear();
+                    continue;
+                }
+                if in_std {
+                    buf.clear();
+                    continue;
+                }
+                match local.as_str() {
+                    "tabularSections" => {
+                        in_tabular = true;
+                        expecting_tab_name = true;
+                        cur_tab_name = None;
+                    }
+                    "attributes" => {
+                        field = Some(FieldBuild::new(if in_tabular {
+                            FieldKind::TabAttr
+                        } else {
+                            FieldKind::Attribute
+                        }));
+                    }
+                    "dimensions" => field = Some(FieldBuild::new(FieldKind::Dimension)),
+                    // Ресурсы регистров тоже дают ссылочные рёбра — в формате
+                    // Конфигуратора они идут как обычные реквизиты (`attr`). Без
+                    // этой ветки в выгрузке EDT терялась основная масса ссылок
+                    // регистров сведений (E-9).
+                    "resources" => field = Some(FieldBuild::new(FieldKind::Resource)),
+                    // Владелец подчинённого справочника: `<owners>Catalog.X</owners>`,
+                    // значение уже каноническое. Берём только у самого объекта.
+                    "owners" => {
+                        if field.is_none() {
+                            tt = T::OwnerRef;
+                        }
+                    }
+                    "name" => {
+                        if let Some(f) = field.as_ref() {
+                            if f.name.is_none() {
+                                tt = T::FieldName;
+                            }
+                        } else if expecting_tab_name {
+                            tt = T::TabName;
+                        }
+                    }
+                    "type" => {
+                        if field.is_some() {
+                            in_type = true;
+                        }
+                    }
+                    "types" => {
+                        if field.is_some() && in_type {
+                            tt = T::TypeValue;
+                        }
+                    }
+                    "registerRecords" => {
+                        if field.is_none() {
+                            tt = T::RegisterRec;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if tt == T::None {
+                    buf.clear();
+                    continue;
+                }
+                let txt = t
+                    .unescape()
+                    .map(|s| s.into_owned())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                match tt {
+                    T::FieldName => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() {
+                                f.name = Some(txt);
+                            }
+                        }
+                    }
+                    T::TabName => {
+                        if !txt.is_empty() {
+                            cur_tab_name = Some(txt);
+                            expecting_tab_name = false;
+                        }
+                    }
+                    T::TypeValue => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() {
+                                f.types.push(edt_type_to_cfg(&txt));
+                            }
+                        }
+                    }
+                    // Движение документа: `<registerRecords>AccumulationRegister.X`.
+                    // Значение уже каноническое имя регистра → прямое ребро recorder.
+                    T::RegisterRec => {
+                        if !txt.is_empty() {
+                            edges.push(DataLinkEdge {
+                                from_path: String::new(),
+                                to_object: txt,
+                                link_kind: "recorder",
+                                is_composite: false,
+                                is_universal: false,
+                            });
+                        }
+                    }
+                    // Владелец подчинённого справочника → ребро owner (E-9).
+                    T::OwnerRef => {
+                        if !txt.is_empty() {
+                            edges.push(DataLinkEdge {
+                                from_path: String::new(),
+                                to_object: txt,
+                                link_kind: "owner",
+                                is_composite: false,
+                                is_universal: false,
+                            });
+                        }
+                    }
+                    T::None => {}
+                }
+                tt = T::None;
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                if local == "standardAttributes" {
+                    in_std = false;
+                    buf.clear();
+                    continue;
+                }
+                if in_std {
+                    buf.clear();
+                    continue;
+                }
+                match local.as_str() {
+                    "attributes" | "dimensions" | "resources" => {
+                        if let Some(fb) = field.take() {
+                            if let Some(name) = fb.name.filter(|n| !n.is_empty()) {
+                                // Классифицируем каждый ссылочный тип в цель ребра.
+                                let refs: Vec<(String, bool)> =
+                                    fb.types.iter().filter_map(|t| classify_type(t)).collect();
+                                let is_composite = refs.len() > 1;
+                                let (from_path, link_kind): (String, &'static str) = match fb.kind {
+                                    FieldKind::TabAttr => (
+                                        match &cur_tab_name {
+                                            Some(tn) => format!("{}.{}", tn, name),
+                                            None => name.clone(),
+                                        },
+                                        "tabular_attr",
+                                    ),
+                                    FieldKind::Dimension => (name.clone(), "register_dim"),
+                                    _ => (name.clone(), "attr"),
+                                };
+                                for (to_object, is_universal) in refs {
+                                    edges.push(DataLinkEdge {
+                                        from_path: from_path.clone(),
+                                        to_object,
+                                        link_kind,
+                                        is_composite,
+                                        is_universal,
+                                    });
+                                }
+                            }
+                        }
+                        in_type = false;
+                    }
+                    "tabularSections" => {
+                        in_tabular = false;
+                        cur_tab_name = None;
+                        expecting_tab_name = false;
+                    }
+                    "type" => in_type = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow::anyhow!("mdo data_links: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(edges)
+}
+
+/// Лёгкий парс шапки `.mdo`: meta_type (корневой тег `mdclass:<Тип>`), имя
+/// объекта (`<name>` — прямой ребёнок корня) и синоним (`<synonym><value>` ru).
+/// Возвращает `None`, если корневой тег/имя не распознаны.
+pub fn parse_mdo_header(content: &str) -> Option<(String, String, Option<String>)> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut meta_type: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut synonym: Option<String> = None;
+
+    let mut want_name = false; // ждём текст прямого <name> объекта (depth 2)
+    let mut in_obj_synonym = false; // внутри прямого <synonym> объекта
+    let mut want_syn_value = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                // Корневой тег mdclass:<Тип> на depth 1 — это meta_type.
+                if depth == 1 {
+                    meta_type = Some(local.clone());
+                } else if depth == 2 {
+                    // Состав объекта начался — шапка позади, дальше не нужно.
+                    if matches!(
+                        local.as_str(),
+                        "attributes"
+                            | "tabularSections"
+                            | "dimensions"
+                            | "resources"
+                            | "enumValues"
+                            | "commands"
+                            | "forms"
+                    ) {
+                        break;
+                    }
+                    if local == "name" && name.is_none() {
+                        want_name = true;
+                    } else if local == "synonym" && synonym.is_none() {
+                        in_obj_synonym = true;
+                    }
+                } else if depth == 3 && in_obj_synonym && local == "value" {
+                    want_syn_value = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if want_name || want_syn_value {
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if want_name {
+                        if !txt.is_empty() {
+                            name = Some(txt);
+                        }
+                        want_name = false;
+                    } else if want_syn_value {
+                        if !txt.is_empty() {
+                            synonym = Some(txt);
+                        }
+                        want_syn_value = false;
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if local_name(&raw) == "synonym" {
+                    in_obj_synonym = false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    match (meta_type, name) {
+        (Some(mt), Some(nm)) => Some((mt, nm, synonym)),
+        _ => None,
+    }
+}
+
+/// Разобрать обработчики событий формы из EDT `Form.form`.
+/// Form-level и element-level обработчики записаны единообразно:
+/// `<handlers><event>OnCreateAtServer</event><name>ПриСозданииНаСервере</name></handlers>`,
+/// где `event` — англ. имя события платформы, `name` — имя процедуры-обработчика
+/// в модуле формы. Возвращает пары `(event, handler)`; `event` приводится к
+/// русскому имени через `event_to_russian` — чтобы совпадать с форматом
+/// Конфигуратора (где события формы по-русски). Привязки команд
+/// (`<action ...><handler>`) — это не event-обработчики, их не берём.
+pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
+    // Словарь именно событий ФОРМ — общий с форматом Конфигуратора, чтобы
+    // одна и та же форма в двух выгрузках давала одинаковые имена событий.
+    use super::forms::form_event_to_russian;
+
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut out: Vec<FormHandler> = Vec::new();
+    let mut buf = Vec::new();
+
+    let mut in_handlers = false;
+    let mut cur_event: Option<String> = None;
+    let mut cur_name: Option<String> = None;
+    // 0 — нет; 1 — ждём текст <event>; 2 — ждём текст <name> обработчика;
+    // 3 — ждём текст <name> элемента формы.
+    let mut tt = 0u8;
+    // Элементы формы вложены друг в друга тегами <items>; имя элемента —
+    // прямой дочерний <name>. Владелец обработчика — ближайший открытый
+    // <items>; пусто — обработчик самой формы (его <handlers> лежат в корне).
+    let mut depth = 0usize;
+    let mut items_stack: Vec<(usize, Option<String>)> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
+                depth += 1;
+                match local.as_str() {
+                    "items" => items_stack.push((depth, None)),
+                    "handlers" => {
+                        in_handlers = true;
+                        cur_event = None;
+                        cur_name = None;
+                    }
+                    "event" if in_handlers => tt = 1,
+                    "name" if in_handlers => tt = 2,
+                    // Имя элемента формы: <name> прямо внутри своего <items>.
+                    // Вложенные <name> подсказки и контекстного меню лежат
+                    // глубже и под это условие не подходят.
+                    "name" => {
+                        if let Some((item_depth, item_name)) = items_stack.last() {
+                            if *item_depth + 1 == depth && item_name.is_none() {
+                                tt = 3;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if tt != 0 {
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if tt == 1 && !txt.is_empty() {
+                        cur_event = Some(txt);
+                    } else if tt == 2 && !txt.is_empty() {
+                        cur_name = Some(txt);
+                    } else if tt == 3 && !txt.is_empty() {
+                        if let Some((_, item_name)) = items_stack.last_mut() {
+                            *item_name = Some(txt);
+                        }
+                    }
+                    tt = 0;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
+                if local == "handlers" {
+                    if let (Some(ev), Some(nm)) = (cur_event.take(), cur_name.take()) {
+                        let element = items_stack
+                            .last()
+                            .and_then(|(_, item_name)| item_name.clone());
+                        out.push(FormHandler {
+                            event: form_event_to_russian(&ev).to_string(),
+                            handler: nm,
+                            element,
+                        });
+                    }
+                    in_handlers = false;
+                }
+                if local == "items" {
+                    items_stack.pop();
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+/// Разобрать `.mdo` подписки на событие (EventSubscriptions/<Имя>/<Имя>.mdo).
+/// Возвращает `(name, event_ru, handler_module, handler_proc, sources)`:
+/// `event` нормализуется к русскому виду (как у формата Конфигуратора),
+/// `handler` (`CommonModule.Модуль.Процедура`) режется по последней точке на
+/// модуль и процедуру, `sources` — типы источников (`DocumentObject.X`).
+/// Возвращает `None`, если нет name/event/handler.
+pub fn parse_mdo_event_subscription(
+    content: &str,
+) -> Option<(String, String, String, String, Vec<String>)> {
+    use super::event_subscriptions::event_to_russian;
+
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut name: Option<String> = None;
+    let mut event: Option<String> = None;
+    let mut handler: Option<String> = None;
+    let mut sources: Vec<String> = Vec::new();
+    let mut in_source = false;
+    // 0 нет; 1 name; 2 event; 3 handler; 4 types(source).
+    let mut tt = 0u8;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
+                if depth == 2 {
+                    match local.as_str() {
+                        "name" if name.is_none() => tt = 1,
+                        "event" => tt = 2,
+                        "handler" => tt = 3,
+                        "source" => in_source = true,
+                        _ => {}
+                    }
+                } else if in_source && local == "types" {
+                    tt = 4;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if tt != 0 {
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if !txt.is_empty() {
+                        match tt {
+                            1 => name = Some(txt),
+                            2 => event = Some(txt),
+                            3 => handler = Some(txt),
+                            4 => sources.push(txt),
+                            _ => {}
+                        }
+                    }
+                    tt = 0;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
+                if local == "source" {
+                    in_source = false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let (n, ev, h) = (name?, event?, handler?);
+    let (module, proc_) = match h.rfind('.') {
+        Some(i) => (h[..i].to_string(), h[i + 1..].to_string()),
+        None => (String::new(), h),
+    };
+    Some((n, event_to_russian(&ev).to_string(), module, proc_, sources))
+}
+
+/// Определить, является ли репо проектом 1C:EDT, и вернуть корень с папками
+/// типов (`src/`, где лежат `Catalogs/`, `Documents/` и т.д.).
+/// Признак EDT: файл `<...>/Configuration/Configuration.mdo`.
+pub fn detect_edt_src(repo_root: &Path) -> Option<PathBuf> {
+    for entry in WalkDir::new(repo_root)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file()
+            && entry.file_name().to_str() == Some("Configuration.mdo")
+        {
+            if let Some(cfg_dir) = entry.path().parent() {
+                if cfg_dir.file_name().and_then(|s| s.to_str()) == Some("Configuration") {
+                    if let Some(src) = cfg_dir.parent() {
+                        return Some(src.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Конфигурационные рёбра из `.mdo`: состав подсистемы и плана обмена, цели
+/// определяемого типа, расположение и состав функциональной опции.
+///
+/// В формате Конфигуратора каждый вид лежит в своём файле (`Subsystems/**.xml`,
+/// `ExchangePlans/<X>/Ext/Content.xml`, `DefinedTypes/<X>.xml`,
+/// `FunctionalOptions/<X>.xml`), и их читает `index_metadata_refs`. В EDT всё
+/// это — теги внутри самого `.mdo` объекта, поэтому разбор идёт тем же проходом,
+/// что и остальная шапка: повторное чтение файла не нужно.
+///
+/// Возвращает кортежи `(link_kind, to_object, from_path, is_composite,
+/// is_universal)` — ровно те поля `data_links`, что заполняет формат
+/// Конфигуратора.
+pub fn parse_mdo_config_refs(
+    meta_type: &str,
+    content: &str,
+) -> Vec<(&'static str, String, String, bool, bool)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Want {
+        None,
+        SubsystemContent,
+        ExchangeContent,
+        DefinedType,
+        FoLocation,
+        FoContent,
+    }
+
+    // Виды, у которых конфигурационных рёбер не бывает, отсекаем сразу:
+    // проход по XML ради заведомо пустого результата не нужен.
+    if !matches!(
+        meta_type,
+        "Subsystem" | "ExchangePlan" | "DefinedType" | "FunctionalOption"
+    ) {
+        return Vec::new();
+    }
+
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut want = Want::None;
+    let mut in_content = false; // <content> плана обмена (обёртка над <mdObject>)
+    let mut in_type = false; // <type> определяемого типа (обёртка над <types>)
+    let mut raw_types: Vec<String> = Vec::new();
+    let mut out: Vec<(&'static str, String, String, bool, bool)> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                match (meta_type, depth, local.as_str()) {
+                    ("Subsystem", 2, "content") => want = Want::SubsystemContent,
+                    ("ExchangePlan", 2, "content") => in_content = true,
+                    ("ExchangePlan", 3, "mdObject") if in_content => want = Want::ExchangeContent,
+                    ("DefinedType", 2, "type") => in_type = true,
+                    ("DefinedType", 3, "types") if in_type => want = Want::DefinedType,
+                    ("FunctionalOption", 2, "location") => want = Want::FoLocation,
+                    ("FunctionalOption", 2, "content") => want = Want::FoContent,
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if want != Want::None {
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if !txt.is_empty() {
+                        match want {
+                            Want::SubsystemContent => {
+                                out.push(("subsystem_content", txt, String::new(), false, false))
+                            }
+                            Want::ExchangeContent => {
+                                out.push(("exchange_plan_content", txt, String::new(), false, false))
+                            }
+                            Want::FoContent => out.push((
+                                "functional_option_content",
+                                txt,
+                                String::new(),
+                                false,
+                                false,
+                            )),
+                            Want::FoLocation => {
+                                // Формат `<MetaType>.<Name>[.<...>]`: объект — первые
+                                // два сегмента, сырое значение уходит в `from_path`
+                                // (как в формате Конфигуратора).
+                                let mut it = txt.splitn(3, '.');
+                                if let (Some(kind), Some(name)) = (it.next(), it.next()) {
+                                    if !kind.is_empty() && !name.is_empty() {
+                                        out.push((
+                                            "functional_option_location",
+                                            format!("{}.{}", kind, name),
+                                            txt,
+                                            false,
+                                            false,
+                                        ));
+                                    }
+                                }
+                            }
+                            Want::DefinedType => raw_types.push(txt),
+                            Want::None => {}
+                        }
+                    }
+                    want = Want::None;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                match local_name(&raw) {
+                    "content" => in_content = false,
+                    "type" => in_type = false,
+                    _ => {}
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !raw_types.is_empty() {
+        // Типы в EDT записаны без префикса `cfg:` — приводим к нотации
+        // Конфигуратора, чтобы работал общий `classify_type`.
+        let mut targets: Vec<(String, bool)> = raw_types
+            .iter()
+            .filter_map(|t| classify_type(&edt_type_to_cfg(t)))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        let is_composite = targets.len() > 1;
+        for (to_object, is_universal) in targets {
+            out.push((
+                "defined_type_content",
+                to_object,
+                String::new(),
+                is_composite,
+                is_universal,
+            ));
+        }
+    }
+
+    out
+}
+
+/// Идентификатор самого объекта: атрибут `uuid` корневого тега `.mdo`.
+pub fn parse_mdo_root_uuid(content: &str) -> Option<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                for attr in e.attributes().filter_map(|a| a.ok()) {
+                    if local_name(&String::from_utf8_lossy(attr.key.as_ref())) == "uuid" {
+                        let v = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+                        return if v.is_empty() { None } else { Some(v) };
+                    }
+                }
+                return None;
+            }
+            Ok(Event::Eof) => return None,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Идентификатор вложенного элемента объекта — формы или команды.
+///
+/// В EDT они описаны внутри `.mdo` владельца: `<forms uuid="…"><name>X</name>`
+/// и `<commands uuid="…"><name>X</name>`. Собственного идентификатора у файла
+/// формы (`Form.form`) нет вовсе, поэтому для перечня модулей его берут отсюда.
+pub fn parse_mdo_child_uuid(content: &str, container: &str, child_name: &str) -> Option<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut current: Option<String> = None; // uuid открытого контейнера
+    let mut want_name = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                if depth == 2 && local == container {
+                    current = e
+                        .attributes()
+                        .filter_map(|a| a.ok())
+                        .find(|a| local_name(&String::from_utf8_lossy(a.key.as_ref())) == "uuid")
+                        .map(|a| String::from_utf8_lossy(a.value.as_ref()).into_owned());
+                } else if depth == 3 && local == "name" && current.is_some() {
+                    want_name = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if want_name {
+                    want_name = false;
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if txt == child_name {
+                        if let Some(u) = current.take() {
+                            if !u.is_empty() {
+                                return Some(u);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if depth == 2 && local_name(&raw) == container {
+                    current = None;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CATALOG_MDO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:core="http://g5.1c.ru/v8/dt/mcore" xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cf336ad9">
+  <name>АвансовыйОтчетПрисоединенныеФайлы</name>
+  <synonym><key>ru</key><value>Присоединенные файлы</value></synonym>
+  <standardAttributes>
+    <name>Description</name>
+    <synonym><key>ru</key><value>Имя файла</value></synonym>
+  </standardAttributes>
+  <attributes uuid="301fe396">
+    <name>Автор</name>
+    <synonym><key>ru</key><value>Автор</value></synonym>
+    <type>
+      <types>CatalogRef.ВнешниеПользователи</types>
+      <types>CatalogRef.Пользователи</types>
+    </type>
+    <toolTip><key>ru</key><value>Пользователь, который добавил файл</value></toolTip>
+    <fillChecking>ShowError</fillChecking>
+  </attributes>
+  <attributes uuid="6f5bef20">
+    <name>ДатаСоздания</name>
+    <type><types>Date</types></type>
+  </attributes>
+</mdclass:Catalog>"#;
+
+    #[test]
+    fn header_extracts_meta_type_name_synonym() {
+        let h = parse_mdo_header(CATALOG_MDO).unwrap();
+        assert_eq!(h.0, "Catalog");
+        assert_eq!(h.1, "АвансовыйОтчетПрисоединенныеФайлы");
+        assert_eq!(h.2.as_deref(), Some("Присоединенные файлы"));
+    }
+
+    #[test]
+    fn structure_skips_standard_attrs_and_reads_user_attrs() {
+        let s = parse_mdo_structure_xml(CATALOG_MDO).unwrap();
+        assert_eq!(s.attributes.len(), 2);
+        assert_eq!(s.attributes[0].name, "Автор");
+        // Составной ссылочный тип → русская нотация через " | ".
+        assert_eq!(
+            s.attributes[0].type_str,
+            "СправочникСсылка.ВнешниеПользователи | СправочникСсылка.Пользователи"
+        );
+        assert_eq!(s.attributes[0].synonym.as_deref(), Some("Автор"));
+        assert!(s.attributes[0].required);
+        assert_eq!(s.attributes[1].name, "ДатаСоздания");
+        assert_eq!(s.attributes[1].type_str, "Дата");
+        // standardAttributes (Description) НЕ попадает в пользовательские реквизиты.
+        assert!(!s.attributes.iter().any(|f| f.name == "Description"));
+    }
+
+    #[test]
+    fn datalinks_emit_referential_edges_composite() {
+        let edges = parse_mdo_datalinks_xml(CATALOG_MDO).unwrap();
+        // Автор → 2 ссылочных ребра (составной), ДатаСоздания (Date) — не ссылка.
+        assert_eq!(edges.len(), 2);
+        assert!(edges
+            .iter()
+            .all(|e| e.from_path == "Автор" && e.link_kind == "attr" && e.is_composite));
+        assert!(edges.iter().any(|e| e.to_object == "Catalog.ВнешниеПользователи"));
+        assert!(edges.iter().any(|e| e.to_object == "Catalog.Пользователи"));
+    }
+
+    const DOC_MDO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Document xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="abc">
+  <name>АвансовыйОтчет</name>
+  <synonym><key>ru</key><value>Авансовый отчёт</value></synonym>
+  <posting>Allow</posting>
+  <registerRecordsDeletion>AutoDeleteOff</registerRecordsDeletion>
+  <registerRecords>AccumulationRegister.ПрочиеРасчеты</registerRecords>
+  <registerRecords>AccountingRegister.Хозрасчетный</registerRecords>
+  <attributes uuid="1"><name>Организация</name><type><types>CatalogRef.Организации</types></type></attributes>
+  <tabularSections uuid="2">
+    <name>Товары</name>
+    <attributes uuid="3"><name>Номенклатура</name><type><types>CatalogRef.Номенклатура</types></type></attributes>
+  </tabularSections>
+</mdclass:Document>"#;
+
+    #[test]
+    fn document_posting_recorder_and_tabular() {
+        let s = parse_mdo_structure_xml(DOC_MDO).unwrap();
+        assert_eq!(s.attributes.len(), 1);
+        assert_eq!(s.attributes[0].name, "Организация");
+        assert_eq!(s.tabular_sections.len(), 1);
+        assert_eq!(s.tabular_sections[0].name, "Товары");
+        assert_eq!(s.tabular_sections[0].attributes[0].name, "Номенклатура");
+        // Свойства проведения.
+        assert!(s.posting.iter().any(|(k, v)| k == "Posting" && v == "Allow"));
+        assert!(s
+            .posting
+            .iter()
+            .any(|(k, v)| k == "RegisterRecordsDeletion" && v == "AutoDeleteOff"));
+
+        let edges = parse_mdo_datalinks_xml(DOC_MDO).unwrap();
+        // recorder: 2 регистра; attr: Организация; tabular_attr: Товары.Номенклатура.
+        let rec: Vec<_> = edges.iter().filter(|e| e.link_kind == "recorder").collect();
+        assert_eq!(rec.len(), 2);
+        assert!(rec.iter().any(|e| e.to_object == "AccumulationRegister.ПрочиеРасчеты"));
+        assert!(edges
+            .iter()
+            .any(|e| e.link_kind == "attr" && e.to_object == "Catalog.Организации"));
+        assert!(edges.iter().any(|e| e.link_kind == "tabular_attr"
+            && e.from_path == "Товары.Номенклатура"
+            && e.to_object == "Catalog.Номенклатура"));
+    }
+
+    const REGISTER_MDO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:AccumulationRegister xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="r">
+  <name>ТоварыНаСкладах</name>
+  <registerType>Balance</registerType>
+  <resources uuid="r1"><name>Количество</name><type><types>Number</types></type></resources>
+  <dimensions uuid="d1"><name>Склад</name><type><types>CatalogRef.Склады</types></type></dimensions>
+  <dimensions uuid="d2"><name>Номенклатура</name><type><types>CatalogRef.Номенклатура</types></type></dimensions>
+</mdclass:AccumulationRegister>"#;
+
+    #[test]
+    fn register_dimensions_resources_and_dim_links() {
+        let s = parse_mdo_structure_xml(REGISTER_MDO).unwrap();
+        assert_eq!(s.dimensions.len(), 2);
+        assert_eq!(s.resources.len(), 1);
+        assert_eq!(s.resources[0].type_str, "Число");
+        assert!(s.properties.iter().any(|(k, v)| k == "RegisterType" && v == "Balance"));
+
+        let edges = parse_mdo_datalinks_xml(REGISTER_MDO).unwrap();
+        // Оба измерения ссылочные → register_dim; ресурс (Число) — не ссылка.
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.link_kind == "register_dim"));
+        assert!(edges.iter().any(|e| e.to_object == "Catalog.Склады"));
+    }
+
+    const ENUM_MDO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Enum xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="e">
+  <name>ВидыЦен</name>
+  <enumValues uuid="e1"><name>Оптовая</name><synonym><key>ru</key><value>Оптовая цена</value></synonym></enumValues>
+  <enumValues uuid="e2"><name>Розничная</name></enumValues>
+</mdclass:Enum>"#;
+
+    #[test]
+    fn resources_and_owners_give_edges() {
+        // Ресурсы регистров и владельцы подчинённых справочников в рёбра не
+        // попадали вовсе: в сборщике связей были только реквизиты, табличные
+        // части и измерения (E-9).
+        let reg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:InformationRegister xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="r">
+  <name>СведенияОСотрудниках</name>
+  <resources uuid="r1"><name>Организация</name><type><types>CatalogRef.Организации</types></type></resources>
+  <resources uuid="r2"><name>Сумма</name><type><types>Number</types></type></resources>
+  <dimensions uuid="d1"><name>Сотрудник</name><type><types>CatalogRef.Сотрудники</types></type></dimensions>
+</mdclass:InformationRegister>"#;
+        let edges = parse_mdo_datalinks_xml(reg).unwrap();
+        assert!(
+            edges.iter().any(|e| e.link_kind == "attr"
+                && e.from_path == "Организация"
+                && e.to_object == "Catalog.Организации"),
+            "ссылочный ресурс регистра обязан давать ребро, получено: {edges:?}"
+        );
+        assert!(edges.iter().any(|e| e.link_kind == "register_dim"));
+        // Ресурс нессылочного типа ребра не даёт.
+        assert_eq!(edges.len(), 2);
+
+        let cat = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="c">
+  <name>БанковскиеСчета</name>
+  <owners>Catalog.Контрагенты</owners>
+  <owners>Catalog.Организации</owners>
+</mdclass:Catalog>"#;
+        let edges = parse_mdo_datalinks_xml(cat).unwrap();
+        let owners: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.link_kind == "owner")
+            .map(|e| e.to_object.as_str())
+            .collect();
+        assert_eq!(owners, vec!["Catalog.Контрагенты", "Catalog.Организации"]);
+    }
+
+    #[test]
+    fn enum_values_and_synonyms() {
+        let s = parse_mdo_structure_xml(ENUM_MDO).unwrap();
+        assert_eq!(s.enum_values, vec!["Оптовая", "Розничная"]);
+        assert_eq!(
+            s.enum_synonyms,
+            vec![("Оптовая".to_string(), "Оптовая цена".to_string())]
+        );
+    }
+
+    #[test]
+    fn owners_predefined_and_value_types() {
+        // Три секции, которых EDT-разбор раньше не давал вовсе: владельцы
+        // подчинённого справочника, предопределённые элементы и тип значения
+        // объекта (ПВХ/константа). Раскладка тегов — как в реальной выгрузке.
+        let mdo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:ChartOfCharacteristicTypes xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass">
+  <name>ВидыСубконто</name>
+  <owners>Catalog.Контрагенты</owners>
+  <owners>Catalog.Организации</owners>
+  <type>
+    <types>CatalogRef.Склады</types>
+    <types>DocumentRef.АвансовыйОтчет</types>
+  </type>
+  <attributes>
+    <name>Комментарий</name>
+    <type>
+      <types>String</types>
+    </type>
+  </attributes>
+  <predefined>
+    <items id="a1">
+      <name>ОсновнойВид</name>
+      <description>Основной вид</description>
+      <code xsi:type="core:NumberValue">
+        <value>1</value>
+      </code>
+    </items>
+    <items id="a2">
+      <name>ПрочийВид</name>
+      <description>Прочий вид</description>
+      <type>
+        <types>CatalogRef.Номенклатура</types>
+      </type>
+    </items>
+  </predefined>
+</mdclass:ChartOfCharacteristicTypes>"#;
+        let s = parse_mdo_structure_xml(mdo).unwrap();
+        assert_eq!(s.owners, vec!["Catalog.Контрагенты", "Catalog.Организации"]);
+        assert_eq!(s.predefined, vec!["ОсновнойВид", "ПрочийВид"]);
+        // Только корневой тип значения объекта. Тип предопределённого элемента
+        // (CatalogRef.Номенклатура внутри <predefined>) сюда попадать не должен.
+        assert_eq!(
+            s.value_types,
+            vec!["СправочникСсылка.Склады", "ДокументСсылка.АвансовыйОтчет"]
+        );
+        // Тип значения объекта не смешивается с типом реквизита.
+        assert_eq!(s.attributes.len(), 1);
+        assert_eq!(s.attributes[0].name, "Комментарий");
+        assert_eq!(s.attributes[0].type_str, "Строка");
+        // Секции попадают в JSON структуры.
+        let js = s.to_json();
+        assert!(js.get("owners").is_some());
+        assert!(js.get("predefined").is_some());
+        assert!(js.get("value_types").is_some());
+    }
+
+    #[test]
+    fn edt_type_normalization() {
+        assert_eq!(edt_type_to_cfg("String"), "xs:string");
+        assert_eq!(edt_type_to_cfg("Number"), "xs:decimal");
+        assert_eq!(edt_type_to_cfg("CatalogRef.Товары"), "cfg:CatalogRef.Товары");
+        assert_eq!(edt_type_to_cfg("DefinedType.Сумма"), "cfg:DefinedType.Сумма");
+        assert_eq!(edt_type_to_cfg("AnyRef"), "cfg:AnyRef");
+    }
+
+    #[test]
+    fn form_handlers_extracted_actions_skipped() {
+        let form = r#"<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <handlers><event>OnCreateAtServer</event><name>ПриСозданииНаСервере</name></handlers>
+  <handlers><event>Selection</event><name>СписокВыбор</name></handlers>
+  <action xsi:type="form:FormCommandHandlerContainer"><handler>НеБрать</handler></action>
+</form:Form>"#;
+        let h = parse_mdo_form_handlers(form);
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().any(|x| x.handler == "ПриСозданииНаСервере"));
+        assert!(h.iter().any(|x| x.handler == "СписокВыбор"));
+        // Привязка команды (<action><handler>) — не event-обработчик, не берём.
+        assert!(!h.iter().any(|x| x.handler == "НеБрать"));
+        // Обработчики лежат в корне формы — владельца-элемента у них нет.
+        assert!(h.iter().all(|x| x.element.is_none()));
+    }
+
+    #[test]
+    fn form_handlers_carry_owning_element() {
+        let form = r#"<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <items xsi:type="form:FormGroup">
+    <name>ГруппаШапка</name>
+    <items xsi:type="form:FormField">
+      <name>Дата</name>
+      <handlers><event>OnChange</event><name>ДатаПриИзменении</name></handlers>
+      <extendedTooltip><name>ДатаПодсказка</name></extendedTooltip>
+    </items>
+  </items>
+  <handlers><event>OnOpen</event><name>ПриОткрытии</name></handlers>
+</form:Form>"#;
+        let h = parse_mdo_form_handlers(form);
+        assert_eq!(h.len(), 2);
+        let on_change = h.iter().find(|x| x.handler == "ДатаПриИзменении").unwrap();
+        // Владелец — ближайший элемент, а не группа и не имя подсказки.
+        assert_eq!(on_change.element.as_deref(), Some("Дата"));
+        let on_open = h.iter().find(|x| x.handler == "ПриОткрытии").unwrap();
+        assert_eq!(on_open.element, None);
+    }
+
+    #[test]
+    fn event_subscription_parsed() {
+        let mdo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:EventSubscription xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="x">
+  <name>ПодписьПриПроведении</name>
+  <synonym><key>ru</key><value>Подпись при проведении</value></synonym>
+  <source><types>DocumentObject.АвансовыйОтчет</types></source>
+  <event>Posting</event>
+  <handler>CommonModule.УчетЗарплаты.ПриПроведении</handler>
+</mdclass:EventSubscription>"#;
+        let (name, event, module, proc_, sources) = parse_mdo_event_subscription(mdo).unwrap();
+        assert_eq!(name, "ПодписьПриПроведении");
+        // Posting → русское событие (как у формата Конфигуратора).
+        assert_eq!(event, "ОбработкаПроведения");
+        assert_eq!(module, "CommonModule.УчетЗарплаты");
+        assert_eq!(proc_, "ПриПроведении");
+        assert_eq!(sources, vec!["DocumentObject.АвансовыйОтчет"]);
+    }
+    #[test]
+    fn config_refs_cover_four_kinds() {
+        // Состав подсистемы: прямые теги <content> с полным именем объекта.
+        let sub = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Subsystem xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="s">
+  <name>Продажи</name>
+  <content>Catalog.Контрагенты</content>
+  <content>Document.ЗаказКлиента</content>
+</mdclass:Subsystem>"#;
+        assert_eq!(
+            parse_mdo_config_refs("Subsystem", sub)
+                .iter()
+                .map(|r| (r.0, r.1.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("subsystem_content", "Catalog.Контрагенты".to_string()),
+                ("subsystem_content", "Document.ЗаказКлиента".to_string()),
+            ]
+        );
+
+        // Состав плана обмена: <content> — обёртка, имя лежит в <mdObject>.
+        let ep = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:ExchangePlan xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="e">
+  <name>Обмен</name>
+  <content>
+    <mdObject>Constant.ВестиУчет</mdObject>
+    <autoRecord>Allow</autoRecord>
+  </content>
+</mdclass:ExchangePlan>"#;
+        assert_eq!(
+            parse_mdo_config_refs("ExchangePlan", ep)
+                .iter()
+                .map(|r| (r.0, r.1.clone()))
+                .collect::<Vec<_>>(),
+            vec![("exchange_plan_content", "Constant.ВестиУчет".to_string())]
+        );
+
+        // Цели определяемого типа: ссылочные становятся рёбрами, примитивы нет.
+        let dt = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:DefinedType xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="d">
+  <name>Партнер</name>
+  <type>
+    <types>CatalogRef.Контрагенты</types>
+    <types>DocumentRef.ЗаказКлиента</types>
+    <types>String</types>
+  </type>
+</mdclass:DefinedType>"#;
+        let refs = parse_mdo_config_refs("DefinedType", dt);
+        assert_eq!(
+            refs.iter().map(|r| (r.0, r.1.clone())).collect::<Vec<_>>(),
+            vec![
+                ("defined_type_content", "Catalog.Контрагенты".to_string()),
+                ("defined_type_content", "Document.ЗаказКлиента".to_string()),
+            ],
+            "строковый тип ребром не становится"
+        );
+        assert!(
+            refs.iter().all(|r| r.3),
+            "две цели — составной тип"
+        );
+
+        // Функциональная опция: расположение (объект + сырое значение) и состав.
+        let fo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:FunctionalOption xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="f">
+  <name>ВестиУчетПоСкладам</name>
+  <location>InformationRegister.Настройки.Resource.Значение</location>
+  <content>Document.ЗаказКлиента.Attribute.Склад</content>
+</mdclass:FunctionalOption>"#;
+        let refs = parse_mdo_config_refs("FunctionalOption", fo);
+        assert_eq!(
+            refs.iter()
+                .map(|r| (r.0, r.1.clone(), r.2.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "functional_option_location",
+                    "InformationRegister.Настройки".to_string(),
+                    "InformationRegister.Настройки.Resource.Значение".to_string()
+                ),
+                (
+                    "functional_option_content",
+                    "Document.ЗаказКлиента.Attribute.Склад".to_string(),
+                    String::new()
+                ),
+            ]
+        );
+
+        // Вид без конфигурационных рёбер — пустой результат без разбора.
+        assert!(parse_mdo_config_refs("Catalog", sub).is_empty());
+    }
+}

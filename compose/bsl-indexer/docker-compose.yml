@@ -1,0 +1,22 @@
+name: bsl-indexer
+services:
+  bsl-indexer:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    image: bsl-indexer:local
+    container_name: bsl-indexer
+    environment:
+      CODE_INDEX_HOME: /data/code-index-home
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "9003"
+    volumes:
+      - /srv/ai/ubd/src:/repos/SRC
+      - bsl-indexer-home:/data/code-index-home
+      - ./deploy/docker/daemon.toml:/data/code-index-home/daemon.toml:ro
+    ports:
+      - "8011:9003"
+    restart: unless-stopped
+
+volumes:
+  bsl-indexer-home:

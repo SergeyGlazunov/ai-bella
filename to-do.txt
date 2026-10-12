@@ -1,0 +1,7 @@
+3. Contour / orchestrator cutover
+Contour = Python-оркестратор из комплекта AI-Contour (controller/, timer ai-sync), который по ТЗ должен заменить ночной PowerShell (UBD Config Sync и т.п.).
+
+Cutover = официально выключить старые Task Scheduler-задачи и включить contour update как единственный nightly.
+
+Сейчас на стенде оркестратор не переключён — ночь всё ещё PowerShell.
+В этом плане мы чиним и выравниваем текущий PowerShell/ai2-контур, а не делаем большой переход на Contour. Иначе смешиваются две программы: «починить индексы» и «внедрить новый оркестратор».

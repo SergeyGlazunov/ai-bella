@@ -1,0 +1,36 @@
+# Isolation overlay: ai2 graph + query for KB only.
+# compose -p ai2-mcp-kb -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.ai2.yml \
+#   up -d neo4j mcp-metadata-graph mcp-query-builder
+services:
+  neo4j:
+    container_name: ai2-neo4j-kb
+    image: neo4j:5-community
+    ports: !override
+      - "127.0.0.1:7674:7474"
+      - "127.0.0.1:7887:7687"
+
+  mcp-metadata-graph:
+    container_name: ai2-mcp-graph-kb
+    image: ai2-mcp-metadata-graph:latest
+    ports: !override
+      - "0.0.0.0:${MCP_PORT:-8201}:8001"
+      - "127.0.0.1:9200:9000"
+    networks:
+      - default
+
+  metadata-indexer:
+    container_name: ai2-metadata-indexer-kb
+    image: ai2-metadata-indexer:latest
+
+  mcp-query-builder:
+    container_name: ai2-mcp-query-builder-kb
+    image: ai2-mcp-metadata-graph:latest
+    ports: !override
+      - "0.0.0.0:${QUERY_PORT:-8209}:8009"
+    networks:
+      - default
+
+networks:
+  default:
+    name: ai2-mcp-kb_net
+    external: true

@@ -1,0 +1,1170 @@
+//! Граф вызовов процедур 1С: сборка слоёв, резолв адресов вызываемых
+//! процедур и отсев платформенного балласта.
+
+use std::path::Path;
+use anyhow::Result;
+use rusqlite::params;
+
+use super::*;
+
+
+// ───────────────────────── Инкрементальное обновление ─────────────────────
+//
+// Slice-rebuild графа вызовов и per-object/per-file апдейт XML-слоёв для
+// файлов одного watcher-батча. Семантика идентична полному `run_index_extras`
+// (см. тест эквивалентности в конце файла). Новых таблиц/колонок не вводит —
+// все slice-функции дедуплицированы так же, как полное построение
+// (`build_call_graph`), и `find_path_bsl`/`find_data_path` это не затрагивает.
+
+/// Точечно обновить слой `direct` графа вызовов для ОДНОГО файла.
+///
+/// proc_call_graph дедуплицирован и не помнит источник ребра, поэтому
+/// «прежние» рёбра файла берём из side-таблицы `direct_edge_files`, а
+/// «текущие» — из core-таблицы `calls` (её базовый индексатор уже обновил
+/// по этому файлу к моменту вызова). Трогаем только рёбра этого файла:
+///   1) прежние рёбра файла, которых больше нет ни в одном файле
+///      (проверка `calls` — она глобальна и актуальна), удаляем из графа;
+///   2) текущие рёбра файла доинсертим (существующие отсекает UNIQUE).
+/// Стоимость — O(рёбер одного файла), не зависит от размера графа.
+pub(crate) fn update_call_graph_direct_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    abs_path: &Path,
+) -> Result<()> {
+    // rel-путь в формате files.path (forward slash, относительно корня репо).
+    let rel = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+
+    // Прежние рёбра файла (из side-карты).
+    let old: Vec<(String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT caller, callee FROM direct_edge_files \
+             WHERE repo = ?1 AND source_file = ?2",
+        )?;
+        let v = st
+            .query_map(params![REPO_DEFAULT, &rel], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        v
+    };
+    // Текущие рёбра файла (из calls; для удалённого файла — пусто, files-строки нет).
+    let new: Vec<(String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT DISTINCT c.caller, c.callee \
+             FROM calls c JOIN files f ON f.id = c.file_id \
+             WHERE f.path = ?1 AND c.caller IS NOT NULL AND c.callee IS NOT NULL",
+        )?;
+        let v = st
+            .query_map(params![&rel], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        v
+    };
+
+    // Обновляем side-карту файла: снести прежние записи, записать текущие.
+    conn.execute(
+        "DELETE FROM direct_edge_files WHERE repo = ?1 AND source_file = ?2",
+        params![REPO_DEFAULT, &rel],
+    )?;
+    {
+        let mut ins = conn.prepare(
+            "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (caller, callee) in &new {
+            ins.execute(params![REPO_DEFAULT, caller, callee, &rel])?;
+        }
+    }
+
+    use std::collections::HashSet;
+    let new_set: HashSet<&(String, String)> = new.iter().collect();
+
+    // Рёбра, которые файл перестал давать → удалить из графа. Ключ теперь
+    // привязан к файлу (`<rel>::<caller>`), поэтому ребро принадлежит ровно
+    // этому файлу и не делится с другими — удаляем безусловно, как только
+    // файл его больше не даёт. Прежняя глобальная проверка по `calls` (нужная
+    // для голых ключей, чтобы не снести ребро, которое даёт другой файл) стала
+    // не только лишней, но и неверной: при path-привязке она удержала бы
+    // мёртвое ребро файла, если одноимённую пару даёт другой модуль.
+    {
+        let mut del = conn.prepare(
+            "DELETE FROM proc_call_graph \
+             WHERE repo = ?1 AND call_type = 'direct' \
+               AND caller_proc_key = ?2 AND callee_proc_name = ?3",
+        )?;
+        for e in &old {
+            if new_set.contains(e) {
+                continue;
+            }
+            let caller_key = format!("{}::{}", rel, e.0);
+            del.execute(params![REPO_DEFAULT, caller_key, &e.1])?;
+        }
+    }
+
+    // Текущие рёбра файла → в граф (существующие отсекает UNIQUE без записи).
+    // caller_proc_key привязан к файлу: `<rel>::<caller>` (как в build_call_graph).
+    {
+        let mut ins = conn.prepare(
+            "INSERT OR IGNORE INTO proc_call_graph \
+             (repo, caller_proc_key, callee_proc_name, call_type) \
+             VALUES (?1, ?2, ?3, 'direct')",
+        )?;
+        for (caller, callee) in &new {
+            let caller_key = format!("{}::{}", rel, caller);
+            ins.execute(params![REPO_DEFAULT, caller_key, callee])?;
+        }
+    }
+
+    // callee_proc_key здесь НЕ резолвим: новые рёбра остаются с NULL-адресом,
+    // а резолв всего графа (resolve_and_prune_direct_edges) вызывающий делает
+    // ОДИН раз после пофайлового цикла батча. Пофайловый резолв раньше
+    // (build_common_module_methods + resolve_* + prune_* на КАЖДЫЙ .bsl) давал
+    // квадратичную деградацию на bulk-батче: каждый файл заново сканировал весь
+    // proc_call_graph и пересобирал tmp-карты общих модулей.
+    conn.execute("COMMIT", [])?;
+    // Строки на каждый файл здесь нет намеренно: на пачке в тысячи файлов она
+    // раздувает журнал и ничего не добавляет — по ней всё равно смотрят итог
+    // по пачке, а он печатается после цикла («граф вызовов, пофайловая часть»).
+    Ok(())
+}
+
+
+/// Пересобрать слой `subscription` графа вызовов из таблицы
+/// `event_subscriptions`. Идентично subscription-части `build_call_graph`.
+pub(crate) fn rebuild_call_graph_subscription(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ? AND call_type = 'subscription'",
+        params![REPO_DEFAULT],
+    )?;
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, 'event::' || event, handler_module || '.' || handler_proc, 'subscription' \
+         FROM event_subscriptions \
+         WHERE repo = ? AND handler_module != '' AND handler_proc != ''",
+        params![REPO_DEFAULT, REPO_DEFAULT],
+    )?;
+    conn.execute("COMMIT", [])?;
+    tracing::debug!("proc_call_graph subscription (slice-rebuild): {} рёбер", n);
+    Ok(())
+}
+
+
+/// Пересобрать слой `form_event` графа вызовов из таблицы `metadata_forms`.
+/// Идентично form_event-части `build_call_graph`.
+pub(crate) fn rebuild_call_graph_form_event(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ? AND call_type = 'form_event'",
+        params![REPO_DEFAULT],
+    )?;
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT owner_full_name, form_name, handlers_json \
+             FROM metadata_forms WHERE repo = ?",
+        )?;
+        let mapped = stmt
+            .query_map(params![REPO_DEFAULT], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        mapped
+    };
+    let mut form_count = 0usize;
+    {
+        let mut insert = conn.prepare(
+            "INSERT OR IGNORE INTO proc_call_graph \
+             (repo, caller_proc_key, callee_proc_name, call_type) \
+             VALUES (?, ?, ?, 'form_event')",
+        )?;
+        for (owner, form_name, handlers_json) in rows {
+            let parsed: Vec<serde_json::Value> =
+                serde_json::from_str(&handlers_json).unwrap_or_default();
+            for h in parsed {
+                let event = h.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let handler = h.get("handler").and_then(|v| v.as_str()).unwrap_or("");
+                if event.is_empty() || handler.is_empty() {
+                    continue;
+                }
+                let caller_key = format!("form::{}::{}::{}", owner, form_name, event);
+                let callee_name = format!("{}::{}::{}", owner, form_name, handler);
+                insert.execute(params![REPO_DEFAULT, caller_key, callee_name])?;
+                form_count += 1;
+            }
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    tracing::debug!("proc_call_graph form_event (slice-rebuild): {} рёбер", form_count);
+    Ok(())
+}
+
+
+/// Построить граф вызовов из заполненных metadata_forms,
+/// event_subscriptions и core-таблицы `calls`. Удаляет старые ребра
+/// этого репо и вставляет свежие — идемпотентно.
+/// Полный пересбор слоя `extension_override` из `functions.override_*`.
+/// Идентично subscription-/form_event-частям `build_call_graph`. Вызывается
+/// инкрементально при изменении `.bsl` — override-данные живут в `functions`,
+/// которую core-индексатор обновляет на правку модуля расширения.
+pub(crate) fn rebuild_call_graph_extension_override(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ? AND call_type = 'extension_override'",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, f.override_target, f.name, 'extension_override' \
+         FROM functions f \
+         WHERE f.override_type IS NOT NULL AND f.override_target IS NOT NULL \
+           AND f.override_target != '' AND f.name != ''",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+
+/// Вторичные индексы таблиц графа — те же, что заводит расширение схемы.
+///
+/// На полном пересборе снимаются перед заливкой и поднимаются после неё. Ключи
+/// рёбер приходят вперемешку, поэтому вставка миллиона строк при живых индексах
+/// правит их деревья в случайных местах — на дешёвом накопителе это самая
+/// дорогая работа из возможных. Построение заново идёт одним проходом с
+/// сортировкой. Список обязан совпадать со `schema.rs`: расходятся — после
+/// пересбора часть индексов не вернётся, и выдача просядет молча.
+const GRAPH_INDEX_NAMES: &[&str] = &[
+    "idx_pcg_repo",
+    "idx_pcg_caller",
+    "idx_pcg_callee_name",
+    "idx_pcg_call_type",
+    "idx_pcg_callee_key",
+    "idx_def_source",
+];
+
+const GRAPH_INDEX_DDL: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_pcg_repo ON proc_call_graph(repo);",
+    "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
+    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
+    "CREATE INDEX IF NOT EXISTS idx_pcg_call_type ON proc_call_graph(repo, call_type);",
+    // Частичный — см. комментарий в schema.rs: полный планировщик брал для `IS NULL`.
+    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_key ON proc_call_graph(repo, callee_proc_key) WHERE callee_proc_key IS NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS idx_def_source ON direct_edge_files(repo, source_file);",
+];
+
+pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+
+    // Снимаем вне транзакции: DDL внутри неё сложил бы страницы удаляемых
+    // деревьев в тот же журнал, от роста которого мы и уходим. Обрыв между
+    // снятием и подъёмом оставляет таблицу без вторичных индексов — данные
+    // целы, а сами индексы вернёт ближайшее открытие базы (расширение схемы
+    // создаёт их с `IF NOT EXISTS`).
+    for name in GRAPH_INDEX_NAMES {
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))?;
+    }
+
+    conn.execute("BEGIN", [])?;
+    let t_step = std::time::Instant::now();
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+    tracing::debug!("удаление прежних рёбер — {} мс", t_step.elapsed().as_millis());
+
+    // ── direct: из core::calls ────────────────────────────────────────
+    // Таблица `calls` core содержит ребра «caller имя → callee имя»
+    // на уровне исходников. Преобразуем в proc_call_graph с типом
+    // `direct`. caller_proc_key — стабильный ключ вызывателя в формате
+    // `<rel_path>::<caller>` (через JOIN calls ⋈ files): тот же формат,
+    // что у procedure_enrichment.proc_key, что даёт джойн граф↔термы и
+    // разводит одноимённые процедуры из разных модулей (две
+    // `ОбработкаПроведения` больше не схлопываются в одну строку).
+    // callee_proc_name остаётся сырым именем; callee_proc_key (адрес
+    // цели) заполняет резолвер на этапе 4e.
+    // ── direct + direct_edge_files: материализуем calls⋈files ОДИН раз ──
+    // Дорогой JOIN+DISTINCT по calls⋈files раньше гонялся дважды (для
+    // proc_call_graph и для direct_edge_files) и в паре с построчной вставкой
+    // в индексируемую таблицу деградировал сильнее суммы частей. Собираем
+    // распарсенное множество рёбер во временную таблицу один раз и наполняем
+    // из неё обе таблицы простыми вставками без повторного JOIN/DISTINCT.
+    let t_step = std::time::Instant::now();
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw; CREATE TEMP TABLE tmp_direct_raw AS SELECT DISTINCT f.path AS path, c.caller AS caller, c.callee AS callee FROM calls c JOIN files f ON f.id = c.file_id WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL;")?;
+    tracing::debug!("выборка рёбер из вызовов — {} мс", t_step.elapsed().as_millis());
+
+    // Рёбра слоя `direct` собираются во временной таблице и там же проходят
+    // резолв и отсев. Прежде они попадали в основную таблицу сразу, целиком: на
+    // типовой торговой конфигурации это 1,17 млн строк, из которых отсев тут же
+    // выбрасывал 622 тыс. — больше половины вставок делалось, чтобы через
+    // минуту быть удалёнными, и каждая обновляла ключ уникальности и четыре
+    // индекса, а её страницы ложились в журнал. Временная таблица живёт в
+    // памяти (SQLite собран с `SQLITE_TEMP_STORE=2`), индексов и журнала у неё
+    // нет. Набор колонок повторяет основную таблицу, чтобы запросы резолва были
+    // дословно теми же — иначе полный пересбор и точечное обновление разошлись
+    // бы двумя реализациями одного правила.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_direct;
+         CREATE TEMP TABLE tmp_pcg_direct (
+             repo TEXT NOT NULL,
+             caller_proc_key TEXT NOT NULL,
+             callee_proc_name TEXT NOT NULL,
+             callee_proc_key TEXT,
+             call_type TEXT NOT NULL
+         );",
+    )?;
+    conn.execute(
+        "INSERT INTO tmp_pcg_direct (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, path || '::' || caller, callee, 'direct' FROM tmp_direct_raw",
+        params![REPO_DEFAULT],
+    )?;
+
+    // Побочная таблица источников рёбер: строк столько же, сколько рёбер до
+    // отсева (1,17 млн на типовой торговой конфигурации), и у неё свой ключ
+    // уникальности из четырёх текстовых полей. Порядок вставки задан этим
+    // ключом — строки ложатся в его дерево по возрастанию, а не вразнобой.
+    let t_step = std::time::Instant::now();
+    conn.execute("DELETE FROM direct_edge_files WHERE repo = ?", params![REPO_DEFAULT])?;
+    let def_count = conn.execute(
+        "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
+         SELECT ?, caller, callee, path FROM tmp_direct_raw ORDER BY caller, callee, path",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw;")?;
+    tracing::debug!(
+        "таблица источников рёбер: {} строк за {} мс",
+        def_count,
+        t_step.elapsed().as_millis()
+    );
+
+    // ── subscription: event_subscriptions → ребро ────────────────────
+    // caller_proc_key для подписок — это «виртуальный триггер» вида
+    // `<source>::<event>`, например `cfg:DocumentRef.Реализация::ПриЗаписи`.
+    // Это не реальная процедура, а событие платформы — но в графе оно
+    // занимает позицию вызывателя. callee — `<handler_module>.<handler_proc>`.
+    let subscription_count = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT \
+            ?, \
+            'event::' || event, \
+            handler_module || '.' || handler_proc, \
+            'subscription' \
+         FROM event_subscriptions \
+         WHERE repo = ? AND handler_module != '' AND handler_proc != ''",
+        params![REPO_DEFAULT, REPO_DEFAULT],
+    )?;
+
+    // ── form_event: metadata_forms → ребра ───────────────────────────
+    // Каждый `(event, handler)` в handlers_json превращается в ребро.
+    // Source — `form::<owner_full_name>::<form_name>::<event>`,
+    // callee — `<owner_full_name>::<form_name>::<handler>`. Это
+    // не классические module.proc — просто стабильные ключи для графа.
+    //
+    // SQLite до 3.45 не имеет чистого parsed-JSON для array-iteration,
+    // поэтому обрабатываем построчно через rusqlite.
+    let mut form_count = 0usize;
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT owner_full_name, form_name, handlers_json \
+             FROM metadata_forms WHERE repo = ?",
+        )?;
+        let mapped = stmt
+            .query_map(params![REPO_DEFAULT], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        mapped
+    };
+
+    {
+        let mut insert = conn.prepare(
+            "INSERT OR IGNORE INTO proc_call_graph \
+             (repo, caller_proc_key, callee_proc_name, call_type) \
+             VALUES (?, ?, ?, 'form_event')",
+        )?;
+        for (owner, form_name, handlers_json) in rows {
+            let parsed: Vec<serde_json::Value> =
+                serde_json::from_str(&handlers_json).unwrap_or_default();
+            for h in parsed {
+                let event = h.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let handler = h.get("handler").and_then(|v| v.as_str()).unwrap_or("");
+                if event.is_empty() || handler.is_empty() {
+                    continue;
+                }
+                let caller_key = format!("form::{}::{}::{}", owner, form_name, event);
+                let callee_name = format!("{}::{}::{}", owner, form_name, handler);
+                insert.execute(params![REPO_DEFAULT, caller_key, callee_name])?;
+                form_count += 1;
+            }
+        }
+    }
+
+    // ── extension_override: перехваты расширений (&Перед/&После/&Вместо) ──
+    // Данные уже в functions.override_type/override_target (заполняет парсер
+    // bsl::extract_override_info при core-индексации) — отдельный парсер CFE НЕ
+    // нужен. Ребро: вызов БАЗОВОГО метода (override_target) достигает
+    // реализации-перехватчика (имя функции-перехватчика). По голому имени — как
+    // direct-рёбра (общий предел резолва, этап 4e). Так `find_path_bsl` проходит
+    // «сквозь &Вместо»: путь до базового метода продолжается в перехватчик.
+    let override_count = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, f.override_target, f.name, 'extension_override' \
+         FROM functions f \
+         WHERE f.override_type IS NOT NULL AND f.override_target IS NOT NULL \
+           AND f.override_target != '' AND f.name != ''",
+        params![REPO_DEFAULT],
+    )?;
+
+    // ── этап 4e + 4e-D + 4e-prune: резолв callee_proc_key + отсев балласта ──
+    // Общий с инкрементом хелпер: run_incremental_extras зовёт его же ОДИН раз
+    // после пофайловой вставки рёбер батча → идентичность full↔incremental.
+    resolve_and_prune_direct_edges(conn, EdgeScope::All, "tmp_pcg_direct")?;
+
+    // Выжившие рёбра — в основную таблицу. Порядок вставки задан ключом
+    // уникальности: строки ложатся в его дерево по возрастанию, а не вразнобой,
+    // и страниц переписывается меньше.
+    let t_step = std::time::Instant::now();
+    let direct_count = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type) \
+         SELECT repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type \
+         FROM tmp_pcg_direct ORDER BY caller_proc_key, callee_proc_name",
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_direct;")?;
+    tracing::debug!(
+        "перенос выживших рёбер в граф: {} строк за {} мс",
+        direct_count,
+        t_step.elapsed().as_millis()
+    );
+
+    let t_step = std::time::Instant::now();
+    conn.execute("COMMIT", [])?;
+    tracing::debug!("фиксация — {} мс", t_step.elapsed().as_millis());
+
+    // Индексы обратно — уже по готовому набору рёбер, одним проходом на каждый.
+    let idx_started = std::time::Instant::now();
+    for ddl in GRAPH_INDEX_DDL {
+        conn.execute_batch(ddl)?;
+    }
+    tracing::debug!(
+        "индексы графа подняты заново за {} мс",
+        idx_started.elapsed().as_millis()
+    );
+
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        (direct_count + subscription_count + form_count + override_count) as u64,
+        "ребро",
+        "ребра",
+        "рёбер",
+    ));
+    // Число рёбер слоя `direct` — то, что осталось ПОСЛЕ отсева балласта:
+    // вставляются теперь только выжившие. Прежде здесь стояло число вставленных
+    // до отсева, и итог расходился с содержимым таблицы вдвое.
+    tracing::info!(
+        "proc_call_graph: {} direct + {} subscription + {} form_event + {} extension_override ребер",
+        direct_count,
+        subscription_count,
+        form_count,
+        override_count
+    );
+
+    // TODO(этап 4f): extension_override — резолв override_target/имени перехватчика
+    // в `<rel_path>::<name>` (сейчас голые имена, как direct до 4e).
+    // TODO(этап 4g): external_assignment — runtime-анализ переменных
+    // неопределённого типа. Опционально, очень дорогая фича.
+
+    Ok(())
+}
+
+
+/// Этап 4e (общий для полного пересбора и инкремента): заполнить
+/// `callee_proc_key` всем direct-рёбрам с NULL-адресом и отсеять
+/// платформенный/объектный балласт. Транзакцией управляет вызывающий.
+/// Трогает ТОЛЬКО рёбра с `callee_proc_key IS NULL` → идемпотентен: результат
+/// идентичен при вызове из `build_call_graph` (после полной вставки рёбер) и из
+/// `run_incremental_extras` (после пофайловой вставки рёбер батча).
+/// `edges` — имя таблицы рёбер. Полный пересбор ведёт эту работу на временной
+/// таблице (она в памяти, без индексов и без журнала) и переносит в основную
+/// уже выживший набор; точечное обновление правит основную таблицу на месте.
+pub(crate) fn resolve_and_prune_direct_edges(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // При полном пересборе справочник экспортных процедур собирается заново:
+    // все процедуры конфигурации тут и так читаются. При точечном обновлении
+    // он уже актуален — его ведёт пофайловый путь.
+    if scope == EdgeScope::All {
+        let t = std::time::Instant::now();
+        let n = rebuild_exported_procs(conn)?;
+        tracing::debug!(
+            "справочник экспортных процедур: {} строк за {} мс",
+            n,
+            t.elapsed().as_millis()
+        );
+    }
+    // Времена шагов — на уровне отладки: по общей строке «граф вызовов» не
+    // видно, какой именно шаг сколько занял.
+    let t = std::time::Instant::now();
+    resolve_direct_callee_keys(conn, scope, edges)?;
+    tracing::debug!("резолв: локальные и экспортные адреса — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    resolve_callee_keys_by_manager(conn, scope, edges)?;
+    tracing::debug!("резолв: адреса через менеджеры — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    resolve_callee_keys_by_form_owner(conn, scope, edges)?;
+    tracing::debug!("резолв: вызовы из форм в модуль своего объекта — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    prune_platform_balast(conn, scope, edges)?;
+    tracing::debug!("отсев: платформенный балласт — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    prune_object_method_calls(conn, scope, edges)?;
+    tracing::debug!("отсев: вызовы методов объектов — {} мс", t.elapsed().as_millis());
+    Ok(())
+}
+
+/// Область резолва: весь граф или только рёбра файлов текущего пакета.
+///
+/// Рёбра, которые не удалось адресовать однозначно, остаются с пустым адресом
+/// навсегда (неоднозначные и платформенные вызовы) — поэтому проход «по всем
+/// неадресованным рёбрам» на большой конфигурации каждый раз перебирает одно и
+/// то же. При точечном обновлении трогаем только рёбра изменённых файлов.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EdgeScope {
+    /// Весь граф репозитория (полный пересбор).
+    All,
+    /// Только файлы пакета — их пути лежат во временной таблице
+    /// `tmp_pcg_scope`, которую готовит [`create_batch_scope`].
+    Batch,
+}
+
+impl EdgeScope {
+    /// Добавка к условию `WHERE`, ограничивающая рёбра файлами пакета.
+    ///
+    /// Сравнение идёт по равенству целого ключа вызывателя, а не по отрезанию
+    /// пути из него: `substr(...)` от индексированного столбца индексом не
+    /// пользуется, и просмотр шёл бы по всему графу — ровно то, от чего мы тут
+    /// уходим (замер: 6,3 с на пакете из трёх файлов).
+    fn clause(self) -> &'static str {
+        match self {
+            EdgeScope::All => "",
+            EdgeScope::Batch => " AND caller_proc_key IN (SELECT key FROM tmp_pcg_keys)",
+        }
+    }
+}
+
+/// Сложить пути файлов пакета во временную таблицу — по ней ограничивается
+/// область резолва. Пути — в формате `files.path` (относительные, через `/`).
+pub(crate) fn create_batch_scope(conn: &rusqlite::Connection, paths: &[String]) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_scope; CREATE TEMP TABLE tmp_pcg_scope(path TEXT PRIMARY KEY);",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT OR IGNORE INTO tmp_pcg_scope(path) VALUES (?1)")?;
+        for p in paths {
+            ins.execute(params![p])?;
+        }
+    }
+    // Ключи вызывателей этих файлов. Берутся из побочной таблицы рёбер, где
+    // источник ребра записан явно, — по ней ключ находится сразу, без разбора
+    // пути из самого ключа.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_keys; CREATE TEMP TABLE tmp_pcg_keys(key TEXT PRIMARY KEY);",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO tmp_pcg_keys(key) \
+         SELECT DISTINCT source_file || '::' || caller FROM direct_edge_files \
+         WHERE repo = ?1 AND source_file IN (SELECT path FROM tmp_pcg_scope)",
+        params![REPO_DEFAULT],
+    )?;
+    Ok(())
+}
+
+/// Убрать временные таблицы области.
+pub(crate) fn drop_batch_scope(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_scope; DROP TABLE IF EXISTS tmp_pcg_keys;")?;
+    Ok(())
+}
+
+
+/// Этап 4e: заполнить `callee_proc_key` для direct-рёбер графа — адрес
+/// вызываемой процедуры в формате `<rel_path>::<name>` (тот же, что у
+/// `caller_proc_key` и `procedure_enrichment.proc_key`). Две безопасные
+/// ступени; всё, что статически не выводится однозначно, остаётся NULL
+/// (ложная привязка хуже честного NULL).
+///
+///   (а) **локальный вызов** — голое имя callee объявлено как процедура в том
+///       же файле, что и вызыватель (1С: безымянный вызов разрешается в
+///       локальный модуль). Адрес = `<файл вызывателя>::<callee>`.
+///   (б) **уникальный экспорт** — имя callee принадлежит ровно одной экспортной
+///       процедуре во всей конфигурации. Ядро при разборе вызова теряет
+///       квалификатор модуля (`Модуль.Метод` → `Метод`), но единственность
+///       цели снимает неоднозначность: любой вызов этого имени ведёт именно
+///       туда. Экспортность определяется по ключевому слову `Экспорт` после
+///       `)` в сигнатуре (поле `functions.args`; отдельного флага нет).
+///
+/// Неоднозначные (имя экспортно в ≥2 модулях), динамические (`Объект.Метод`
+/// по переменной) и платформенные (`Сообщить`, `СтрНайти` — цель вне кода
+/// конфигурации) остаются NULL.
+pub(crate) fn resolve_direct_callee_keys(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // Карта уникальных экспортных имён → путь единственного носителя. Берётся
+    // из справочника: он и есть перечень экспортных процедур, читать заново
+    // все процедуры конфигурации с текстовым условием больше не нужно.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_uexp;
+         CREATE TEMP TABLE tmp_pcg_uexp AS
+           SELECT name AS nm, MIN(path) AS path FROM exported_procs
+           GROUP BY name HAVING COUNT(*) = 1;
+         CREATE INDEX tmp_pcg_uexp_idx ON tmp_pcg_uexp(nm);",
+    )?;
+
+    // (а) локальный вызов: callee объявлен в файле вызывателя.
+    //
+    // Способ проверки зависит от размера работы, и это подтверждено замером на
+    // типовой торговой конфигурации. При полном пересборе рёбер больше миллиона,
+    // и дешевле один раз сложить карту «файл + процедура» во временную таблицу
+    // (её построение окупается): 4,7 с против 20,5 с у проверки напрямую. При
+    // пакете изменений рёбер единицы, и всё наоборот: строить карту по 261 тыс.
+    // процедур ради трёх файлов — те самые секунды на ровном месте.
+    let local_exists = if scope == EdgeScope::All {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS tmp_pcg_funcs;
+             CREATE TEMP TABLE tmp_pcg_funcs AS
+               SELECT fl.path AS path, fn.name AS nm
+               FROM functions fn JOIN files fl ON fl.id = fn.file_id
+               WHERE fn.name IS NOT NULL AND fn.name != '';
+             CREATE INDEX tmp_pcg_funcs_idx ON tmp_pcg_funcs(path, nm);",
+        )?;
+        format!(
+            "SELECT 1 FROM tmp_pcg_funcs t \
+             WHERE t.path = substr({edges}.caller_proc_key, 1, \
+                                   instr({edges}.caller_proc_key, '::') - 1) \
+               AND t.nm = {edges}.callee_proc_name"
+        )
+    } else {
+        format!(
+            "SELECT 1 FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+             WHERE fl.path = substr({edges}.caller_proc_key, 1, \
+                                    instr({edges}.caller_proc_key, '::') - 1) \
+               AND fn.name = {edges}.callee_proc_name"
+        )
+    };
+    conn.execute(
+        &format!(
+            "UPDATE {edges} \
+             SET callee_proc_key = substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) \
+                                   || '::' || callee_proc_name \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+               AND EXISTS ({}){}",
+            local_exists,
+            scope.clause()
+        ),
+        params![REPO_DEFAULT],
+    )?;
+
+    // (б) уникальный экспорт: имя callee экспортно ровно в одном месте.
+    conn.execute(
+        &format!(
+            "UPDATE {edges} \
+             SET callee_proc_key = ( \
+                 SELECT u.path || '::' || u.nm FROM tmp_pcg_uexp u \
+                 WHERE u.nm = {edges}.callee_proc_name) \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+               AND callee_proc_name IN (SELECT nm FROM tmp_pcg_uexp){}",
+            scope.clause()
+        ),
+        params![REPO_DEFAULT],
+    )?;
+
+    // (в) квалифицированный вызов общего модуля: callee хранится склеенным
+    // `Модуль.Метод`; по квалификатору точно находим файл общего модуля и его
+    // экспортный метод. Заменяет эвристику уникального экспорта для имён,
+    // экспортных в ≥2 модулях. Только вызовы с ОДНОЙ точкой (общий модуль);
+    // цепочки `Справочники.X.Метод` (менеджеры) — следующий шаг, остаются NULL.
+    build_common_module_methods(conn)?;
+    resolve_callee_keys_by_qualifier(conn, scope, edges)?;
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_funcs; \
+         DROP TABLE IF EXISTS tmp_pcg_uexp; \
+         DROP TABLE IF EXISTS tmp_pcg_cmeth;",
+    )?;
+    Ok(())
+}
+
+
+/// Построить temp-таблицу `tmp_pcg_cmeth` экспортных методов общих модулей:
+/// `(mname, method, path)`, где `mname` — имя общего модуля (сегмент пути после
+/// `CommonModules/`). Используется Tier C резолва (`resolve_callee_keys_by_qualifier`)
+/// и в полном пересборе, и в инкременте.
+pub(crate) fn build_common_module_methods(conn: &rusqlite::Connection) -> Result<()> {
+    // Источник — справочник экспортных процедур: имя общего модуля и вид
+    // модуля в нём уже разобраны, читать пути и сигнатуры заново незачем.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_cmeth;\n\
+         CREATE TEMP TABLE tmp_pcg_cmeth AS\n\
+           SELECT owner AS mname, name AS method, path AS path\n\
+           FROM exported_procs WHERE kind = 'common' AND owner IS NOT NULL;\n\
+         CREATE INDEX tmp_pcg_cmeth_idx ON tmp_pcg_cmeth(mname, method);",
+    )?;
+    Ok(())
+}
+
+
+/// Tier C: резолв `callee_proc_key` по квалификатору общего модуля. callee
+/// хранится склеенным `Модуль.Метод`; берём часть до точки как имя модуля,
+/// после — как метод, и точно адресуем в файл общего модуля. Требует заранее
+/// построенной `tmp_pcg_cmeth`. Работает только для вызовов с ОДНОЙ точкой
+/// (общий модуль); цепочки `Справочники.X.Метод` пропускаются (остаются NULL).
+/// `scope` = `Batch` ограничивает рёбрами файлов пакета (точечное обновление).
+pub(crate) fn resolve_callee_keys_by_qualifier(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    let mut sql = format!(
+        "UPDATE {edges} \
+         SET callee_proc_key = ( \
+             SELECT MIN(cm.path || '::' || cm.method) FROM tmp_pcg_cmeth cm \
+             WHERE cm.mname = substr({edges}.callee_proc_name, 1, instr({edges}.callee_proc_name,'.')-1) \
+               AND cm.method = substr({edges}.callee_proc_name, instr({edges}.callee_proc_name,'.')+1)) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr(callee_proc_name,'.') > 0 \
+           AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0 \
+           AND EXISTS ( \
+             SELECT 1 FROM tmp_pcg_cmeth cm \
+             WHERE cm.mname = substr({edges}.callee_proc_name, 1, instr({edges}.callee_proc_name,'.')-1) \
+               AND cm.method = substr({edges}.callee_proc_name, instr({edges}.callee_proc_name,'.')+1))",
+    );
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
+    Ok(())
+}
+
+
+/// Имена-«балласт»: методы коллекций/объектов/запросов/выборок и глобальные
+/// функции платформы, чья цель лежит ВНЕ кода конфигурации. Ядро стирает
+/// приёмник вызова (`Коллекция.Добавить` → `Добавить`), поэтому такие рёбра
+/// ведут «в никуда» (callee_proc_key не резолвится) и составляют ~⅓ графа.
+/// Список курируемый и намеренно консервативный: имена методов БСП/общих
+/// модулей (`ЗначениеРеквизитаОбъекта`, `ПодсистемаСуществует`,
+/// `СообщитьПользователю`, `КодОсновногоЯзыка`…) сюда НЕ входят — они резолвятся
+/// в реальные процедуры. Дополнительная страховка от коллизий имён — в
+/// `prune_platform_balast` удаляются только рёбра с `callee_proc_key IS NULL`.
+pub(crate) const PLATFORM_BALAST: &[&str] = &[
+    // методы коллекций / объектов / запросов / выборок (приёмник стёрт ядром)
+    "Вставить", "Добавить", "Количество", "Найти", "Выбрать", "Следующий",
+    "Получить", "Выгрузить", "ВыгрузитьКолонку", "Записать", "НайтиСтроки",
+    "Очистить", "Удалить", "Закрыть", "ПолучитьОбъект", "Прочитать",
+    "Установить", "ПолучитьЭлементы", "НайтиПоИдентификатору", "Свойство",
+    "Метаданные", "ПолноеИмя", "УникальныйИдентификатор", "ПустаяСсылка",
+    "СоздатьНаборЗаписей",
+    // глобальные функции / процедуры платформы
+    "ЗначениеЗаполнено", "НСтр", "Тип", "ТипЗнч", "Выполнить", "СтрЗаменить",
+    "СтрШаблон", "ПодставитьПараметрыВСтроку", "Строка", "СокрЛП",
+    "СтрСоединить", "СтрНайти", "СтрДлина", "Лев", "Сред", "Прав", "Формат",
+    "ТекущаяДатаСеанса", "ПредопределенноеЗначение", "ОткрытьФорму", "Сообщить",
+    "УстановитьПривилегированныйРежим", "ПолучитьФункциональнуюОпцию",
+    "ЗаписьЖурналаРегистрации", "НачатьТранзакцию", "ЗафиксироватьТранзакцию",
+    "ОтменитьТранзакцию", "ОчиститьСообщения", "ИнформацияОбОшибке",
+    "ПодробноеПредставлениеОшибки", "ПоместитьВоВременноеХранилище",
+    "ПолучитьИзВременногоХранилища", "ВыполнитьОбработкуОповещения",
+    "ОбщийМодуль", "ЗаполнитьЗначенияСвойств", "УстановитьПараметр",
+    "ОписаниеОповещения", "ОписаниеТипов", "ПустаяСтрока",
+    // конструкторы типов (Новый X — ядро пишет callee = имя типа)
+    "Структура", "Массив", "Запрос", "Соответствие", "ТаблицаЗначений",
+    "СписокЗначений",
+
+];
+
+/// Удалить direct-рёбра-балласт (см. [`PLATFORM_BALAST`]). Две защиты от потери
+/// реальных рёбер: (1) удаляются только рёбра с `callee_proc_key IS NULL` —
+/// резолвленные в реальную процедуру сохраняются; (2) имя, экспортное где-либо
+/// в конфигурации, не трогается вовсе (адаптивно к размеру конфигурации). `file_scope=
+/// Some(rel)` ограничивает удаление рёбрами одного файла (инкремент), `None` —
+/// весь граф (полный пересбор).
+pub(crate) fn prune_platform_balast(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // Имена — статические кириллические идентификаторы без SQL-метасимволов,
+    // поэтому инлайн в IN(...) безопасен (не пользовательский ввод).
+    let in_list = PLATFORM_BALAST
+        .iter()
+        .map(|n| format!("'{}'", n))
+        .collect::<Vec<_>>()
+        .join(",");
+    // Защита от коллизий имён, адаптивная под конфигурацию: НЕ трогаем имя,
+    // которое где-либо в конфигурации экспортно (`Записать`/`Удалить`/`Получить`
+    // и т.п. могут быть и методом объекта платформы, и реальной экспортной
+    // процедурой). Стерев квалификатор, ядро делает их неотличимыми; для
+    // экспортных-в-конфиге имён это означало бы потерю реальных рёбер при
+    // неоднозначном (NULL) резолве — а потеря хуже шума. Чистая платформа
+    // (`Вставить`/`НСтр`/`Структура`…, нигде не экспортна) отсеивается.
+    // Имя метода для сопоставления с балластом: callee хранится склеенным
+    // (`Объект.Записать`), поэтому берём часть ПОСЛЕ точки (`Записать`); у голых
+    // имён (точки нет) — имя целиком. По первой точке — для одноточечных вызовов
+    // это и есть метод; многоточечные цепочки в балласт не попадут (не страшно).
+    let meth = "substr(callee_proc_name, CASE WHEN instr(callee_proc_name,'.')>0 \
+                THEN instr(callee_proc_name,'.')+1 ELSE 1 END)";
+    let mut sql = format!(
+        "DELETE FROM {edges} \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND {meth} IN ({in_list}) \
+           AND {meth} NOT IN (SELECT name FROM exported_procs)"
+    );
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
+    Ok(())
+}
+
+
+/// Коллекции метаданных 1С — менеджеры, доступные как `Справочники.X`,
+/// `Документы.X` и т.п. Одноточечный вызов с таким префиксом — обращение к
+/// менеджеру (вызов менеджер-модуля), НЕ метод локального объекта. Прун
+/// объектных вызовов их щадит: резолв менеджер-модулей — отдельный шаг.
+pub(crate) const METADATA_COLLECTIONS: &[&str] = &[
+    "Справочники", "Документы", "ЖурналыДокументов", "Перечисления",
+    "Отчеты", "Обработки", "ПланыВидовХарактеристик", "ПланыСчетов",
+    "ПланыВидовРасчета", "РегистрыСведений", "РегистрыНакопления",
+    "РегистрыБухгалтерии", "РегистрыРасчета", "БизнесПроцессы", "Задачи",
+    "ПланыОбмена", "Константы", "Последовательности", "КритерииОтбора",
+    "ОпределяемыеТипы",
+    // англоязычные эквиваленты (EN-конфигурации)
+    "Catalogs", "Documents", "DocumentJournals", "Enums", "Reports",
+    "DataProcessors", "ChartsOfCharacteristicTypes", "ChartsOfAccounts",
+    "ChartsOfCalculationTypes", "InformationRegisters", "AccumulationRegisters",
+    "AccountingRegisters", "CalculationRegisters", "BusinessProcesses",
+    "Tasks", "ExchangePlans", "Constants", "Sequences",
+
+];
+
+/// Прун объектных вызовов (CORE B): удалить склеенные ОДНОТОЧЕЧНЫЕ рёбра
+/// `Объект.Метод`, где квалификатор — локальная переменная / объект платформы
+/// (`Запрос.Выполнить`, `Выборка.Следующий`, `НаборЗаписей.Записать`), цель
+/// которых вне кода конфигурации. Квалификатор-driven — точнее списочного
+/// балласта: знаем, что приёмник не модуль, поэтому режем даже коллизионные
+/// имена методов. ТРИ ЗАЩИТЫ, чтобы не снести реальные вызовы:
+///   1) только ОДНА точка — цепочки `Справочники.X.Метод` (менеджеры) не трогаем;
+///   2) квалификатор НЕ имя общего модуля (его резолвит Tier C);
+///   3) квалификатор НЕ коллекция метаданных (`Справочники`/`Документы`/… —
+///      вызовы менеджеров, резолв отложен).
+/// Удаляются только рёбра с `callee_proc_key IS NULL`. `file_scope=Some(rel)` —
+/// в области одного файла (инкремент).
+pub(crate) fn prune_object_method_calls(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // tmp_pmods — имена общих модулей (сегмент пути после CommonModules/).
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pmods;\n\
+         CREATE TEMP TABLE tmp_pmods AS\n\
+           SELECT DISTINCT substr(seg,1,instr(seg,'/')-1) AS q FROM (\n\
+             SELECT substr(path, instr(path,'CommonModules/')+length('CommonModules/')) AS seg\n\
+             FROM files WHERE path LIKE '%CommonModules/%/Module.bsl') WHERE instr(seg,'/')>0;\n\
+         CREATE INDEX tmp_pmods_idx ON tmp_pmods(q);",
+    )?;
+    // tmp_pcolls — коллекции метаданных (защита одноточечных менеджер-вызовов).
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcolls; CREATE TEMP TABLE tmp_pcolls(q TEXT);")?;
+    {
+        let mut ins = conn.prepare("INSERT INTO tmp_pcolls(q) VALUES (?1)")?;
+        for c in METADATA_COLLECTIONS {
+            ins.execute(params![c])?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX tmp_pcolls_idx ON tmp_pcolls(q);")?;
+
+    let first = "substr(callee_proc_name, 1, instr(callee_proc_name,'.')-1)";
+    let single_dot = "instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0";
+    // (1) ОДНОТОЧЕЧНЫЕ объектные вызовы `Объект.Метод`: первый сегмент НЕ общий
+    //     модуль и НЕ коллекция метаданных → это метод локального объекта.
+    let mut sql1 = format!(
+        "DELETE FROM {edges} \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr(callee_proc_name,'.') > 0 AND {single_dot} \
+           AND {first} NOT IN (SELECT q FROM tmp_pmods) \
+           AND {first} NOT IN (SELECT q FROM tmp_pcolls)"
+    );
+    // (2) МНОГОТОЧЕЧНЫЕ цепочки `X.Y.Метод`, оставшиеся NULL после Tier C/D:
+    //     первый сегмент НЕ общий модуль → объектная цепочка (`Запрос.Поле.Метод`)
+    //     либо платформенный метод менеджера (`Справочники.Объект.ПустаяСсылка` —
+    //     Tier D его уже проверил и не нашёл юзер-экспорт). Цепочки общих модулей
+    //     (first = модуль) щадим. Резолвленные менеджер-вызовы тут не NULL.
+    let mut sql2 = format!(
+        "DELETE FROM {edges} \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') > 0 \
+           AND {first} NOT IN (SELECT q FROM tmp_pmods)"
+    );
+    sql1.push_str(scope.clause());
+    sql2.push_str(scope.clause());
+    conn.execute(&sql1, params![REPO_DEFAULT])?;
+    conn.execute(&sql2, params![REPO_DEFAULT])?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pmods; DROP TABLE IF EXISTS tmp_pcolls;")?;
+    Ok(())
+}
+
+
+/// Построить temp-таблицу `tmp_pcg_mmeth` экспортных методов менеджер-модулей:
+/// `(folder, object, method, path)`. folder/object извлекаем из пути
+/// `<...>/<Folder>/<Object>/[Ext/]ManagerModule.bsl` в Rust (в SQLite нет «последнего
+/// вхождения» для надёжного разбора двух хвостовых сегментов).
+pub(crate) fn build_manager_module_methods(conn: &rusqlite::Connection) -> Result<()> {
+    // Источник — справочник экспортных процедур: папка типа и имя объекта в
+    // нём уже разобраны из пути (обе раскладки — Конфигуратора и 1C:EDT).
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_mmeth;\n\
+         CREATE TEMP TABLE tmp_pcg_mmeth AS\n\
+           SELECT folder AS folder, owner AS object, name AS method, path AS path\n\
+           FROM exported_procs\n\
+           WHERE kind = 'manager' AND owner IS NOT NULL AND folder IS NOT NULL;\n\
+         CREATE INDEX tmp_pcg_mmeth_idx ON tmp_pcg_mmeth(folder, object, method);",
+    )?;
+    Ok(())
+}
+
+
+/// Построить temp-таблицу `tmp_pcg_coll` (форма-обращения → папка метаданных) из
+/// единой таблицы META_FORMS (`code_usages`). RU и EN формы ведут в одну папку.
+pub(crate) fn build_collection_folder_map(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_coll; CREATE TEMP TABLE tmp_pcg_coll(coll TEXT, folder TEXT);",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT INTO tmp_pcg_coll(coll, folder) VALUES (?1,?2)")?;
+        for (coll, folder) in crate::code_usages::collection_folder_pairs() {
+            ins.execute(params![coll, folder])?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX tmp_pcg_coll_idx ON tmp_pcg_coll(coll);")?;
+    Ok(())
+}
+
+
+/// Tier D: резолв менеджер-вызовов `Коллекция.Объект.Метод` (ровно 2 точки).
+/// Коллекцию маппим в папку метаданных, ищем экспортный метод в
+/// `<Папка>/<Объект>/[Ext/]ManagerModule.bsl`. Платформенные методы менеджера
+/// (`ПустаяСсылка`, `НайтиПоКоду`) не экспортны в модуле → остаются NULL.
+/// `scope` = `Batch` — в области файлов пакета.
+pub(crate) fn resolve_callee_keys_by_manager(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    build_manager_module_methods(conn)?;
+    build_collection_folder_map(conn)?;
+    let col = format!("{edges}.callee_proc_name");
+    let s1 = format!("substr({col},1,instr({col},'.')-1)");
+    let rest = format!("substr({col},instr({col},'.')+1)");
+    let s2 = format!("substr({rest},1,instr({rest},'.')-1)");
+    let s3 = format!("substr({rest},instr({rest},'.')+1)");
+    let twodots = format!("(length({col})-length(replace({col},'.','')))=2");
+    let join_cond = format!("cc.coll = {s1} AND mm.object = {s2} AND mm.method = {s3}");
+    let mut sql = format!(
+        "UPDATE {edges} \
+         SET callee_proc_key = ( \
+             SELECT MIN(mm.path || '::' || mm.method) \
+             FROM tmp_pcg_coll cc JOIN tmp_pcg_mmeth mm ON mm.folder = cc.folder \
+             WHERE {join_cond}) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL AND {twodots} \
+           AND EXISTS ( \
+             SELECT 1 FROM tmp_pcg_coll cc JOIN tmp_pcg_mmeth mm ON mm.folder = cc.folder \
+             WHERE {join_cond})"
+    );
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_mmeth; DROP TABLE IF EXISTS tmp_pcg_coll;")?;
+    Ok(())
+}
+
+
+/// Кандидаты в модуль объекта, которому принадлежит модуль формы `path`.
+/// Пустой вектор — `path` не модуль формы объекта.
+///
+/// Раскладка Конфигуратора — `<X>/Forms/<Форма>/Ext/Form/Module.bsl` → модуль
+/// объекта `<X>/Ext/ObjectModule.bsl`; 1C:EDT — `<X>/Forms/<Форма>/Module.bsl`
+/// → `<X>/ObjectModule.bsl`; внешняя обработка/отчёт —
+/// `<X>/Form/<Форма>/Form.obj.bsl` → `<X>/ExternalDataProcessor.obj.bsl`, затем
+/// `<X>/ExternalReport.obj.bsl`. Имя формы — ровно один сегмент без `/`.
+/// Раскладка Конфигуратора проверяется раньше EDT: её хвост тоже оканчивается
+/// на `/Module.bsl`, но у EDT между `/Forms/<Форма>/` и `Module.bsl` ничего нет.
+/// Всё прочее (в том числе `.../CommonForms/<Ф>/Ext/Form/Module.bsl` — там нет
+/// сегмента `/Forms/`) → пустой вектор.
+pub(crate) fn form_owner_object_module_candidates(path: &str) -> Vec<String> {
+    if let Some(idx) = path.rfind("/Forms/") {
+        let head = &path[..idx];
+        let form = &path[idx + "/Forms/".len()..];
+        if !head.is_empty() {
+            if let Some(name) = form.strip_suffix("/Ext/Form/Module.bsl") {
+                if !name.is_empty() && !name.contains('/') {
+                    return vec![format!("{head}/Ext/ObjectModule.bsl")];
+                }
+            }
+            if let Some(name) = form.strip_suffix("/Module.bsl") {
+                if !name.is_empty() && !name.contains('/') {
+                    return vec![format!("{head}/ObjectModule.bsl")];
+                }
+            }
+        }
+    }
+    if let Some(idx) = path.rfind("/Form/") {
+        let head = &path[..idx];
+        let form = &path[idx + "/Form/".len()..];
+        if !head.is_empty() {
+            if let Some(name) = form.strip_suffix("/Form.obj.bsl") {
+                if !name.is_empty() && !name.contains('/') {
+                    return vec![
+                        format!("{head}/ExternalDataProcessor.obj.bsl"),
+                        format!("{head}/ExternalReport.obj.bsl"),
+                    ];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+
+/// Правило (д): вызов из модуля формы → модуль объекта этой формы.
+///
+/// В 1С из формы нельзя вызвать процедуру модуля объекта иначе как через
+/// переменную с объектом (`РеквизитФормыВЗначение("Объект")`, `ЭтотОбъект()`),
+/// поэтому одноточечный вызов из модуля формы, чьё имя метода экспортно в
+/// модуле объекта этой формы, привязывается туда. Замер на типовой торговой
+/// конфигурации: 501 такой вызов, 91 % подтверждён по присваиванию переменной.
+/// Не привязываются: вызовы из процедур с директивой `&НаКлиенте` и вызовы через
+/// переменную `Модуль<Имя>`, если общий модуль `<Имя>` существует. Замер на
+/// бухгалтерии (выгрузки EDT и Конфигуратора): из 2830 связей правила оба
+/// исключения убирают 60 ложных, верных — ни одной.
+/// Правило идёт после (в) и (г), до отсева. Транзакцией не управляет.
+pub(crate) fn resolve_callee_keys_by_form_owner(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // Пары «модуль формы → модуль объекта» области резолва. Пути читаем в Vec
+    // до вставок: открытый SELECT во время INSERT'ов держать не нужно.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_formobj;
+         CREATE TEMP TABLE tmp_pcg_formobj(form_path TEXT PRIMARY KEY, obj_path TEXT NOT NULL);",
+    )?;
+    let form_paths: Vec<String> = {
+        let sql = match scope {
+            EdgeScope::All => {
+                "SELECT path FROM files WHERE path LIKE '%/Forms/%' OR path LIKE '%/Form/%'"
+            }
+            EdgeScope::Batch => "SELECT path FROM tmp_pcg_scope",
+        };
+        let mut st = conn.prepare(sql)?;
+        let v = st
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        v
+    };
+    {
+        let mut known =
+            conn.prepare("SELECT 1 FROM exported_procs WHERE repo = ?1 AND path = ?2 LIMIT 1")?;
+        let mut ins = conn.prepare(
+            "INSERT OR IGNORE INTO tmp_pcg_formobj(form_path, obj_path) VALUES (?1, ?2)",
+        )?;
+        for path in &form_paths {
+            // Первый кандидат, для которого модуль объекта реально есть в
+            // справочнике (у внешних обработки/отчёта кандидатов два).
+            let obj = form_owner_object_module_candidates(path)
+                .into_iter()
+                .find(|c| known.query_row(params![REPO_DEFAULT, c], |_| Ok(())).is_ok());
+            if let Some(obj) = obj {
+                ins.execute(params![path, obj])?;
+            }
+        }
+    }
+    let found: i64 = conn.query_row("SELECT COUNT(*) FROM tmp_pcg_formobj", [], |r| r.get(0))?;
+    if found == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj;")?;
+        return Ok(());
+    }
+    // Клиентские процедуры форм области. Из процедуры `&НаКлиенте` модуль объекта
+    // недоступен — в переменной там клиентская форма или общий модуль, привязывать
+    // такой вызов к модулю объекта нельзя. Директиву разборщик кладёт в
+    // `functions.docstring` («procedure &НаКлиенте export»); пробелы вокруг образца
+    // отсекают `&НаКлиентеНаСервереБезКонтекста`. Собираем только по формам из
+    // tmp_pcg_formobj: на точечном обновлении это формы пакета.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_formclient;
+         CREATE TEMP TABLE tmp_pcg_formclient(k TEXT PRIMARY KEY);
+         INSERT OR IGNORE INTO tmp_pcg_formclient(k)
+           SELECT m.form_path || '::' || fn.name
+           FROM tmp_pcg_formobj m
+           JOIN files f ON f.path = m.form_path
+           JOIN functions fn ON fn.file_id = f.id
+           WHERE (' ' || IFNULL(fn.docstring, '') || ' ') LIKE '% &НаКлиенте %';",
+    )?;
+
+    // Квалификатор вызова не должен быть ни именем общего модуля (его резолвит
+    // Tier C), ни коллекцией метаданных (её резолвит Tier D). Имена коллекций —
+    // статические, инлайн безопасен (так же сделано для PLATFORM_BALAST).
+    let colls = METADATA_COLLECTIONS
+        .iter()
+        .map(|c| format!("'{}'", c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let form_of_caller =
+        format!("substr({edges}.caller_proc_key, 1, instr({edges}.caller_proc_key, '::') - 1)");
+    let method =
+        format!("substr({edges}.callee_proc_name, instr({edges}.callee_proc_name, '.') + 1)");
+    let first =
+        format!("substr({edges}.callee_proc_name, 1, instr({edges}.callee_proc_name, '.') - 1)");
+    let single_dot = format!(
+        "instr(substr({edges}.callee_proc_name, instr({edges}.callee_proc_name, '.') + 1), '.') = 0"
+    );
+    let exists = format!(
+        "EXISTS ( \
+           SELECT 1 FROM tmp_pcg_formobj m JOIN exported_procs e ON e.repo = ?1 AND e.path = m.obj_path \
+           WHERE m.form_path = {form_of_caller} AND e.name = {method})"
+    );
+    let mut sql = format!(
+        "UPDATE {edges} \
+         SET callee_proc_key = ( \
+             SELECT MIN(e.path || '::' || e.name) \
+             FROM tmp_pcg_formobj m JOIN exported_procs e ON e.repo = ?1 AND e.path = m.obj_path \
+             WHERE m.form_path = {form_of_caller} AND e.name = {method}) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr({edges}.callee_proc_name, '.') > 0 \
+           AND {single_dot} \
+           AND {form_of_caller} IN (SELECT form_path FROM tmp_pcg_formobj) \
+           AND {first} NOT IN (SELECT owner FROM exported_procs WHERE repo = ?1 AND kind = 'common' AND owner IS NOT NULL) \
+           AND {first} NOT IN ({colls}) \
+           AND {edges}.caller_proc_key NOT IN (SELECT k FROM tmp_pcg_formclient) \
+           AND NOT ({first} LIKE 'Модуль%' AND substr({first}, 7) IN (SELECT owner FROM exported_procs WHERE repo = ?1 AND kind = 'common' AND owner IS NOT NULL)) \
+           AND {exists}"
+    );
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj; DROP TABLE IF EXISTS tmp_pcg_formclient;")?;
+    Ok(())
+}

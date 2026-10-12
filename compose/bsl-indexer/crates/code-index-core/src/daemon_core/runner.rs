@@ -1,0 +1,1331 @@
+// Основная точка входа демона. Связывает вместе:
+//   * захват глобального PID-lock
+//   * загрузку daemon.toml
+//   * DaemonState
+//   * HTTP-сервер (axum)
+//   * worker'ы по одному на папку
+//   * обработку команд reload/stop и Ctrl-C
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
+
+use super::cache_client::CacheClient;
+use super::commands::{self, DaemonCommand};
+use super::config::{self, IndexerSection, PathEntry};
+use super::ipc::{PathStatus, ReloadResponse, RuntimeInfo, StopResponse};
+use super::language_detect;
+use super::lock;
+use super::paths;
+use super::server::{build_router, AppState};
+use super::state::{DaemonState, PathPulse};
+use super::worker;
+use crate::extension::ProcessorRegistry;
+use crate::watcher::is_config_change;
+
+struct WorkerTask {
+    handle: tokio::task::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
+
+type WorkerMap = HashMap<PathBuf, WorkerTask>;
+type StoppingWorkerMap = HashMap<PathBuf, tokio::task::JoinHandle<()>>;
+
+/// Запустить демона в foreground-режиме. Возврат происходит только после
+/// полной остановки (сигнал stop или Ctrl-C).
+///
+/// `processor_registry` — реестр `LanguageProcessor`-ов от bin'а
+/// (`code-index` или `bsl-indexer`). Пробрасывается до worker'ов, чтобы
+/// они могли применить `schema_extensions()` и `index_extras()` для
+/// своих репо. `None` — universal-only сборка без BSL.
+pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<()> {
+    let _pid_lock = lock::acquire()?;
+    let started_at = std::time::Instant::now();
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let pid = std::process::id();
+
+    let mut cfg = config::load_or_default()?;
+    let cfg_path = paths::config_path()?;
+    tracing::info!(
+        "конфиг: {} (папок: {})",
+        cfg_path.display(),
+        cfg.paths.len()
+    );
+
+    // Миграция: заполнить language у тех [[paths]], где он не задан
+    // (старые конфиги до этой версии не имели поля language).
+    // Auto-detect → дозапись обратно в TOML через toml_edit (сохраняет
+    // комментарии и форматирование). После миграции локальная копия
+    // cfg обновляется in-memory, чтобы дальнейший код видел корректные
+    // языки без повторного чтения с диска.
+    migrate_languages(&cfg_path, &mut cfg)?;
+
+    let daemon_state = DaemonState::new();
+    let (cmd_tx, mut cmd_rx) = commands::channel();
+
+    // HTTP-сервер слушает на loopback. Порт 0 → ОС выбирает свободный.
+    let host: std::net::IpAddr = cfg
+        .daemon
+        .http_host
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+    let listener = TcpListener::bind(SocketAddr::new(host, cfg.daemon.http_port)).await?;
+    let actual_addr = listener.local_addr()?;
+
+    write_runtime_info(&actual_addr, pid, &version)?;
+    tracing::info!("HTTP health-IPC: http://{}", actual_addr);
+
+    let app_state = AppState {
+        state: daemon_state.clone(),
+        commands: cmd_tx.clone(),
+        version: version.clone(),
+        pid,
+    };
+    let router = build_router(app_state);
+
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, router).await {
+            tracing::error!("HTTP-сервер упал: {}", e);
+        }
+    });
+
+    // Глобальный shutdown-канал для workers.
+    let (shutdown_tx, _) = broadcast::channel::<()>(16);
+
+    // Семафор, ограничивающий число одновременных initial-reindex'ов.
+    // `0` = без ограничений (старое поведение параллельного старта всех).
+    let initial_limiter = if cfg.daemon.max_concurrent_initial == 0 {
+        None
+    } else {
+        Some(Arc::new(Semaphore::new(cfg.daemon.max_concurrent_initial)))
+    };
+
+    // Зарегистрировать пути в state и запустить worker'ы.
+    let wanted_canon: Vec<PathBuf> = cfg
+        .paths
+        .iter()
+        .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
+        .collect();
+    daemon_state.apply_config(&wanted_canon).await;
+
+    let mut workers: WorkerMap = HashMap::new();
+    let mut stopping_workers: StoppingWorkerMap = HashMap::new();
+    // Копии PathEntry по каноническому пути — чтобы сторож ниже мог перезапустить
+    // упавший/аварийно завершившийся worker с той же конфигурацией.
+    let mut worker_entries: HashMap<PathBuf, PathEntry> = HashMap::new();
+    // Backoff перезапусков: (число попыток, время последней) на путь. Защита от
+    // шторма перезапусков при устойчиво падающем worker'е.
+    let mut respawn_tracker: HashMap<PathBuf, (u32, std::time::Instant)> = HashMap::new();
+    let indexer_section = cfg.indexer.clone();
+
+    // Event-based cache invalidation (этап 3, v0.9.1+): создаём один общий
+    // CacheClient на все workers, передаём как `Option<Arc<_>>`. Пустой
+    // `cache_targets` → None (внутренний путь invalidate отключён).
+    let cache_target_urls: Vec<String> =
+        cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
+    let cache_client = if cache_target_urls.is_empty() {
+        None
+    } else {
+        let cc = Arc::new(CacheClient::new(cache_target_urls));
+        tracing::info!(
+            "сброс кэша выдачи: настроено адресов — {}",
+            cc.target_count()
+        );
+        Some(cc)
+    };
+
+    for entry in cfg.paths.into_iter() {
+        let canonical = entry
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| entry.path.clone());
+        worker_entries.insert(canonical.clone(), entry.clone());
+        let handle = spawn_worker(
+            entry,
+            daemon_state.clone(),
+            shutdown_tx.subscribe(),
+            initial_limiter.clone(),
+            indexer_section.clone(),
+            processor_registry.clone(),
+            cache_client.clone(),
+        );
+        workers.insert(canonical, handle);
+    }
+
+    let config_watch_handle = spawn_daemon_config_watch(cfg_path.clone(), cmd_tx.clone());
+
+    // Сторож worker'ов тикает раз в 5 секунд — ищет аварийно завершившиеся потоки
+    // и перезапускает их (см. supervise_workers).
+    let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
+
+    // Пульс: раз в минуту строка о состоянии папок, но ТОЛЬКО пока есть
+    // незавершённая работа. Нужен, чтобы по присланному журналу было видно,
+    // какая папка стоит без движения — «встало на первичной индексации»
+    // иначе выглядит как просто оборвавшийся журнал. Когда все папки готовы,
+    // сообщать нечего: одинаковая строка каждую минуту только забивает файл.
+    // Первый тик — через интервал, а не сразу: на старте все папки ещё «не
+    // начаты», и мгновенный пульс дал бы полсотни бессодержательных строк.
+    let pulse_period = std::time::Duration::from_secs(PULSE_INTERVAL_SEC);
+    let mut pulse = tokio::time::interval_at(tokio::time::Instant::now() + pulse_period, pulse_period);
+
+    // Основной цикл: команды + Ctrl-C + сторож
+    loop {
+        tokio::select! {
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    DaemonCommand::Reload { respond_to } => {
+                        let resp = handle_reload(
+                            &daemon_state,
+                            &mut workers,
+                            &mut stopping_workers,
+                            &mut worker_entries,
+                            &shutdown_tx,
+                            &cfg_path,
+                            processor_registry.clone(),
+                        ).await;
+                        let _ = respond_to.send(resp);
+                    }
+                    DaemonCommand::Stop { respond_to } => {
+                        let _ = respond_to.send(StopResponse { stopping: true });
+                        break;
+                    }
+                }
+            }
+            _ = watchdog.tick() => {
+                supervise_workers(
+                    &daemon_state,
+                    &mut workers,
+                    &mut stopping_workers,
+                    &worker_entries,
+                    &mut respawn_tracker,
+                    &shutdown_tx,
+                    &initial_limiter,
+                    &indexer_section,
+                    &processor_registry,
+                    &cache_client,
+                ).await;
+            }
+            _ = pulse.tick() => {
+                let snapshot = daemon_state.pulse_snapshot().await;
+                if pulse_needed(&snapshot) {
+                    let uptime = started_at.elapsed().as_secs();
+                    let memory = crate::logging::memory_note();
+                    for line in format_pulse(uptime, &memory, &snapshot) {
+                        tracing::info!("{}", line);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl-C — завершение");
+                break;
+            }
+        }
+    }
+
+    config_watch_handle.abort();
+    tracing::info!("остановка worker'ов...");
+    for task in workers.values() {
+        task.stop.store(true, Ordering::Release);
+    }
+    if let Some(limiter) = &initial_limiter {
+        limiter.close();
+    }
+    let _ = shutdown_tx.send(());
+    for (path, task) in workers {
+        if let Err(e) = task.handle.await {
+            tracing::warn!(
+                "worker {} не завершился корректно: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+    for (path, handle) in stopping_workers {
+        if let Err(e) = handle.await {
+            tracing::warn!(
+                "останавливаемый worker {} не завершился корректно: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+    server_handle.abort();
+
+    remove_runtime_info();
+    tracing::info!(
+        "демон остановлен, время работы {}",
+        human_duration(started_at.elapsed().as_secs())
+    );
+    Ok(())
+}
+
+/// Как часто демон пишет в журнал строку пульса.
+const PULSE_INTERVAL_SEC: u64 = 60;
+
+/// Сколько неготовых папок перечислять поимённо. На полусотне репозиториев
+/// очередь на первичную индексацию иначе даёт стену строк каждую минуту.
+const PULSE_MAX_PATH_LINES: usize = 10;
+
+use crate::logging::human_duration;
+
+/// Название статуса по-русски — журнал читает человек, которому машинные
+/// `reindexing_batch` ничего не говорят.
+fn status_ru(status: PathStatus) -> &'static str {
+    match status {
+        PathStatus::NotStarted => "не начата",
+        // Не «первичная»: демон приходит сюда и на существующей базе, где
+        // переписываются только изменившиеся файлы. Обещание «первичная»
+        // сбивало с толку — на деле это индексация папки при старте демона.
+        PathStatus::InitialIndexing => "индексация при старте",
+        PathStatus::Ready => "готова",
+        PathStatus::ReindexingBatch => "обработка пакета изменений",
+        PathStatus::Error => "ошибка",
+    }
+}
+
+/// Нужна ли строка состояния прямо сейчас. Пока все папки готовы, состояние
+/// демона не меняется, и минутная строка о простое только забивает журнал:
+/// интересны индексация, пакеты изменений и ошибки — то есть незавершённая
+/// работа. Вынесено чистой функцией ради модульного теста.
+fn pulse_needed(snapshot: &[PathPulse]) -> bool {
+    snapshot.iter().any(|p| p.status != PathStatus::Ready)
+}
+
+/// Собрать строки состояния демона: сводка по всем папкам плюс отдельная
+/// строка на каждую, которая сейчас не готова. Готовые папки поимённо не
+/// перечисляем — на полусотне репозиториев это была бы стена текста каждую
+/// минуту.
+///
+/// Вынесено чистой функцией ради модульного теста — тем же приёмом, что
+/// `allow_respawn` и `batch_outcome`.
+fn format_pulse(uptime_sec: u64, memory: &str, snapshot: &[PathPulse]) -> Vec<String> {
+    let mut ready = 0usize;
+    let mut indexing = 0usize;
+    let mut errors = 0usize;
+    let mut not_started = 0usize;
+    for p in snapshot {
+        match p.status {
+            PathStatus::Ready => ready += 1,
+            PathStatus::InitialIndexing | PathStatus::ReindexingBatch => indexing += 1,
+            PathStatus::Error => errors += 1,
+            PathStatus::NotStarted => not_started += 1,
+        }
+    }
+
+    let mut lines = vec![format!(
+        // «Запущен столько-то назад» — про возраст процесса. Прежнее «работает
+        // 4 мин» рядом с «в работе 1» читалось как время текущей работы, хотя
+        // это время жизни демона: он мог уже отработать несколько операций.
+        "[состояние демона] запущен {} назад, память демона {}, папок {}: готовы {}, в работе {}, ошибок {}, не начаты {}",
+        human_duration(uptime_sec),
+        memory,
+        snapshot.len(),
+        ready,
+        indexing,
+        errors,
+        not_started
+    )];
+
+    let pending: Vec<&PathPulse> = snapshot
+        .iter()
+        .filter(|p| p.status != PathStatus::Ready)
+        .collect();
+
+    for p in pending.iter().take(PULSE_MAX_PATH_LINES) {
+        // Что папка делает прямо сейчас — главное, ради чего строку читают.
+        // Этап знает только рабочий поток; если он между этапами, остаётся
+        // общий статус и время без движения.
+        // Когда известен текущий этап, названием статуса его не предваряем:
+        // статус описывает всю операцию грубо («индексация при старте») и на
+        // первичной индексации звучит неточно, а этап отвечает на вопрос
+        // «чем занято прямо сейчас» — ради него строку и читают.
+        let mut parts = match &p.stage {
+            Some((stage, sec)) => vec![format!("этап «{}» идёт {}", stage, human_duration(*sec))],
+            None => vec![status_ru(p.status).to_string()],
+        };
+        if let Some(pr) = &p.progress {
+            // Ноль обработанных показывать незачем: полный проход счётчик
+            // файлов не ведёт вовсе, и «0/3000 (0.0%)» читается как «встало».
+            if pr.files_total > 0 && pr.files_done > 0 {
+                parts.push(format!(
+                    "{}/{} файлов ({:.1}%)",
+                    pr.files_done,
+                    pr.files_total,
+                    pr.percent.unwrap_or(0.0)
+                ));
+            }
+        }
+        parts.push(format!("в этом состоянии {}", human_duration(p.still_sec)));
+        lines.push(format!(
+            "[состояние демона] {} — {}",
+            p.path.display(),
+            parts.join(", ")
+        ));
+    }
+
+    if pending.len() > PULSE_MAX_PATH_LINES {
+        lines.push(format!(
+            "[состояние демона] …и ещё {} папок не готовы (перечислены первые {})",
+            pending.len() - PULSE_MAX_PATH_LINES,
+            PULSE_MAX_PATH_LINES
+        ));
+    }
+
+    lines
+}
+
+fn spawn_worker(
+    entry: PathEntry,
+    state: DaemonState,
+    shutdown_rx: broadcast::Receiver<()>,
+    initial_limiter: Option<Arc<Semaphore>>,
+    indexer_section: IndexerSection,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
+    cache_client: Option<Arc<CacheClient>>,
+) -> WorkerTask {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        worker::run_worker(
+            entry,
+            state,
+            shutdown_rx,
+            worker_stop,
+            initial_limiter,
+            indexer_section,
+            processor_registry,
+            cache_client,
+        );
+    });
+    WorkerTask { handle, stop }
+}
+
+/// Решение backoff для перезапуска пути. Обновляет счётчик в `tracker` и
+/// возвращает `true`, если перезапуск ещё разрешён (число попыток в пределах
+/// окна не превысило `max`). Счётчик сбрасывается, если с последней попытки
+/// прошло больше `window`. Вынесено чистой функцией ради модульного теста.
+fn allow_respawn(
+    tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
+    path: &PathBuf,
+    now: std::time::Instant,
+    window: std::time::Duration,
+    max: u32,
+) -> bool {
+    let slot = tracker.entry(path.clone()).or_insert((0, now));
+    if now.duration_since(slot.1) > window {
+        *slot = (0, now);
+    }
+    slot.0 += 1;
+    slot.1 = now;
+    slot.0 <= max
+}
+
+/// Сторож worker'ов. Перезапускает потоки, завершившиеся НЕ по общему shutdown
+/// (паника внутри батча или ранний выход из-за ошибки транзакции). В штатном
+/// режиме worker живёт до shutdown, поэтому `is_finished()` во время работы
+/// демона означает аварию: раньше статус папки при этом навсегда застревал на
+/// `ReindexingBatch` («indexing»), а самовосстановления не было.
+///
+/// Перезапуск ограничен backoff'ом (`allow_respawn`): устойчиво падающий путь
+/// после лимита попыток оставляется в `Error`, чтобы не крутить бесконечный
+/// цикл перезапусков.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_workers(
+    state: &DaemonState,
+    workers: &mut WorkerMap,
+    stopping_workers: &mut StoppingWorkerMap,
+    worker_entries: &HashMap<PathBuf, PathEntry>,
+    respawn_tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
+    shutdown_tx: &broadcast::Sender<()>,
+    initial_limiter: &Option<Arc<Semaphore>>,
+    indexer_section: &IndexerSection,
+    processor_registry: &Option<Arc<ProcessorRegistry>>,
+    cache_client: &Option<Arc<CacheClient>>,
+) {
+    const RESPAWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_RESPAWNS: u32 = 5;
+
+    reap_stopping_workers(stopping_workers).await;
+
+    // Сначала собрать пути завершившихся потоков, потом мутировать `workers`.
+    let finished: Vec<PathBuf> = workers
+        .iter()
+        .filter(|(_, task)| task.handle.is_finished())
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    for path in finished {
+        if let Some(task) = workers.remove(&path) {
+            match task.handle.await {
+                Ok(()) => tracing::warn!(
+                    "worker {} завершился сам (не по команде остановки) — перезапуск",
+                    path.display()
+                ),
+                Err(e) => {
+                    tracing::error!("worker {} упал ({}) — перезапуск", path.display(), e)
+                }
+            }
+        }
+
+        let entry = match worker_entries.get(&path) {
+            Some(e) => e.clone(),
+            None => {
+                tracing::error!(
+                    "worker {} завершился, но его настройки не найдены — перезапуск невозможен",
+                    path.display()
+                );
+                state
+                    .set_error(
+                        &path,
+                        "worker завершился, перезапуск невозможен (нет конфигурации пути)",
+                    )
+                    .await;
+                continue;
+            }
+        };
+
+        if !allow_respawn(
+            respawn_tracker,
+            &path,
+            std::time::Instant::now(),
+            RESPAWN_WINDOW,
+            MAX_RESPAWNS,
+        ) {
+            tracing::error!(
+                "worker {} аварийно завершался > {} раз за {} с — перезапуски прекращены, статус «ошибка»",
+                path.display(),
+                MAX_RESPAWNS,
+                RESPAWN_WINDOW.as_secs()
+            );
+            state
+                .set_error(
+                    &path,
+                    "worker многократно аварийно завершается — см. журнал демона",
+                )
+                .await;
+            continue;
+        }
+
+        // Честный промежуточный статус до готовности свежего worker'а.
+        state
+            .set_error(&path, "worker перезапускается после аварийного завершения")
+            .await;
+
+        let handle = spawn_worker(
+            entry,
+            state.clone(),
+            shutdown_tx.subscribe(),
+            initial_limiter.clone(),
+            indexer_section.clone(),
+            processor_registry.clone(),
+            cache_client.clone(),
+        );
+        workers.insert(path, handle);
+    }
+}
+
+async fn reap_stopping_workers(stopping_workers: &mut StoppingWorkerMap) {
+    let finished: Vec<PathBuf> = stopping_workers
+        .iter()
+        .filter(|(_, handle)| handle.is_finished())
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in finished {
+        if let Some(handle) = stopping_workers.remove(&path) {
+            if let Err(e) = handle.await {
+                tracing::warn!(
+                    "останавливаемый worker {} завершился некорректно: {}",
+                    path.display(),
+                    e
+                );
+            }
+            tracing::info!("каталог {} больше не отслеживается", path.display());
+        }
+    }
+}
+
+fn request_worker_stop(
+    path: &PathBuf,
+    workers: &mut WorkerMap,
+    stopping_workers: &mut StoppingWorkerMap,
+    worker_entries: &mut HashMap<PathBuf, PathEntry>,
+) {
+    worker_entries.remove(path);
+    if let Some(task) = workers.remove(path) {
+        task.stop.store(true, Ordering::Release);
+        stopping_workers.insert(path.clone(), task.handle);
+    }
+}
+
+async fn wait_for_stopping_worker(
+    path: &PathBuf,
+    stopping_workers: &mut StoppingWorkerMap,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let Some(handle) = stopping_workers.get_mut(path) else {
+        return Ok(());
+    };
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(joined) => {
+            stopping_workers.remove(path);
+            if let Err(e) = joined {
+                tracing::warn!(
+                    "останавливаемый worker {} завершился некорректно: {}",
+                    path.display(),
+                    e
+                );
+            }
+            tracing::info!("каталог {} больше не отслеживается", path.display());
+            Ok(())
+        }
+        Err(_) => Err(format!(
+            "Каталог {} ещё завершает прежнюю задачу; новая задача не запущена, повторите reload",
+            path.display()
+        )),
+    }
+}
+
+/// Обработка `POST /reload` и автоматической перечитки daemon.toml.
+async fn handle_reload(
+    state: &DaemonState,
+    workers: &mut WorkerMap,
+    stopping_workers: &mut StoppingWorkerMap,
+    worker_entries: &mut HashMap<PathBuf, PathEntry>,
+    shutdown_tx: &broadcast::Sender<()>,
+    cfg_path: &Path,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
+) -> ReloadResponse {
+    let cfg = match config::load_from(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return ReloadResponse {
+                reloaded: false,
+                added: vec![],
+                removed: vec![],
+                unchanged: vec![],
+                error: Some(format!("Не удалось перечитать конфиг: {}", e)),
+            };
+        }
+    };
+
+    let wanted_canon: Vec<PathBuf> = cfg
+        .paths
+        .iter()
+        .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
+        .collect();
+    let (added, removed, unchanged) = state.apply_config(&wanted_canon).await;
+
+    for path in &removed {
+        request_worker_stop(path, workers, stopping_workers, worker_entries);
+    }
+
+    // Запускаем worker'ы для добавленных. Семафор берём из текущего конфига —
+    // предположение: limiter не меняется в рантайме, только при рестарте демона.
+    let limiter = if cfg.daemon.max_concurrent_initial == 0 {
+        None
+    } else {
+        Some(Arc::new(Semaphore::new(cfg.daemon.max_concurrent_initial)))
+    };
+    let indexer_section = cfg.indexer.clone();
+
+    // На reload пересоздаём CacheClient — оператор мог добавить/удалить
+    // cache_targets в daemon.toml. Существующие workers продолжают
+    // использовать свой (захваченный при старте) client, новые получают
+    // обновлённый. После полного рестарта demon все workers будут на
+    // одной актуальной версии.
+    let cache_target_urls: Vec<String> =
+        cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
+    let reload_cache_client = if cache_target_urls.is_empty() {
+        None
+    } else {
+        Some(Arc::new(CacheClient::new(cache_target_urls)))
+    };
+
+    let mut launch_errors = Vec::new();
+    let mut failed_additions = Vec::new();
+    for entry in cfg.paths.into_iter() {
+        let canonical = entry
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| entry.path.clone());
+        if added.contains(&canonical) {
+            if let Err(e) = wait_for_stopping_worker(
+                &canonical,
+                stopping_workers,
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                launch_errors.push(e);
+                failed_additions.push(canonical);
+                continue;
+            }
+            worker_entries.insert(canonical.clone(), entry.clone());
+            let handle = spawn_worker(
+                entry,
+                state.clone(),
+                shutdown_tx.subscribe(),
+                limiter.clone(),
+                indexer_section.clone(),
+                processor_registry.clone(),
+                reload_cache_client.clone(),
+            );
+            workers.insert(canonical, handle);
+        }
+    }
+
+    if !failed_additions.is_empty() {
+        let effective: Vec<PathBuf> = wanted_canon
+            .iter()
+            .filter(|path| !failed_additions.contains(path))
+            .cloned()
+            .collect();
+        state.apply_config(&effective).await;
+    }
+
+    ReloadResponse {
+        reloaded: launch_errors.is_empty(),
+        added,
+        removed,
+        unchanged,
+        error: if launch_errors.is_empty() {
+            None
+        } else {
+            Some(launch_errors.join("; "))
+        },
+    }
+}
+
+fn spawn_daemon_config_watch(
+    config_path: PathBuf,
+    commands: commands::CommandSender,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = run_daemon_config_watch(config_path, commands).await {
+            tracing::error!("наблюдатель daemon.toml завершился с ошибкой: {}", e);
+        }
+    })
+}
+
+async fn run_daemon_config_watch(
+    config_path: PathBuf,
+    commands: commands::CommandSender,
+) -> Result<()> {
+    let config_path = if config_path.is_absolute() {
+        config_path
+    } else {
+        std::env::current_dir()?.join(config_path)
+    };
+    let parent = config_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "у пути конфигурации {} нет родительского каталога",
+            config_path.display()
+        )
+    })?;
+    if !config_path.exists() {
+        tracing::warn!(
+            "{} отсутствует; демон сохранит текущий набор каталогов и применит файл после создания",
+            config_path.display()
+        );
+    }
+
+    let (event_tx, mut event_rx) = mpsc::channel::<DebounceEventResult>(16);
+    let watched_path = config_path.clone();
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(500),
+        None,
+        move |result: DebounceEventResult| {
+            let filtered = match result {
+                Ok(events) => Ok(events
+                    .into_iter()
+                    .filter(|event| {
+                        is_config_change(
+                            &event.kind,
+                            &event.paths,
+                            std::slice::from_ref(&watched_path),
+                        )
+                    })
+                    .collect()),
+                Err(errors) => Err(errors),
+            };
+            let _ = event_tx.blocking_send(filtered);
+        },
+    )?;
+    debouncer.watch(parent, RecursiveMode::NonRecursive)?;
+    tracing::info!(
+        "демон отслеживает изменения {} (задержка 500 мс)",
+        config_path.display()
+    );
+
+    while let Some(result) = event_rx.recv().await {
+        match result {
+            Ok(events) if !events.is_empty() => {
+                let (respond_to, response_rx) = oneshot::channel();
+                if commands
+                    .send(DaemonCommand::Reload { respond_to })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                match response_rx.await {
+                    Ok(response) if response.reloaded => tracing::info!(
+                        "daemon.toml применён: добавлено [{}], убрано [{}]",
+                        format_paths(&response.added),
+                        format_paths(&response.removed)
+                    ),
+                    Ok(response) => tracing::warn!(
+                        "daemon.toml не применён полностью: добавлено [{}], убрано [{}], ошибка: {}",
+                        format_paths(&response.added),
+                        format_paths(&response.removed),
+                        response.error.as_deref().unwrap_or("неизвестная ошибка")
+                    ),
+                    Err(_) => break,
+                }
+            }
+            Ok(_) => {}
+            Err(errors) => {
+                for error in errors {
+                    tracing::warn!("наблюдатель daemon.toml: notify error: {}", error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_runtime_info(addr: &SocketAddr, pid: u32, version: &str) -> Result<()> {
+    paths::ensure_state_dir()?;
+    let info = RuntimeInfo {
+        pid,
+        version: version.to_string(),
+        http_host: addr.ip().to_string(),
+        http_port: addr.port(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let text = serde_json::to_string_pretty(&info)?;
+    std::fs::write(paths::runtime_info_file()?, text)?;
+    Ok(())
+}
+
+fn remove_runtime_info() {
+    if let Ok(path) = paths::runtime_info_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Попытаться прочитать runtime-info файл. Возвращает None если демон не запущен
+/// либо `CODE_INDEX_HOME` не задана (значит и запускать негде).
+pub fn read_runtime_info() -> Option<RuntimeInfo> {
+    let path = paths::runtime_info_file().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RuntimeInfo>(&text).ok()
+}
+
+/// Миграция конфига: для каждой `[[paths]]` без `language` определить
+/// язык эвристикой `language_detect::detect_language` и дописать
+/// результат обратно в `daemon.toml` через `toml_edit`. После записи
+/// `cfg.paths[i].language` обновляется в памяти.
+///
+/// Вызывается один раз при старте демона. Если файл `daemon.toml` не
+/// существует (демон стартовал без конфига), функция ничего не делает —
+/// записи без `language` всё равно нечем сохранить.
+///
+/// Не возвращает ошибку при сбое отдельной записи — пишет warning и
+/// идёт дальше; одна нераспознанная папка не должна валить весь демон.
+fn migrate_languages(cfg_path: &std::path::Path, cfg: &mut config::DaemonFileConfig) -> Result<()> {
+    if !cfg_path.exists() {
+        // Конфига нет — нет и записей для миграции. Норма для первого запуска.
+        return Ok(());
+    }
+    for entry in cfg.paths.iter_mut() {
+        if entry.language.is_some() {
+            continue;
+        }
+        // Корень репо для эвристик. Канонизация может упасть на не существующем
+        // пути — тогда работаем с тем что в конфиге; detect_language вернёт None
+        // и мы пропустим запись.
+        let root = entry
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| entry.path.clone());
+
+        match language_detect::detect_language(&root) {
+            Some(lang) => match language_detect::write_language_back(cfg_path, &entry.path, lang) {
+                Ok(true) => {
+                    tracing::info!(
+                        "[migrate_languages] {} → language=\"{}\" (записано в {})",
+                        entry.path.display(),
+                        lang,
+                        cfg_path.display()
+                    );
+                    entry.language = Some(lang.to_string());
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        "[migrate_languages] язык определён ({}) для {}, \
+                         но запись в TOML не нашла такой [[paths]] — \
+                         возможно canonical-путь и путь в конфиге расходятся",
+                        lang,
+                        entry.path.display()
+                    );
+                    // В памяти всё равно проставляем — на случай, если
+                    // active set строится отсюда.
+                    entry.language = Some(lang.to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[migrate_languages] не удалось записать language для {}: {}",
+                        entry.path.display(),
+                        e
+                    );
+                    entry.language = Some(lang.to_string());
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "[migrate_languages] не удалось определить язык для {}: \
+                     добавьте `language = \"...\"` вручную в {}",
+                    entry.path.display(),
+                    cfg_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn test_entry(path: &Path) -> PathEntry {
+        config::parse_str(&format!("[[paths]]\npath = '{}'\n", path.display()))
+            .unwrap()
+            .paths
+            .remove(0)
+    }
+
+    #[tokio::test]
+    async fn удаление_переносит_worker_и_сторож_его_не_перезапускает() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("daemon.toml");
+        std::fs::write(&cfg_path, "").unwrap();
+        let path = PathBuf::from("C:/repo/removed");
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_stop = stop.clone();
+        let handle = tokio::spawn(async move {
+            while !observed_stop.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut workers = WorkerMap::new();
+        workers.insert(path.clone(), WorkerTask { handle, stop: stop.clone() });
+        let mut stopping = StoppingWorkerMap::new();
+        let mut entries = HashMap::new();
+        entries.insert(path.clone(), test_entry(&path));
+        let state = DaemonState::new();
+        state.apply_config(std::slice::from_ref(&path)).await;
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let response = handle_reload(
+            &state,
+            &mut workers,
+            &mut stopping,
+            &mut entries,
+            &shutdown_tx,
+            &cfg_path,
+            None,
+        )
+        .await;
+
+        assert!(response.reloaded);
+        assert_eq!(response.removed, vec![path.clone()]);
+        assert!(stop.load(Ordering::Acquire), "worker должен получить собственный сигнал");
+        assert!(!workers.contains_key(&path));
+        assert!(!entries.contains_key(&path));
+        assert!(stopping.contains_key(&path));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stopping.get(&path).unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut respawn_tracker = HashMap::new();
+        let cfg = config::DaemonFileConfig::default();
+        supervise_workers(
+            &state,
+            &mut workers,
+            &mut stopping,
+            &entries,
+            &mut respawn_tracker,
+            &shutdown_tx,
+            &None,
+            &cfg.indexer,
+            &None,
+            &None,
+        )
+        .await;
+        assert!(workers.is_empty(), "сторож не должен перезапускать удалённый путь");
+        assert!(stopping.is_empty(), "завершившаяся задача должна быть убрана");
+    }
+
+    #[tokio::test]
+    async fn повторное_добавление_ждёт_старую_задачу_и_запускает_одну() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("readded");
+        std::fs::create_dir(&repo).unwrap();
+        let path = repo.canonicalize().unwrap();
+        let cfg_path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("[[paths]]\npath = '{}'\n", path.display()),
+        )
+        .unwrap();
+
+        let mut stopping = StoppingWorkerMap::new();
+        stopping.insert(
+            path.clone(),
+            tokio::spawn(async { tokio::time::sleep(Duration::from_millis(30)).await }),
+        );
+        let state = DaemonState::new();
+        let mut workers = WorkerMap::new();
+        let mut entries = HashMap::new();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let started = std::time::Instant::now();
+
+        let response = handle_reload(
+            &state,
+            &mut workers,
+            &mut stopping,
+            &mut entries,
+            &shutdown_tx,
+            &cfg_path,
+            None,
+        )
+        .await;
+
+        assert!(response.reloaded, "{:?}", response.error);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(stopping.is_empty());
+        assert_eq!(workers.len(), 1, "должна быть запущена ровно одна новая задача");
+        assert!(workers.contains_key(&path));
+
+        request_worker_stop(&path, &mut workers, &mut stopping, &mut entries);
+        wait_for_stopping_worker(&path, &mut stopping, Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn фильтр_daemon_toml_отбрасывает_соседа_и_access() {
+        use notify_debouncer_full::notify::{event::AccessKind, EventKind};
+
+        let target = PathBuf::from("C:/config/daemon.toml");
+        assert!(is_config_change(
+            &EventKind::Modify(notify_debouncer_full::notify::event::ModifyKind::Any),
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&target),
+        ));
+        assert!(!is_config_change(
+            &EventKind::Modify(notify_debouncer_full::notify::event::ModifyKind::Any),
+            &[PathBuf::from("C:/config/serve.toml")],
+            std::slice::from_ref(&target),
+        ));
+        assert!(!is_config_change(
+            &EventKind::Access(AccessKind::Any),
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&target),
+        ));
+    }
+
+    #[tokio::test]
+    async fn ошибка_daemon_toml_не_меняет_текущий_набор() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("daemon.toml");
+        std::fs::write(&cfg_path, "[[paths]\n").unwrap();
+        let path = PathBuf::from("C:/repo/kept");
+        let state = DaemonState::new();
+        state.apply_config(std::slice::from_ref(&path)).await;
+        let mut workers = WorkerMap::new();
+        let mut stopping = StoppingWorkerMap::new();
+        let mut entries = HashMap::new();
+        entries.insert(path.clone(), test_entry(&path));
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let response = handle_reload(
+            &state,
+            &mut workers,
+            &mut stopping,
+            &mut entries,
+            &shutdown_tx,
+            &cfg_path,
+            None,
+        )
+        .await;
+
+        assert!(!response.reloaded);
+        assert!(response.error.is_some());
+        assert!(entries.contains_key(&path));
+        assert_eq!(state.pulse_snapshot().await[0].path, path);
+    }
+
+    #[test]
+    fn allow_respawn_разрешает_до_лимита_и_сбрасывается_после_окна() {
+        let mut tracker = HashMap::new();
+        let path = PathBuf::from("/tmp/repo");
+        let window = std::time::Duration::from_secs(60);
+        let t0 = std::time::Instant::now();
+        // Первые 5 попыток в пределах одного окна разрешены.
+        for i in 1..=5 {
+            assert!(
+                allow_respawn(&mut tracker, &path, t0, window, 5),
+                "попытка {i} должна быть разрешена"
+            );
+        }
+        // 6-я попытка в том же окне — запрещена (сработал backoff).
+        assert!(!allow_respawn(&mut tracker, &path, t0, window, 5));
+        // По прошествии окна счётчик сбрасывается — снова разрешено.
+        let later = t0 + std::time::Duration::from_secs(61);
+        assert!(allow_respawn(&mut tracker, &path, later, window, 5));
+    }
+
+    #[test]
+    fn состояние_молчит_когда_все_папки_готовы() {
+        let ready = |name: &str| PathPulse {
+            path: PathBuf::from(name),
+            status: PathStatus::Ready,
+            progress: None,
+            still_sec: 3600,
+            stage: None,
+        };
+
+        // Всё готово — работы нет, писать нечего.
+        assert!(!pulse_needed(&[ready("/repo/a"), ready("/repo/b")]));
+        // Нет ни одной папки — тоже молчим.
+        assert!(!pulse_needed(&[]));
+
+        // Достаточно одной незавершённой папки, чтобы строка снова заработала.
+        for status in [
+            PathStatus::NotStarted,
+            PathStatus::InitialIndexing,
+            PathStatus::ReindexingBatch,
+            PathStatus::Error,
+        ] {
+            let snapshot = vec![
+                ready("/repo/a"),
+                PathPulse {
+                    path: PathBuf::from("/repo/busy"),
+                    status,
+                    progress: None,
+                    still_sec: 5,
+                    stage: None,
+                },
+            ];
+            assert!(
+                pulse_needed(&snapshot),
+                "статус {:?} должен давать строку состояния",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn состояние_даёт_сводку_и_строку_на_каждую_неготовую_папку() {
+        use super::super::ipc::Progress;
+
+        let snapshot = vec![
+            PathPulse {
+                path: PathBuf::from("/repo/ready"),
+                status: PathStatus::Ready,
+                progress: None,
+                still_sec: 5,
+                stage: None,
+            },
+            PathPulse {
+                path: PathBuf::from("/repo/slow"),
+                status: PathStatus::InitialIndexing,
+                progress: Some(Progress::new(1200, 90_000)),
+                still_sec: 3700,
+                stage: Some(("граф вызовов".to_string(), 95)),
+            },
+        ];
+
+        let lines = format_pulse(7300, "812 МБ", &snapshot);
+        assert_eq!(lines.len(), 2, "сводка + одна неготовая папка: {:?}", lines);
+        assert!(lines[0].contains("папок 2"));
+        assert!(lines[0].contains("память демона 812 МБ"));
+        assert!(lines[0].contains("готовы 1"));
+        assert!(lines[0].contains("в работе 1"));
+        // Готовая папка поимённо не перечисляется.
+        assert!(!lines.iter().any(|l| l.contains("/repo/ready")));
+        // У застрявшей видно и прогресс, и как давно нет движения.
+        assert!(lines[1].contains("1200/90000 файлов"));
+        // Пока известен этап, названием статуса строку не начинаем.
+        assert!(!lines[1].contains("индексация при старте"), "{}", lines[1]);
+        // Главное в строке — чем папка занята прямо сейчас.
+        assert!(
+            lines[1].contains("этап «граф вызовов» идёт 1 мин 35 с"),
+            "текущий этап и сколько он идёт: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("в этом состоянии 1 ч 1 мин"),
+            "время без движения должно быть человекочитаемым: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn состояние_не_перечисляет_больше_десяти_папок() {
+        // 25 неготовых папок: десять поимённо плюс строка про остаток —
+        // иначе каждую минуту в журнал уходила бы стена строк.
+        let snapshot: Vec<PathPulse> = (0..25)
+            .map(|i| PathPulse {
+                path: PathBuf::from(format!("/repo/{:02}", i)),
+                status: PathStatus::NotStarted,
+                progress: None,
+                still_sec: 10,
+                stage: None,
+            })
+            .collect();
+
+        let lines = format_pulse(60, "100 МБ", &snapshot);
+        assert_eq!(lines.len(), 1 + 10 + 1, "сводка + 10 папок + остаток: {:?}", lines.len());
+        assert!(lines.last().unwrap().contains("и ещё 15 папок"), "{}", lines.last().unwrap());
+    }
+
+
+    fn make_repo_with_marker(tmp: &TempDir, name: &str, marker: &str) -> std::path::PathBuf {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::File::create(dir.join(marker)).unwrap();
+        dir
+    }
+
+    /// Пишет path в TOML как literal-string (одинарные кавычки) — там
+    /// не действуют escape-sequences, что важно для Windows-путей с
+    /// backslashes (`\\?\C:\...`).
+    fn toml_literal_path(p: &std::path::Path) -> String {
+        format!("'{}'", p.display())
+    }
+
+    #[test]
+    fn fills_language_for_entries_without_it() {
+        let tmp = TempDir::new().unwrap();
+
+        // Два «репо» — Rust по Cargo.toml, BSL по Configuration.xml.
+        let rust_repo = make_repo_with_marker(&tmp, "rust_repo", "Cargo.toml");
+        let bsl_repo = make_repo_with_marker(&tmp, "bsl_repo", "Configuration.xml");
+
+        // daemon.toml без language. Используем canonical-путь, т.к.
+        // migrate_languages canonicalize'ит entry.path и сравнивает.
+        // В TOML literal-strings (одинарные кавычки) backslashes не
+        // экранируются — Windows-пути сохраняются как есть.
+        let toml_path = tmp.path().join("daemon.toml");
+        let rust_canon = rust_repo.canonicalize().unwrap();
+        let bsl_canon = bsl_repo.canonicalize().unwrap();
+        let original = format!(
+            "# user comment\n\
+             [[paths]]\n\
+             path = {}\n\
+             \n\
+             [[paths]]\n\
+             path = {}\n",
+            toml_literal_path(&rust_canon),
+            toml_literal_path(&bsl_canon),
+        );
+        std::fs::File::create(&toml_path)
+            .unwrap()
+            .write_all(original.as_bytes())
+            .unwrap();
+
+        let mut cfg = config::parse_str(&original).unwrap();
+        migrate_languages(&toml_path, &mut cfg).unwrap();
+
+        // В памяти заполнено.
+        assert_eq!(cfg.paths[0].language.as_deref(), Some("rust"));
+        assert_eq!(cfg.paths[1].language.as_deref(), Some("bsl"));
+
+        // На диске тоже — комментарий сохранён.
+        let new_text = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(new_text.contains("# user comment"));
+        assert!(new_text.contains(r#"language = "rust""#));
+        assert!(new_text.contains(r#"language = "bsl""#));
+    }
+
+    #[test]
+    fn keeps_explicit_language_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo_with_marker(&tmp, "repo", "Cargo.toml");
+
+        let toml_path = tmp.path().join("daemon.toml");
+        let canon = repo.canonicalize().unwrap();
+        let original = format!(
+            "[[paths]]\n\
+             path = {}\n\
+             language = \"python\"\n",
+            toml_literal_path(&canon),
+        );
+        std::fs::File::create(&toml_path)
+            .unwrap()
+            .write_all(original.as_bytes())
+            .unwrap();
+
+        let mut cfg = config::parse_str(&original).unwrap();
+        migrate_languages(&toml_path, &mut cfg).unwrap();
+
+        // Явное `python` не должно быть перезаписано на rust, даже
+        // несмотря на Cargo.toml. Оператор знает лучше.
+        assert_eq!(cfg.paths[0].language.as_deref(), Some("python"));
+    }
+
+    #[test]
+    fn warns_but_doesnt_fail_when_language_undetectable() {
+        let tmp = TempDir::new().unwrap();
+        // Пустая директория — детектор не сможет определить язык.
+        let empty_repo = tmp.path().join("empty_repo");
+        std::fs::create_dir(&empty_repo).unwrap();
+
+        let toml_path = tmp.path().join("daemon.toml");
+        let canon = empty_repo.canonicalize().unwrap();
+        let original = format!(
+            "[[paths]]\n\
+             path = {}\n",
+            toml_literal_path(&canon),
+        );
+        std::fs::File::create(&toml_path)
+            .unwrap()
+            .write_all(original.as_bytes())
+            .unwrap();
+
+        let mut cfg = config::parse_str(&original).unwrap();
+        // Не должно паниковать или возвращать Err.
+        migrate_languages(&toml_path, &mut cfg).unwrap();
+
+        // language остался None — ждём от оператора ручного указания.
+        assert_eq!(cfg.paths[0].language, None);
+    }
+}
