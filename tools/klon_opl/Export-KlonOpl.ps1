@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-  klon_opl: выгрузить конфигурацию в файлы → /srv/ai2/klon_opl/src
+  klon_opl: выгрузить конфигурацию → /srv/ai2/klon_opl/src → code-index (ai2-bsl-klon-opl)
 
 .DESCRIPTION
-  Запуск: Windows PowerShell. Хранилища нет — только DumpConfigToFiles + copy в WSL.
+  Запуск: Windows PowerShell. Хранилища нет — DumpConfigToFiles + copy + code-index.
   Белый список ключей DESIGNER: только dump-xml.
 
 .EXAMPLE
@@ -90,48 +90,8 @@ function Invoke-DesignerDump {
     }
 }
 
-function Copy-DumpToLinux {
-    param(
-        [string]$StagingWin,
-        [string]$DestLinux
-    )
-    if (-not (Test-Path -LiteralPath (Join-Path $StagingWin "Configuration.xml"))) {
-        throw "Staging missing Configuration.xml: $StagingWin"
-    }
-
-    Write-Host "=== copy $StagingWin -> $DestLinux ==="
-    $vol = "klon-opl-export-stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    docker volume create $vol | Out-Null
-    try {
-        $cid = docker create -v "${vol}:/data" alpine
-        if (-not $cid) { throw "docker create failed" }
-        try {
-            docker cp "$StagingWin/." "${cid}:/data/"
-            if ($LASTEXITCODE -ne 0) { throw "docker cp into volume failed" }
-        }
-        finally {
-            docker rm $cid | Out-Null
-        }
-
-        docker run --rm `
-            -v "${vol}:/src:ro" `
-            -v "${DestLinux}:/dest" `
-            alpine sh -c @'
-set -e
-mkdir -p /dest
-find /dest -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-cp -a /src/. /dest/
-test -f /dest/Configuration.xml
-test -f /dest/ConfigDumpInfo.xml
-echo COPY_OK
-find /dest -type f | wc -l
-'@
-        if ($LASTEXITCODE -ne 0) { throw "copy into $DestLinux failed" }
-    }
-    finally {
-        docker volume rm $vol 2>$null | Out-Null
-    }
-}
+$common = Join-Path $PSScriptRoot "..\common\Docker-Index.ps1"
+. (Resolve-Path $common).Path
 
 # --- main ---
 $scriptDir = $PSScriptRoot
@@ -146,14 +106,18 @@ $logDir = [IO.Path]::GetFullPath($logDir)
 $staging = if ($cfg.exportStaging) { [string]$cfg.exportStaging } else { Join-Path $scriptDir "..\..\workdir\klon_opl-export" }
 $staging = [IO.Path]::GetFullPath($staging)
 $destLinux = if ($cfg.exportDestLinux) { [string]$cfg.exportDestLinux } else { "/srv/ai2/klon_opl/src" }
+$bslContainer = if ($cfg.bslContainer) { [string]$cfg.bslContainer } else { "ai2-bsl-klon-opl" }
+$skipCodeIndex = $false
+if ($null -ne $cfg.skipCodeIndex) { $skipCodeIndex = [bool]$cfg.skipCodeIndex }
 
 New-Item -ItemType Directory -Force -Path $logDir, $staging | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 Write-Host "profile: $Profile"
-Write-Host "allowed ops: dump-xml, copy (no store)"
+Write-Host "allowed ops: dump-xml, copy, code-index (no store)"
 Write-Host "staging: $staging"
 Write-Host "dest:    $destLinux"
+Write-Host "code-index: $(if ($skipCodeIndex) { 'SKIP' } else { $bslContainer })"
 
 Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -170,6 +134,10 @@ Write-Host "dump files: $fileCount"
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "docker not found; needed to copy into $destLinux"
 }
-Copy-DumpToLinux -StagingWin $staging -DestLinux $destLinux
+Copy-WinTreeToLinuxPath -StagingWin $staging -DestLinux $destLinux -VolumePrefix "klon-opl-export-stage"
+
+if (-not $skipCodeIndex) {
+    Invoke-Ai2BslCodeIndex -Container $bslContainer -LogDir $logDir -Stamp $stamp
+}
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="

@@ -29,8 +29,8 @@
 ### 1.1. Репозиторий и артефакты (безопасно)
 
 - [x] Pre-git cleanup: расширен `.gitignore`; удалены caches/`.7z`/deprecated `deploy-ai2/mcp_for_1c`+`bsl-indexer`; live `.env`/secrets/connection оставлены на диске.
-- [x] `git init` на `C:\AI-contour` (ветка `master`, commits пока нет).
-- [ ] Первый commit — по явной команде.
+- [x] `git init` на `C:\AI-contour` (ветка `master`).
+- [x] Первый commit (initial import, ~440 files). Remote ещё не привязан.
 - [x] Не коммитить: `.env`, `*-connection.json`, `logs/`, `workdir/`, дампы, SQLite — закрыто `.gitignore`.
 - [ ] Зафиксировать в `STATUS.md` (или журнал): порты чата `:3000` WebUI / `:8080` = MDD MCP (не путать).
 
@@ -53,19 +53,19 @@
 
 **УБД**
 
-- [ ] Entry `tools/ubd/` (или обёртка над `C:\MCP\ubd_index`): git FF → copy → `/srv/ai2/ubd/src` → code (`ai2-bsl-indexer`) → graph (`apply` / FULL через `docker run` на ai2 indexer/neo4j).
-- [ ] Убрать зависимость nightly от `bsl-indexer` / prod `neo4j` / WSL compose.
+- [x] UBD scripts → ai2 (`ai2-bsl-indexer` / `ai2-metadata-indexer` / `ai2-neo4j`) + copy git→`/srv/ai2/ubd/src`; hard-fail code-index.
+- [x] Убрать зависимость nightly от `bsl-indexer` / prod `neo4j` (в lib/sync/preflight).
 - [ ] Лимиты/таймауты Neo4j для FULL; не стартовать FULL, если чат-окно / мало RAM (или явный флаг `-ForceFull`).
 - [ ] После успеха — обновлять state только по слоям; не писать «ok» при skip.
 
 **КБ**
 
-- [ ] Дописать после copy: graph full (`ai2-metadata-indexer-kb`) + code (`ai2-bsl-kb`); логи `graph-reindex-*` / `code-index-*`; exit≠0 при любом fail.
-- [ ] Разобрать, почему задача exit 1 при живом dump (место обрыва до/после copy).
+- [x] КБ: graph full + code (`ai2-bsl-kb`); copy через EAP-safe helper; exit≠0 при fail.
+- [x] Root cause KB exit 1: docker stderr при `$ErrorActionPreference=Stop` на copy (без Continue).
 
 **klon_opl**
 
-- [ ] После copy: обязательный code (`ai2-bsl-klon-opl`); store не добавлять.
+- [x] После copy: обязательный code (`ai2-bsl-klon-opl`).
 
 ### 1.4. Операционные предохранители (сейчас)
 

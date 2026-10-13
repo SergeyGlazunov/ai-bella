@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS
-  КБ: (1) обновить из хранилища + ИБ, (2) выгрузить → /srv/ai2/kb/src, (3) полная переиндексация графа
+  КБ: store+dump → /srv/ai2/kb/src → graph full → code-index (ai2-bsl-kb)
 
 .DESCRIPTION
   Запуск: Windows PowerShell. Других операций с хранилищем/конфигуратором скрипт не делает.
   Запрещены произвольные ключи DESIGNER; нет режимов «только dump» / «пропустить store».
 
   После копирования выгрузки — полный прогон metadata-indexer (METADATA_FORCE_REINDEX),
-  без apply_changes: КБ маленькая (~10 мин). Нужен Docker Engine (без docker compose plugin).
+  без apply_changes: КБ маленькая (~10 мин), затем code-index через ai2-bsl-kb.
+  Нужен Docker Engine (без docker compose plugin).
 
   Права учётки хранилища на стороне 1С тоже должны быть минимальными (только получение
   изменений). Скрипт — второй контур ограничения.
@@ -121,71 +122,37 @@ function Invoke-DesignerAllowed {
     }
 }
 
-function Copy-DumpToLinux {
-    param(
-        [string]$StagingWin,
-        [string]$DestLinux
-    )
-    if (-not (Test-Path -LiteralPath (Join-Path $StagingWin "Configuration.xml"))) {
-        throw "Staging missing Configuration.xml: $StagingWin"
-    }
-
-    Write-Host "=== copy $StagingWin -> $DestLinux ==="
-    $vol = "kb-export-stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    docker volume create $vol | Out-Null
-    try {
-        $cid = docker create -v "${vol}:/data" alpine
-        if (-not $cid) { throw "docker create failed" }
-        try {
-            docker cp "$StagingWin/." "${cid}:/data/"
-            if ($LASTEXITCODE -ne 0) { throw "docker cp into volume failed" }
-        }
-        finally {
-            docker rm $cid | Out-Null
-        }
-
-        docker run --rm `
-            -v "${vol}:/src:ro" `
-            -v "${DestLinux}:/dest" `
-            alpine sh -c @'
-set -e
-mkdir -p /dest
-find /dest -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-cp -a /src/. /dest/
-test -f /dest/Configuration.xml
-test -f /dest/ConfigDumpInfo.xml
-echo COPY_OK
-find /dest -type f | wc -l
-'@
-        if ($LASTEXITCODE -ne 0) { throw "copy into $DestLinux failed" }
-    }
-    finally {
-        docker volume rm $vol 2>$null | Out-Null
-    }
-}
+$common = Join-Path $PSScriptRoot "..\common\Docker-Index.ps1"
+. (Resolve-Path $common).Path
 
 function Wait-Neo4jHealthy {
     param(
         [string]$Container = "ai2-neo4j-kb",
         [int]$TimeoutSec = 180
     )
-    $null = docker inspect $Container 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Neo4j container not found: $Container"
-    }
-    docker start $Container 2>$null | Out-Null
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        $health = (docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}" $Container 2>$null)
-        if ($health -eq "healthy" -or $health -eq "running") {
-            if ($health -eq "healthy") { return }
-            # no healthcheck → accept running after short settle
-            Start-Sleep -Seconds 3
-            return
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $null = docker inspect $Container 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Neo4j container not found: $Container"
         }
-        Start-Sleep -Seconds 3
+        docker start $Container 2>$null | Out-Null
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $health = (docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}" $Container 2>$null)
+            if ($health -eq "healthy" -or $health -eq "running") {
+                if ($health -eq "healthy") { return }
+                Start-Sleep -Seconds 3
+                return
+            }
+            Start-Sleep -Seconds 3
+        }
+        throw "Neo4j not healthy within ${TimeoutSec}s: $Container"
     }
-    throw "Neo4j not healthy within ${TimeoutSec}s: $Container"
+    finally {
+        $ErrorActionPreference = $prev
+    }
 }
 
 function Invoke-KbGraphFullReindex {
@@ -292,12 +259,16 @@ if ($null -ne $cfg.skipGraphReindex) {
 }
 $indexerRef = if ($cfg.graphIndexerContainer) { [string]$cfg.graphIndexerContainer } else { "ai2-metadata-indexer-kb" }
 $neo4jRef = if ($cfg.graphNeo4jContainer) { [string]$cfg.graphNeo4jContainer } else { "ai2-neo4j-kb" }
+$bslContainer = if ($cfg.bslContainer) { [string]$cfg.bslContainer } else { "ai2-bsl-kb" }
+$skipCodeIndex = $false
+if ($null -ne $cfg.skipCodeIndex) { $skipCodeIndex = [bool]$cfg.skipCodeIndex }
 
 Write-Host "profile: $Profile"
-Write-Host "allowed ops: store-update (UpdateCfg+UpdateDBCfg), dump-xml, copy, graph-reindex(full)"
+Write-Host "allowed ops: store-update (UpdateCfg+UpdateDBCfg), dump-xml, copy, graph-reindex(full), code-index"
 Write-Host "staging: $staging"
 Write-Host "dest:    $destLinux"
 Write-Host "graph-reindex: $(if ($skipGraphReindex) { 'SKIP' } else { "full via $indexerRef" })"
+Write-Host "code-index: $(if ($skipCodeIndex) { 'SKIP' } else { $bslContainer })"
 
 # (1) хранилище → конфигурация ИБ + применение к БД
 Invoke-DesignerAllowed -Op "store-update" -Cfg $cfg -LogDir $logDir -Stamp $stamp
@@ -318,7 +289,7 @@ Write-Host "dump files: $fileCount"
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "docker not found; needed to copy into $destLinux"
 }
-Copy-DumpToLinux -StagingWin $staging -DestLinux $destLinux
+Copy-WinTreeToLinuxPath -StagingWin $staging -DestLinux $destLinux -VolumePrefix "kb-export-stage"
 
 # (3) полная переиндексация графа КБ (без apply_changes)
 if (-not $skipGraphReindex) {
@@ -328,6 +299,11 @@ if (-not $skipGraphReindex) {
         -SrcLinux $destLinux `
         -LogDir $logDir `
         -Stamp $stamp
+}
+
+# (4) code-index
+if (-not $skipCodeIndex) {
+    Invoke-Ai2BslCodeIndex -Container $bslContainer -LogDir $logDir -Stamp $stamp
 }
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="
