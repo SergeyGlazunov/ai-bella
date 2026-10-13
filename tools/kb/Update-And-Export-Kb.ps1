@@ -164,14 +164,34 @@ function Invoke-KbGraphFullReindex {
         [string]$Stamp
     )
 
-    $null = docker inspect $ReferenceContainer 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Reference indexer container missing: $ReferenceContainer (deploy ai2-mcp-kb first)"
+    $log = Join-Path $LogDir "graph-reindex-$Stamp.log"
+    # Create log early so Task Scheduler failures leave a trail (inspect used to abort under Stop).
+    "graph-reindex prepare $(Get-Date -Format o) ref=$ReferenceContainer neo4j=$Neo4jContainer" |
+        Set-Content -LiteralPath $log -Encoding UTF8
+
+    $inspectCode = Invoke-DockerNative -DockerArgs @("inspect", $ReferenceContainer)
+    if ($inspectCode -ne 0) {
+        throw "Reference indexer container missing: $ReferenceContainer (deploy ai2-mcp-kb first). See $log"
     }
 
     Wait-Neo4jHealthy -Container $Neo4jContainer
 
-    $ref = (docker inspect $ReferenceContainer | ConvertFrom-Json)[0]
+    # Capture JSON under Continue — native docker stderr must not abort the nightly job.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $inspectJson = & docker inspect $ReferenceContainer 2>$null
+        $inspectExit = [int]$LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($inspectExit -ne 0 -or -not $inspectJson) {
+        throw "docker inspect failed for $ReferenceContainer exit=$inspectExit. See $log"
+    }
+    $ref = ($inspectJson | ConvertFrom-Json)[0]
+    if (-not $ref) { throw "Failed to parse docker inspect for $ReferenceContainer. See $log" }
+
     $image = [string]$ref.Config.Image
     if (-not $image) { throw "No image on $ReferenceContainer" }
 
@@ -182,10 +202,8 @@ function Invoke-KbGraphFullReindex {
     if (-not $network) { $network = "ai2-mcp-kb_net" }
 
     $runName = "ai2-metadata-indexer-kb-nightly-$Stamp"
-    # avoid name clash if a previous nightly was killed mid-run
-    docker rm -f $runName 2>$null | Out-Null
+    $null = Invoke-DockerNative -DockerArgs @("rm", "-f", $runName)
 
-    $log = Join-Path $LogDir "graph-reindex-$Stamp.log"
     $dockerArgs = @(
         "run", "--rm",
         "--name", $runName,
@@ -218,16 +236,10 @@ function Invoke-KbGraphFullReindex {
     Write-Host "force: METADATA_FORCE_REINDEX=true"
     Write-Host "log: $log"
 
+    Add-Content -LiteralPath $log -Value "image=$image network=$network src=$SrcLinux" -Encoding UTF8
+
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        & docker @dockerArgs 2>&1 | Tee-Object -FilePath $log
-        $exit = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $prevEap
-    }
+    $exit = Invoke-DockerNative -DockerArgs $dockerArgs -TeeFile $log -AppendTee
     $sw.Stop()
     Write-Host "graph-reindex exit=$exit elapsed_sec=$([math]::Round($sw.Elapsed.TotalSeconds, 1))"
 
@@ -238,6 +250,9 @@ function Invoke-KbGraphFullReindex {
 
 # --- main ---
 $scriptDir = $PSScriptRoot
+if (-not $env:DOCKER_HOST) {
+    $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
+}
 if (-not $Profile) {
     $Profile = Join-Path $scriptDir "kb-connection.json"
 }

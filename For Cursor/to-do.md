@@ -61,7 +61,7 @@
 **КБ**
 
 - [x] КБ: graph full + code (`ai2-bsl-kb`); copy через EAP-safe helper; exit≠0 при fail.
-- [x] Root cause KB exit 1: docker stderr при `$ErrorActionPreference=Stop` на copy (без Continue).
+- [x] Root cause KB exit 1 (13.10): `docker inspect` в graph-prepare под Stop → NativeCommandError до Tee-Object; fixed Continue/`Invoke-DockerNative` + early log + `DOCKER_HOST`.
 
 **klon_opl**
 
@@ -102,7 +102,7 @@
 
 ## 3. После зелёной ночи (короткий горизонт закрыт)
 
-- [ ] Перенацелить Task Scheduler на новые entrypoints (если ещё обёртки).
+- [x] `UBD Config Sync` зарегистрирован (Glazunov.SP, Interactive/Limited, 02:00 → sync-and-index.ps1); scripts+bootstrap на стенде синхронизированы (13.10).
 - [ ] Prod УБД teardown (вариант B: stop+rm контейнеры, тома backup).
 - [ ] Наблюдение 2–3 ночи без ручного catch-up.
 

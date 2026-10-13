@@ -95,6 +95,9 @@ $common = Join-Path $PSScriptRoot "..\common\Docker-Index.ps1"
 
 # --- main ---
 $scriptDir = $PSScriptRoot
+if (-not $env:DOCKER_HOST) {
+    $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
+}
 if (-not $Profile) {
     $Profile = Join-Path $scriptDir "klon_opl-connection.json"
 }
