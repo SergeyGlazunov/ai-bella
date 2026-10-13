@@ -24,11 +24,23 @@ class UniqueKeyLoader(yaml.SafeLoader):
 def _construct_unique_mapping(
     loader: yaml.SafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
 ) -> dict[Any, Any]:
+    # Reject true duplicate keys before merge expansion. After flatten_mapping,
+    # merge + local override intentionally produces the same key twice (local wins).
+    seen: set[Any] = set()
+    for key_node, _value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
+        if key_node.tag == "tag:yaml.org,2002:value":
+            key_node.tag = "tag:yaml.org,2002:str"
+        key = loader.construct_object(key_node, deep=deep)
+        if key in seen:
+            raise ValueError(f"duplicate key: {key!r}")
+        seen.add(key)
+
+    loader.flatten_mapping(node)
     mapping: dict[Any, Any] = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
-            raise ValueError(f"duplicate key: {key!r}")
         mapping[key] = loader.construct_object(value_node, deep=deep)
     return mapping
 

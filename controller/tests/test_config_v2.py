@@ -335,6 +335,86 @@ databases: {}
         load_config(str(p))
 
 
+def test_yaml_merge_key_inherits_and_overrides(tmp_path: Path):
+    """UniqueKeyLoader must keep PyYAML << merge; local fields override anchors."""
+    p = tmp_path / "merge.yaml"
+    p.write_text(
+        """
+schema_version: 2
+runtime:
+  root: /r
+  db_path: /r/s.db
+  lock_path: /r/l
+  logs_path: /r/logs
+  backups_path: /r/b
+schedule:
+  window_start: "01:00"
+  window_end: "02:00"
+  timezone: UTC
+alert:
+  command: [/bin/true]
+db_defaults: &db_defaults
+  enabled: true
+  services:
+    graph_compose_dir: /a
+    graph_project: a
+    graph_service: a
+    graph_mcp: a
+    bsl_compose_dir: /a
+    bsl_project: a
+    bsl_container: from-defaults
+    bsl_publish_port: 1
+    bsl_daemon_toml: /a/t
+    webui_network: n
+  storage:
+    graph_volume: g
+    code_index_volume: c
+  adapters:
+    idle_probe: [/bin/true]
+    code_index:
+      check_bsl: [/bin/true]
+    graph:
+      check_bsl: [/bin/true]
+databases:
+  ubd:
+    <<: *db_defaults
+    required_layers: [graph, code_index]
+    source:
+      type: git
+      path: /r/ubd
+      remote: "https://example.invalid/ubd.git"
+      branch: main
+      workspace_subdir: src
+    services:
+      graph_compose_dir: /a
+      graph_project: a
+      graph_service: a
+      graph_mcp: a
+      bsl_compose_dir: /a
+      bsl_project: a
+      bsl_container: overridden
+      bsl_publish_port: 1
+      bsl_daemon_toml: /a/t
+      webui_network: n
+  kb:
+    <<: *db_defaults
+    enabled: false
+    required_layers: [code_index]
+    source:
+      type: package
+      inbox: /r/inbox
+      source_path: /r/kb
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(str(p))
+    assert cfg.databases["ubd"].enabled is True
+    assert cfg.databases["ubd"].services.bsl_container == "overridden"
+    assert cfg.databases["kb"].enabled is False
+    assert cfg.databases["kb"].services.bsl_container == "from-defaults"
+    assert set(enabled_databases(cfg)) == {"ubd"}
+
+
 def test_duplicate_database_key_raises(tmp_path: Path):
     """Duplicate YAML keys under databases: must not silently overwrite."""
     p = tmp_path / "dup.yaml"
