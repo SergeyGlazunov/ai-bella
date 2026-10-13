@@ -2,9 +2,12 @@ from pathlib import Path
 
 import pytest
 
+import yaml
+
 from contour.config import (
     GitSourceConfig,
     PackageSourceConfig,
+    UniqueKeyLoader,
     enabled_databases,
     load_config,
 )
@@ -413,6 +416,15 @@ databases:
     assert cfg.databases["kb"].enabled is False
     assert cfg.databases["kb"].services.bsl_container == "from-defaults"
     assert set(enabled_databases(cfg)) == {"ubd"}
+
+
+def test_duplicate_keys_inside_merge_mapping_raise():
+    """Duplicates inside <<: {..} must raise; flatten must not hide them."""
+    with pytest.raises(ValueError, match="duplicate"):
+        yaml.load(
+            "profile:\n  <<: {enabled: true, enabled: false}\n",
+            Loader=UniqueKeyLoader,
+        )
 
 
 def test_duplicate_database_key_raises(tmp_path: Path):

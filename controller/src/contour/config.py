@@ -21,14 +21,23 @@ class UniqueKeyLoader(yaml.SafeLoader):
     """Reject duplicate mapping keys (PyYAML otherwise keeps the last value)."""
 
 
-def _construct_unique_mapping(
+def _reject_duplicate_mapping_keys(
     loader: yaml.SafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
-) -> dict[Any, Any]:
-    # Reject true duplicate keys before merge expansion. After flatten_mapping,
-    # merge + local override intentionally produces the same key twice (local wins).
+) -> None:
+    """Reject duplicate keys in this mapping and in unexpanded merge sources.
+
+    ``flatten_mapping`` copies merge MappingNode pairs without constructing them,
+    so inline ``<<: {a: 1, a: 2}`` would otherwise silently keep the last value.
+    """
     seen: set[Any] = set()
-    for key_node, _value_node in node.value:
+    for key_node, value_node in node.value:
         if key_node.tag == "tag:yaml.org,2002:merge":
+            if isinstance(value_node, yaml.nodes.MappingNode):
+                _reject_duplicate_mapping_keys(loader, value_node, deep)
+            elif isinstance(value_node, yaml.nodes.SequenceNode):
+                for subnode in value_node.value:
+                    if isinstance(subnode, yaml.nodes.MappingNode):
+                        _reject_duplicate_mapping_keys(loader, subnode, deep)
             continue
         if key_node.tag == "tag:yaml.org,2002:value":
             key_node.tag = "tag:yaml.org,2002:str"
@@ -37,6 +46,13 @@ def _construct_unique_mapping(
             raise ValueError(f"duplicate key: {key!r}")
         seen.add(key)
 
+
+def _construct_unique_mapping(
+    loader: yaml.SafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    # Reject true duplicates (including inside merge templates) before expansion.
+    # After flatten_mapping, merge + local override may repeat a key (local wins).
+    _reject_duplicate_mapping_keys(loader, node, deep)
     loader.flatten_mapping(node)
     mapping: dict[Any, Any] = {}
     for key_node, value_node in node.value:
