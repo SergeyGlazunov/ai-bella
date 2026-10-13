@@ -41,8 +41,12 @@ def test_requires_alert_command(tmp_path: Path):
 def test_example_yaml_loads_adapters():
     example = Path(__file__).resolve().parents[2] / "contour.example.yaml"
     cfg = load_config(str(example))
+    assert cfg.schema_version == 2
+    assert set(cfg.databases) == {"ubd", "kb", "klon_opl"}
+    ubd = cfg.databases["ubd"]
+    assert ubd.adapters.idle_probe
+    assert ubd.adapters.code_index.check_bsl
+    assert ubd.adapters.graph.check_xml
     assert cfg.adapters is not None
     assert cfg.adapters.idle_probe
-    assert cfg.adapters.code_index.check_bsl
-    assert cfg.adapters.graph.check_xml
     assert cfg.schedule.duration_warn_seconds is None

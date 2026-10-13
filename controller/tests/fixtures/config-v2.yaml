@@ -1,0 +1,112 @@
+schema_version: 2
+
+runtime:
+  root: /srv/ai-contour
+  db_path: /srv/ai-contour/state/state.db
+  lock_path: /srv/ai-contour/locks/sync.lock
+  logs_path: /srv/ai-contour/logs/runs
+  backups_path: /srv/ai-contour/backups/state
+
+schedule:
+  window_start: "01:30"
+  window_end: "06:00"
+  timezone: Asia/Vladivostok
+  duration_warn_seconds: null
+  measure_max_seconds: 43200
+
+alert:
+  command: ["/opt/ai-sync/alert.sh"]
+
+databases:
+  ubd:
+    enabled: true
+    required_layers: [graph, code_index]
+    source:
+      type: git
+      path: /srv/ai-contour/sources/ubd
+      remote: "https://example.invalid/ubd.git"
+      branch: main
+      workspace_subdir: src
+    services:
+      graph_compose_dir: /srv/ai-contour/compose/graph-ubd
+      graph_project: ai2-mcp-ubd
+      graph_service: metadata-indexer
+      graph_mcp: mcp-metadata-graph
+      bsl_compose_dir: /srv/ai-contour/compose/bsl-ubd
+      bsl_project: ai2-bsl-ubd
+      bsl_container: bsl-indexer
+      bsl_publish_port: 8011
+      bsl_daemon_toml: /srv/ai-contour/compose/bsl-ubd/daemon.toml
+      webui_network: ai-stack_default
+    storage:
+      graph_volume: ai2-neo4j-ubd-data
+      code_index_volume: ai2-bsl-ubd-home
+    adapters:
+      idle_probe: ["/opt/ai-sync/integrations/idle_bsl.sh"]
+      code_index:
+        check_bsl: ["/opt/ai-sync/integrations/probe_code_index.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-sync/integrations/probe_code_index.sh", "absent", "{path}"]
+      graph:
+        check_bsl: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
+        check_xml: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-sync/integrations/probe_graph.sh", "absent", "{path}"]
+
+  kb:
+    enabled: true
+    required_layers: [graph, code_index]
+    source:
+      type: package
+      inbox: /srv/ai-contour/inbox/kb
+      source_path: /srv/ai-contour/sources/kb
+    services:
+      graph_compose_dir: /srv/ai-contour/compose/graph-kb
+      graph_project: ai2-mcp-kb
+      graph_service: metadata-indexer
+      graph_mcp: mcp-graph-kb
+      bsl_compose_dir: /srv/ai-contour/compose/bsl-kb
+      bsl_project: ai2-bsl-kb
+      bsl_container: bsl-kb
+      bsl_publish_port: 8211
+      bsl_daemon_toml: /srv/ai-contour/compose/bsl-kb/daemon.toml
+      webui_network: ai-stack_default
+    storage:
+      graph_volume: ai2-neo4j-kb-data
+      code_index_volume: ai2-bsl-kb-home
+    adapters:
+      idle_probe: ["/opt/ai-sync/integrations/idle_bsl.sh"]
+      code_index:
+        check_bsl: ["/opt/ai-sync/integrations/probe_code_index.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-sync/integrations/probe_code_index.sh", "absent", "{path}"]
+      graph:
+        check_bsl: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
+        check_xml: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-sync/integrations/probe_graph.sh", "absent", "{path}"]
+
+  klon_opl:
+    enabled: true
+    required_layers: [code_index]
+    source:
+      type: package
+      inbox: /srv/ai-contour/inbox/klon_opl
+      source_path: /srv/ai-contour/sources/klon_opl
+    services:
+      graph_compose_dir: ""
+      graph_project: ""
+      graph_service: ""
+      graph_mcp: ""
+      bsl_compose_dir: /srv/ai-contour/compose/bsl-klon-opl
+      bsl_project: ai2-bsl-klon-opl
+      bsl_container: bsl-klon-opl
+      bsl_publish_port: 8311
+      bsl_daemon_toml: /srv/ai-contour/compose/bsl-klon-opl/daemon.toml
+      webui_network: ai-stack_default
+    storage:
+      graph_volume: ""
+      code_index_volume: ai2-bsl-klon-opl-home
+    adapters:
+      idle_probe: ["/opt/ai-sync/integrations/idle_bsl.sh"]
+      code_index:
+        check_bsl: ["/opt/ai-sync/integrations/probe_code_index.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-sync/integrations/probe_code_index.sh", "absent", "{path}"]
+      graph:
+        check_bsl: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]

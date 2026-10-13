@@ -121,7 +121,7 @@ def _make_config(tmp_path: Path) -> Config:
         encoding="utf-8",
     )
     assert compose_dir.resolve() != LIVE_GRAPH_COMPOSE.resolve()
-    raw["services"]["graph_compose_dir"] = str(compose_dir)
+    raw["databases"]["ubd"]["services"]["graph_compose_dir"] = str(compose_dir)
     cfg_path = tmp_path / "contour.yaml"
     cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
     return load_config(str(cfg_path))
@@ -264,7 +264,7 @@ def test_index_graph_exit_3_then_0_takes_full(tmp_path: Path):
         assert starts[0] == ["docker", "start", delta_cid]
         assert starts[1] == ["docker", "start", full_cid]
         assert "-p" in creates[0]
-        assert creates[0][creates[0].index("-p") + 1] == "mcp_for_1c"
+        assert creates[0][creates[0].index("-p") + 1] == cfg.services.graph_project
         assert "metadata-indexer" in delta_text
         assert "metadata-indexer" in full_text
     finally:

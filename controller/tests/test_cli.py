@@ -18,7 +18,7 @@ EXAMPLE = Path(__file__).resolve().parents[2] / "contour.example.yaml"
 def _write_cfg(tmp_path: Path, *, remote: str | None = None, **schedule) -> Path:
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
     if remote is not None:
-        raw["repo"]["remote"] = remote
+        raw["databases"]["ubd"]["source"]["remote"] = remote
     raw["schedule"].update(schedule)
     raw["alert"]["command"] = [sys.executable]
     path = tmp_path / "contour.yaml"

@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
 FORBIDDEN_FEATURES = frozenset({"kb", "mdm"})
+VALID_LAYERS = frozenset({"graph", "code_index"})
+LEGACY_RUNTIME = {
+    "root": "/srv/ai",
+    "db_path": "/srv/ai/state/state.db",
+    "lock_path": "/srv/ai/locks/sync.lock",
+    "logs_path": "/srv/ai/logs/runs",
+    "backups_path": "/srv/ai/backups/state",
+}
 
 
 @dataclass(frozen=True)
@@ -15,6 +23,22 @@ class RepoConfig:
     remote: str
     branch: str
     workspace_subdir: str
+
+
+@dataclass(frozen=True)
+class GitSourceConfig:
+    type: Literal["git"]
+    path: str
+    remote: str
+    branch: str
+    workspace_subdir: str
+
+
+@dataclass(frozen=True)
+class PackageSourceConfig:
+    type: Literal["package"]
+    inbox: str
+    source_path: str
 
 
 @dataclass(frozen=True)
@@ -74,6 +98,26 @@ class AdaptersConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    root: str
+    db_path: str
+    lock_path: str
+    logs_path: str
+    backups_path: str
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    name: str
+    source: GitSourceConfig | PackageSourceConfig
+    required_layers: frozenset[str]
+    services: ServicesConfig
+    storage: StorageConfig
+    adapters: AdaptersConfig
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     repo: RepoConfig
     schedule: ScheduleConfig
@@ -82,6 +126,14 @@ class Config:
     storage: StorageConfig
     features: FeaturesConfig | None = None
     adapters: AdaptersConfig | None = None
+    schema_version: int = 1
+    runtime: RuntimeConfig | None = None
+    databases: dict[str, DatabaseConfig] | None = None
+
+
+def enabled_databases(cfg: Config) -> dict[str, DatabaseConfig]:
+    databases = cfg.databases or {}
+    return {name: db for name, db in databases.items() if db.enabled}
 
 
 def _require_mapping(raw: dict[str, Any], section: str) -> dict[str, Any]:
@@ -89,6 +141,12 @@ def _require_mapping(raw: dict[str, Any], section: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"missing or invalid section: {section}")
     return value
+
+
+def _require_key(raw: dict[str, Any], key: str, label: str) -> Any:
+    if key not in raw:
+        raise ValueError(f"missing {label}")
+    return raw[key]
 
 
 def _validate_features(features_raw: dict[str, Any]) -> None:
@@ -213,8 +271,8 @@ def _parse_adapter_commands(raw: Any, section: str) -> AdapterCommands:
     )
 
 
-def _parse_adapters(adapters_raw: dict[str, Any]) -> AdaptersConfig:
-    idle = _parse_command_list(adapters_raw.get("idle_probe"), "adapters.idle_probe")
+def _parse_adapters(adapters_raw: dict[str, Any], label: str = "adapters") -> AdaptersConfig:
+    idle = _parse_command_list(adapters_raw.get("idle_probe"), f"{label}.idle_probe")
     return AdaptersConfig(
         code_index=_parse_adapter_commands(adapters_raw.get("code_index"), "code_index"),
         graph=_parse_adapter_commands(adapters_raw.get("graph"), "graph"),
@@ -222,11 +280,198 @@ def _parse_adapters(adapters_raw: dict[str, Any]) -> AdaptersConfig:
     )
 
 
-def load_config(path: str) -> Config:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("config root must be a mapping")
+def _parse_runtime(runtime_raw: dict[str, Any]) -> RuntimeConfig:
+    return RuntimeConfig(
+        root=str(runtime_raw["root"]),
+        db_path=str(runtime_raw["db_path"]),
+        lock_path=str(runtime_raw["lock_path"]),
+        logs_path=str(runtime_raw["logs_path"]),
+        backups_path=str(runtime_raw["backups_path"]),
+    )
 
+
+def _parse_required_layers(raw: Any, db_name: str) -> frozenset[str]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"databases.{db_name}.required_layers must be a non-empty list")
+    layers = frozenset(str(item) for item in raw)
+    unknown = layers - VALID_LAYERS
+    if unknown:
+        raise ValueError(
+            f"databases.{db_name}.required_layers unknown: {sorted(unknown)[0]}"
+        )
+    return layers
+
+
+def _parse_git_source(source_raw: dict[str, Any], db_name: str) -> GitSourceConfig:
+    label = f"databases.{db_name}.source"
+    for key in ("path", "remote", "branch", "workspace_subdir"):
+        _require_key(source_raw, key, f"{label}.{key}")
+    return GitSourceConfig(
+        type="git",
+        path=str(source_raw["path"]),
+        remote=str(source_raw["remote"]),
+        branch=str(source_raw["branch"]),
+        workspace_subdir=str(source_raw["workspace_subdir"]),
+    )
+
+
+def _parse_package_source(source_raw: dict[str, Any], db_name: str) -> PackageSourceConfig:
+    label = f"databases.{db_name}.source"
+    for key in ("inbox", "source_path"):
+        _require_key(source_raw, key, f"{label}.{key}")
+    return PackageSourceConfig(
+        type="package",
+        inbox=str(source_raw["inbox"]),
+        source_path=str(source_raw["source_path"]),
+    )
+
+
+def _parse_source(
+    source_raw: Any, db_name: str
+) -> GitSourceConfig | PackageSourceConfig:
+    if not isinstance(source_raw, dict):
+        raise ValueError(f"databases.{db_name}.source must be a mapping")
+    source_type = source_raw.get("type")
+    if source_type == "git":
+        return _parse_git_source(source_raw, db_name)
+    if source_type == "package":
+        return _parse_package_source(source_raw, db_name)
+    raise ValueError(f"databases.{db_name}.source.type must be git or package")
+
+
+def _parse_database(name: str, db_raw: Any) -> DatabaseConfig:
+    if not isinstance(db_raw, dict):
+        raise ValueError(f"databases.{name} must be a mapping")
+    if not name or not str(name).strip():
+        raise ValueError("database name must be non-empty")
+    adapters_raw = _require_mapping(db_raw, "adapters")
+    enabled = db_raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"databases.{name}.enabled must be a boolean")
+    return DatabaseConfig(
+        name=str(name),
+        enabled=enabled,
+        source=_parse_source(db_raw.get("source"), name),
+        required_layers=_parse_required_layers(db_raw.get("required_layers"), name),
+        services=_parse_services(_require_mapping(db_raw, "services")),
+        storage=_parse_storage(_require_mapping(db_raw, "storage")),
+        adapters=_parse_adapters(adapters_raw, label=f"databases.{name}.adapters"),
+    )
+
+
+def _parse_databases(databases_raw: Any) -> dict[str, DatabaseConfig]:
+    if not isinstance(databases_raw, dict) or not databases_raw:
+        raise ValueError("databases must be a non-empty mapping")
+    return {str(name): _parse_database(str(name), raw) for name, raw in databases_raw.items()}
+
+
+def _repo_from_git_source(source: GitSourceConfig) -> RepoConfig:
+    return RepoConfig(
+        path=source.path,
+        remote=source.remote,
+        branch=source.branch,
+        workspace_subdir=source.workspace_subdir,
+    )
+
+
+def _features_from_layers(layers: frozenset[str]) -> FeaturesConfig:
+    return FeaturesConfig(
+        graph="graph" in layers,
+        code_index="code_index" in layers,
+        mdd=False,
+    )
+
+
+def _primary_database(databases: dict[str, DatabaseConfig]) -> DatabaseConfig:
+    if "ubd" in databases:
+        return databases["ubd"]
+    enabled = [db for db in databases.values() if db.enabled]
+    if enabled:
+        return enabled[0]
+    return next(iter(databases.values()))
+
+
+def _legacy_database(
+    repo: RepoConfig,
+    services: ServicesConfig,
+    storage: StorageConfig,
+    adapters: AdaptersConfig | None,
+    features: FeaturesConfig | None,
+) -> DatabaseConfig:
+    layers = frozenset({"graph", "code_index"})
+    if features is not None:
+        layers = frozenset(
+            layer
+            for layer, on in (
+                ("graph", features.graph),
+                ("code_index", features.code_index),
+            )
+            if on
+        ) or layers
+    resolved_adapters = adapters or AdaptersConfig(
+        code_index=AdapterCommands(),
+        graph=AdapterCommands(),
+        idle_probe=["/bin/true"],
+    )
+    return DatabaseConfig(
+        name="ubd",
+        enabled=True,
+        source=GitSourceConfig(
+            type="git",
+            path=repo.path,
+            remote=repo.remote,
+            branch=repo.branch,
+            workspace_subdir=repo.workspace_subdir,
+        ),
+        required_layers=layers,
+        services=services,
+        storage=storage,
+        adapters=resolved_adapters,
+    )
+
+
+def _load_v2(raw: dict[str, Any]) -> Config:
+    databases = _parse_databases(raw.get("databases"))
+    primary = _primary_database(databases)
+    if isinstance(primary.source, GitSourceConfig):
+        repo = _repo_from_git_source(primary.source)
+    else:
+        # Package-primary stand: keep RepoConfig shape for pre-Task-6 callers.
+        repo = RepoConfig(
+            path=primary.source.source_path,
+            remote="",
+            branch="",
+            workspace_subdir="",
+        )
+    features_raw = raw.get("features")
+    if isinstance(features_raw, dict):
+        features = _parse_features(features_raw)
+    else:
+        features = _features_from_layers(primary.required_layers)
+
+    # Explicit adapters: null keeps Contour.adapters unset (legacy reconcile path).
+    if "adapters" in raw and raw["adapters"] is None:
+        adapters = None
+    elif isinstance(raw.get("adapters"), dict):
+        adapters = _parse_adapters(raw["adapters"])
+    else:
+        adapters = primary.adapters
+
+    return Config(
+        schema_version=2,
+        runtime=_parse_runtime(_require_mapping(raw, "runtime")),
+        databases=databases,
+        repo=repo,
+        schedule=_parse_schedule(_require_mapping(raw, "schedule")),
+        alert=_parse_alert(_require_mapping(raw, "alert")),
+        services=primary.services,
+        storage=primary.storage,
+        features=features,
+        adapters=adapters,
+    )
+
+
+def _load_legacy(raw: dict[str, Any]) -> Config:
     features_raw = raw.get("features")
     if isinstance(features_raw, dict):
         _validate_features(features_raw)
@@ -239,13 +484,43 @@ def load_config(path: str) -> Config:
     adapters = (
         _parse_adapters(adapters_raw) if isinstance(adapters_raw, dict) else None
     )
-
+    repo = _parse_repo(_require_mapping(raw, "repo"))
+    services = _parse_services(_require_mapping(raw, "services"))
+    storage = _parse_storage(_require_mapping(raw, "storage"))
+    features = _parse_features(features_raw) if isinstance(features_raw, dict) else None
+    databases = {
+        "ubd": _legacy_database(repo, services, storage, adapters, features),
+    }
     return Config(
-        repo=_parse_repo(_require_mapping(raw, "repo")),
+        schema_version=1,
+        runtime=_parse_runtime(LEGACY_RUNTIME),
+        databases=databases,
+        repo=repo,
         schedule=_parse_schedule(_require_mapping(raw, "schedule")),
         alert=_parse_alert(_require_mapping(raw, "alert")),
-        services=_parse_services(_require_mapping(raw, "services")),
-        storage=_parse_storage(_require_mapping(raw, "storage")),
-        features=_parse_features(features_raw) if isinstance(features_raw, dict) else None,
+        services=services,
+        storage=storage,
+        features=features,
         adapters=adapters,
     )
+
+
+def load_config(path: str) -> Config:
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be a mapping")
+
+    # Early rejects used by existing forbidden-feature tests (partial YAML).
+    features_raw = raw.get("features")
+    if isinstance(features_raw, dict):
+        _validate_features(features_raw)
+    alert_raw = raw.get("alert")
+    if isinstance(alert_raw, dict):
+        _validate_alert(alert_raw)
+
+    version = raw.get("schema_version")
+    if version == 2 or (version is None and "databases" in raw):
+        return _load_v2(raw)
+    if version is not None and version != 1:
+        raise ValueError(f"unsupported schema_version: {version}")
+    return _load_legacy(raw)

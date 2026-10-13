@@ -39,23 +39,25 @@ def _make_config(
 ) -> Config:
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
     raw["schedule"].update(schedule_overrides)
+    ubd = raw["databases"]["ubd"]
     toml_path = tmp_path / "daemon.toml"
     toml_path.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
     assert toml_path.resolve() != LIVE_DAEMON.resolve()
-    raw["services"]["bsl_daemon_toml"] = str(toml_path)
+    ubd["services"]["bsl_daemon_toml"] = str(toml_path)
     compose_dir = tmp_path / "compose"
     compose_dir.mkdir()
     (compose_dir / "docker-compose.yml").write_text(
         "services:\n  metadata-indexer:\n    image: alpine\n",
         encoding="utf-8",
     )
-    raw["services"]["graph_compose_dir"] = str(compose_dir)
+    ubd["services"]["graph_compose_dir"] = str(compose_dir)
     repo = tmp_path / "ubd"
     repo.mkdir()
     assert repo.resolve() != LIVE_REPO.resolve()
-    raw["repo"]["path"] = str(repo)
+    ubd["source"]["path"] = str(repo)
     if drop_adapters:
-        raw.pop("adapters", None)
+        # Force Contour.adapters=None while keeping per-DB adapters valid for schema v2.
+        raw["adapters"] = None
     cfg_path = tmp_path / "contour.yaml"
     cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
     return load_config(str(cfg_path))

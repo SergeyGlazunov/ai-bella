@@ -46,5 +46,5 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 ## Next action
 
 1. Observe tonight’s KB/UBD/OPL LastResult.  
-2. Finish linux-first **Task 1** residual on branch `chore/pre-linux-migration-cleanup` (this doc set).  
-3. Then Task 2+ from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md` — **no** Task Scheduler cutover until Task 11–12.
+2. Linux-first **Task 2** done (schema v2, N DBs, `enabled`, example ubd/kb/klon_opl).  
+3. Next: Task 3+ from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md` — **no** Task Scheduler cutover until Task 11–12.
