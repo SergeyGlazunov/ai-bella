@@ -14,6 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "tzdata",  # ZoneInfo IANA zones on Windows
 ]
 
 [project.scripts]

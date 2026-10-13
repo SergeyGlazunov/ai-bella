@@ -1,6 +1,6 @@
 {
   "name": "ai-contour-kit",
-  "date": "2026-09-20",
+  "date": "2026-10-13",
   "live_cutover": false,
   "present": [
     "controller/",
@@ -10,9 +10,13 @@
     "contour.example.yaml",
     "requirements.lock",
     "secrets.example.yaml",
+    "README.md",
     "USER.md",
     "AGENT.md",
     "DEVELOPMENT.md",
+    "STATUS.md",
+    "ROADMAP.md",
+    "VENDOR.md",
     "compose/ai-stack/docker-compose.yml",
     "compose/ai-stack/.env.example",
     "compose/mcp_for_1c/",
@@ -20,23 +24,32 @@
     "compose/bsl-indexer/",
     "compose/bsl-indexer/crates/",
     "compose/bsl-indexer/deploy/docker/Dockerfile",
+    "deploy-ai2/",
     "integrations/idle_bsl.sh",
     "integrations/skills/webui/",
     "integrations/skills/cursor/",
-    "checks/"
+    "checks/",
+    "tools/kb/",
+    "tools/klon_opl/",
+    "tools/ubd/",
+    "tools/common/"
   ],
   "missing": [
     {
       "id": "ubd_git_contents",
-      "why": "recipient clones their own remote onto /srv/ai/ubd"
+      "why": "recipient clones their own remote onto /srv/ai2/ubd (or legacy /srv/ai/ubd)"
     },
     {
       "id": "filled_secrets",
-      "why": "recipient fills .env and /srv/ai/secrets; live .env was not copied"
+      "why": "recipient fills .env and secrets/; live .env is gitignored and not shipped"
+    },
+    {
+      "id": "vendor_upstream_pins",
+      "why": "compose/bsl-indexer and compose/mcp_for_1c lack verified upstream commit SHAs; see VENDOR.md"
     },
     {
       "id": "open_webui_skill_json_exports",
-      "why": "live JSON exports contained user ids; markdown copies are under integrations/skills"
+      "why": "live JSON exports may contain user ids; markdown copies are under integrations/skills"
     },
     {
       "id": "platform_help_data",
@@ -50,6 +63,10 @@
   "do_not_copy_from_live": [
     "C:\\\\MCP",
     "C:\\\\ai-stack",
-    "C:\\\\instructions-main-system_analytics"
+    "C:\\\\instructions-main-system_analytics",
+    "logs/",
+    "workdir/",
+    "secrets/",
+    "**/.env"
   ]
 }

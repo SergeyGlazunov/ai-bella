@@ -114,9 +114,9 @@
 
 Подготовка к нему заранее (можно параллельно с §1, без cutover):
 
-- [ ] Git clone + baseline branch.
-- [ ] Cleanup по PRE-GIT audit в рабочей копии (не на live secrets стенда вслепую).
-- [ ] `STATUS.md` / `ROADMAP.md` с двумя горизонтами: «PS/ai2 stable» → «contour linux-first».
+- [x] Git remote `ai-bella` + branch `chore/pre-linux-migration-cleanup` (Task 1 docs).
+- [x] Cleanup essentials already on main; Task 1 residual: STATUS/ROADMAP/VENDOR/manifest.
+- [x] `STATUS.md` / `ROADMAP.md` / `VENDOR.md` — два горизонта.
 
 ---
 

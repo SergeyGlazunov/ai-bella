@@ -4,11 +4,15 @@
 
 | Документ | Содержание |
 |----------|------------|
+| [STATUS.md](STATUS.md) | Текущий runtime, блокеры, следующий шаг |
+| [ROADMAP.md](ROADMAP.md) | PS/ai2 stable → linux-first / contour |
+| [VENDOR.md](VENDOR.md) | Vendor trees и неизвестные upstream pin |
 | [AGENT.md](AGENT.md) | Контракт для агента |
 | [USER.md](USER.md) | Установка, УБД+КБ, cutover |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Журнал решений |
 | [checks/README.md](checks/README.md) | Stand gates |
 | [deploy-ai2/README.md](deploy-ai2/README.md) | Overlays ai2: графы + query + BSL |
+| [For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md](For%20Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md) | План миграции на orchestrator |
 
 ## Карта каталогов
 
