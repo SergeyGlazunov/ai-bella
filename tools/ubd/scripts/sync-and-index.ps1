@@ -137,8 +137,20 @@ try {
             $null = & docker.exe volume create $vol 2>&1
             if ($LASTEXITCODE -ne 0) { throw "docker volume create failed" }
             try {
-                $cid = (& docker.exe create -v "${vol}:/data" alpine 2>&1 | Out-String).Trim()
-                if (-not $cid -or $LASTEXITCODE -ne 0) { throw "docker create failed" }
+                # stdout = container ID only; pull progress must stay on stderr
+                # (2>&1 would pollute $cid on first alpine download).
+                $errFile = Join-Path $env:TEMP ("ubd-docker-create-" + [guid]::NewGuid().ToString('N') + ".err")
+                try {
+                    $cid = (& docker.exe create -v "${vol}:/data" alpine 2>$errFile | Out-String).Trim()
+                    if (Test-Path -LiteralPath $errFile) {
+                        Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue |
+                            ForEach-Object { if ($_) { Log "  $_" } }
+                    }
+                    if (-not $cid -or $LASTEXITCODE -ne 0) { throw "docker create failed" }
+                }
+                finally {
+                    Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+                }
                 try {
                     & docker.exe cp "${srcWin}/." "${cid}:/data/" 2>&1 | ForEach-Object { Log "  $_" }
                     if ($LASTEXITCODE -ne 0) { throw "docker cp into volume failed" }

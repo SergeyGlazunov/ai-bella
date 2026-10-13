@@ -118,6 +118,43 @@ def test_enabled_false_excludes_from_enabled_databases(tmp_path: Path):
     assert set(enabled_databases(cfg)) == {"ubd", "kb"}
 
 
+def test_disabled_ubd_not_selected_as_primary(tmp_path: Path):
+    """Contour flat fields must follow an enabled profile, never disabled ubd."""
+    text = (FIXTURES / "config-v2.yaml").read_text(encoding="utf-8")
+    text = text.replace("  ubd:\n    enabled: true\n", "  ubd:\n    enabled: false\n", 1)
+    text = text.replace(
+        "  klon_opl:\n    enabled: true\n",
+        "  klon_opl:\n    enabled: false\n",
+        1,
+    )
+    p = tmp_path / "no-ubd.yaml"
+    p.write_text(text, encoding="utf-8")
+    cfg = load_config(str(p))
+    assert set(enabled_databases(cfg)) == {"kb"}
+    assert cfg.services.bsl_container == "bsl-kb"
+    assert cfg.storage.code_index_volume == "ai2-bsl-kb-home"
+    assert cfg.repo.path == "/srv/ai-contour/sources/kb"
+
+
+def test_disabled_ubd_with_multiple_other_enabled_raises(tmp_path: Path):
+    """Until multi-DB orchestration exists, refuse ambiguous primaries."""
+    text = (FIXTURES / "config-v2.yaml").read_text(encoding="utf-8")
+    text = text.replace("  ubd:\n    enabled: true\n", "  ubd:\n    enabled: false\n", 1)
+    p = tmp_path / "multi.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="enabled"):
+        load_config(str(p))
+
+
+def test_no_enabled_databases_raises(tmp_path: Path):
+    text = (FIXTURES / "config-v2.yaml").read_text(encoding="utf-8")
+    text = text.replace("enabled: true", "enabled: false")
+    p = tmp_path / "none.yaml"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="enabled"):
+        load_config(str(p))
+
+
 def test_git_source_requires_fields(tmp_path: Path):
     p = tmp_path / "bad-git.yaml"
     p.write_text(
@@ -273,8 +310,7 @@ databases:
         load_config(str(p))
 
 
-def test_duplicate_database_names_impossible_in_yaml_mapping(tmp_path: Path):
-    # YAML mapping collapses duplicates; explicit empty databases invalid
+def test_empty_databases_raises(tmp_path: Path):
     p = tmp_path / "empty.yaml"
     p.write_text(
         """
@@ -296,6 +332,88 @@ databases: {}
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="databases"):
+        load_config(str(p))
+
+
+def test_duplicate_database_key_raises(tmp_path: Path):
+    """Duplicate YAML keys under databases: must not silently overwrite."""
+    p = tmp_path / "dup.yaml"
+    p.write_text(
+        """
+schema_version: 2
+runtime:
+  root: /r
+  db_path: /r/s.db
+  lock_path: /r/l
+  logs_path: /r/logs
+  backups_path: /r/b
+schedule:
+  window_start: "01:00"
+  window_end: "02:00"
+  timezone: UTC
+alert:
+  command: [/bin/true]
+databases:
+  ubd:
+    enabled: true
+    required_layers: [graph, code_index]
+    source:
+      type: git
+      path: /r/ubd
+      remote: "https://example.invalid/ubd.git"
+      branch: main
+      workspace_subdir: src
+    services:
+      graph_compose_dir: /a
+      graph_project: a
+      graph_service: a
+      graph_mcp: a
+      bsl_compose_dir: /a
+      bsl_project: a
+      bsl_container: bsl-ubd
+      bsl_publish_port: 1
+      bsl_daemon_toml: /a/t
+      webui_network: n
+    storage:
+      graph_volume: g
+      code_index_volume: c
+    adapters:
+      idle_probe: [/bin/true]
+      code_index:
+        check_bsl: [/bin/true]
+      graph:
+        check_bsl: [/bin/true]
+  ubd:
+    enabled: true
+    required_layers: [code_index]
+    source:
+      type: package
+      inbox: /r/inbox
+      source_path: /r/kb
+    services:
+      graph_compose_dir: ""
+      graph_project: ""
+      graph_service: ""
+      graph_mcp: ""
+      bsl_compose_dir: /b
+      bsl_project: b
+      bsl_container: bsl-kb
+      bsl_publish_port: 2
+      bsl_daemon_toml: /b/t
+      webui_network: n
+    storage:
+      graph_volume: ""
+      code_index_volume: kb-home
+    adapters:
+      idle_probe: [/bin/true]
+      code_index:
+        check_bsl: [/bin/true]
+      graph:
+        check_bsl: [/bin/true]
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate"):
         load_config(str(p))
 
 

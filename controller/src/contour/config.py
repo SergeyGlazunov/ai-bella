@@ -17,6 +17,28 @@ LEGACY_RUNTIME = {
 }
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Reject duplicate mapping keys (PyYAML otherwise keeps the last value)."""
+
+
+def _construct_unique_mapping(
+    loader: yaml.SafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 @dataclass(frozen=True)
 class RepoConfig:
     path: str
@@ -383,12 +405,24 @@ def _features_from_layers(layers: frozenset[str]) -> FeaturesConfig:
 
 
 def _primary_database(databases: dict[str, DatabaseConfig]) -> DatabaseConfig:
-    if "ubd" in databases:
-        return databases["ubd"]
+    """Pick Contour's single primary profile among enabled databases only.
+
+    Until multi-DB orchestration lands: prefer enabled ``ubd``; otherwise require
+    exactly one enabled profile (refuse ambiguous sets).
+    """
     enabled = [db for db in databases.values() if db.enabled]
-    if enabled:
-        return enabled[0]
-    return next(iter(databases.values()))
+    if not enabled:
+        raise ValueError("no enabled databases")
+    by_name = {db.name: db for db in enabled}
+    if "ubd" in by_name:
+        return by_name["ubd"]
+    if len(enabled) > 1:
+        names = ", ".join(sorted(by_name))
+        raise ValueError(
+            "multiple enabled databases without enabled ubd "
+            f"({names}); Contour currently supports a single primary profile"
+        )
+    return enabled[0]
 
 
 def _legacy_database(
@@ -506,7 +540,7 @@ def _load_legacy(raw: dict[str, Any]) -> Config:
 
 
 def load_config(path: str) -> Config:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    raw = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=UniqueKeyLoader)
     if not isinstance(raw, dict):
         raise ValueError("config root must be a mapping")
 
