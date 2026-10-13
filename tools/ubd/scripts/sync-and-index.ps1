@@ -123,17 +123,39 @@ try {
     function Copy-UbdGitSrcToAi2 {
         $srcWin = Find-ConfigRoot $script:UbdConfig
         if (-not $srcWin) { throw "Configuration.xml not found under $($script:UbdConfig)" }
-        Log "copy $srcWin -> $srcLinux"
+        if (-not (Test-Path -LiteralPath (Join-Path $srcWin "Configuration.xml"))) {
+            throw "Configuration.xml missing in $srcWin"
+        }
+        # Linux Docker Engine (DOCKER_HOST tcp) rejects Windows bind mounts
+        # (-v C:\...:/src). Same transport as tools/common/Docker-Index.ps1:
+        # named volume + docker cp, then alpine copy into /srv/ai2/ubd/src.
+        Log "copy $srcWin -> $srcLinux (volume+cp)"
+        $vol = "ubd-git-stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
         $oldEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            # Bind Windows git tree + Linux ai2 dest in one alpine run (no huge docker cp of 65k files via volume).
-            & docker.exe run --rm `
-                -v "${srcWin}:/src:ro" `
-                -v "${srcLinux}:/dest" `
-                alpine sh -c "set -e; mkdir -p /dest; find /dest -mindepth 1 -maxdepth 1 -exec rm -rf {} +; cp -a /src/. /dest/; test -f /dest/Configuration.xml; echo COPY_OK; find /dest -type f | wc -l" 2>&1 |
-                ForEach-Object { Log "  $_" }
-            if ($LASTEXITCODE -ne 0) { throw "copy to $srcLinux failed" }
+            $null = & docker.exe volume create $vol 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "docker volume create failed" }
+            try {
+                $cid = (& docker.exe create -v "${vol}:/data" alpine 2>&1 | Out-String).Trim()
+                if (-not $cid -or $LASTEXITCODE -ne 0) { throw "docker create failed" }
+                try {
+                    & docker.exe cp "${srcWin}/." "${cid}:/data/" 2>&1 | ForEach-Object { Log "  $_" }
+                    if ($LASTEXITCODE -ne 0) { throw "docker cp into volume failed" }
+                }
+                finally {
+                    $null = & docker.exe rm $cid 2>&1
+                }
+                & docker.exe run --rm `
+                    -v "${vol}:/src:ro" `
+                    -v "${srcLinux}:/dest" `
+                    alpine sh -c "set -e; mkdir -p /dest; find /dest -mindepth 1 -maxdepth 1 -exec rm -rf {} +; cp -a /src/. /dest/; test -f /dest/Configuration.xml; echo COPY_OK; find /dest -type f | wc -l" 2>&1 |
+                    ForEach-Object { Log "  $_" }
+                if ($LASTEXITCODE -ne 0) { throw "copy to $srcLinux failed" }
+            }
+            finally {
+                $null = & docker.exe volume rm $vol 2>&1
+            }
         }
         finally {
             $ErrorActionPreference = $oldEap
