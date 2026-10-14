@@ -14,6 +14,7 @@ from contour.profiles import (
 )
 from contour.sources import PreparedSource, SourceProvider, activate_source
 from contour.state import StateStore
+from contour.runtime_policy import WriteWindowClosed
 from contour.verify import (
     Samples,
     sample_current_tree,
@@ -191,6 +192,27 @@ def run_database_pipeline(
         state.mark_published(name, revision)
         state.finish_run(run_id, "published", "ok")
         return PipelineResult(name, revision, "published", "ok", run_id=run_id)
+    except WriteWindowClosed as exc:
+        message = str(exc) or "deferred_window"
+        if entry_read_error:
+            message = f"{message}; also could not read prior reads state: {entry_read_error}"
+        if not activated and close_attempted and reads_closed_on_entry is False:
+            try:
+                reads.open()
+            except Exception as open_exc:
+                message = f"{message}; also failed to reopen reads: {open_exc}"
+        if run_id is not None:
+            try:
+                state.finish_run(run_id, "deferred", message)
+            except Exception:
+                pass
+        try:
+            state.set_lifecycle(name, "deferred", detail=message)
+        except Exception:
+            pass
+        return PipelineResult(
+            name, revision or "unknown", "deferred", message, run_id=run_id
+        )
     except Exception as exc:
         message = str(exc) or exc.__class__.__name__
         if entry_read_error:

@@ -170,6 +170,35 @@ def ping(*, runner: DockerRunner | None = None, timeout: float = 5.0) -> None:
     docker_runner.run(["docker", "info"], timeout=timeout)
 
 
+def run_readonly_with_retry(
+    runner: DockerRunner,
+    cmd: list[str],
+    *,
+    timeout: float = 30.0,
+    retries: int = 2,
+    pause_seconds: float = 1.0,
+) -> subprocess.CompletedProcess[str]:
+    """Bounded retries for transient read-only Docker inspect/info failures."""
+    import time
+
+    attempts = max(1, int(retries))
+    last_exc: BaseException | None = None
+    for index in range(attempts):
+        try:
+            return runner.run(cmd, timeout=timeout)
+        except (TimeoutError, OSError, subprocess.TimeoutExpired) as exc:
+            last_exc = exc
+            if index + 1 >= attempts:
+                break
+            if pause_seconds > 0:
+                time.sleep(pause_seconds)
+        except Exception as exc:
+            # Non-transient command failures are not retried.
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
 def compose_create(
     compose_dir: str,
     project: str,

@@ -59,10 +59,14 @@ def test_no_new_package_is_noop(tmp_path: Path):
         seen.append(database.name)
         return "deferred"
 
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
     result = reconcile(
         cfg,
         timer=False,
         measure=False,
+        now=datetime(2026, 9, 20, 3, 0, tzinfo=ZoneInfo("Asia/Vladivostok")),
         paths=RuntimePaths(
             db_path=str(tmp_path / "state.db"),
             lock_path=str(tmp_path / "sync.lock"),

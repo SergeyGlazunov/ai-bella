@@ -5,6 +5,9 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 import yaml
 
@@ -15,6 +18,15 @@ from contour.reconcile import RuntimePaths, aggregate_database_results, reconcil
 from contour.state import StateStore
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "contour.example.yaml"
+VLAD = ZoneInfo("Asia/Vladivostok")
+
+
+def _in_window() -> datetime:
+    return datetime(2026, 9, 20, 3, 0, tzinfo=VLAD)
+
+
+def _out_of_window() -> datetime:
+    return datetime(2026, 9, 20, 12, 0, tzinfo=VLAD)
 
 
 @dataclass
@@ -67,6 +79,7 @@ def test_v2_preserves_config_order(tmp_path: Path):
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         paths=paths,
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
@@ -87,6 +100,7 @@ def test_disabled_database_is_skipped(tmp_path: Path):
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         paths=paths,
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
@@ -108,6 +122,7 @@ def test_manual_database_filter(tmp_path: Path):
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         paths=paths,
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
@@ -145,6 +160,7 @@ def test_v2_failed_kb_does_not_mask_aggregate(tmp_path: Path):
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         paths=paths,
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
@@ -162,6 +178,7 @@ def test_v2_runtime_paths_prefer_cfg_runtime_when_cli_defaults_absent(tmp_path: 
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
         database_runner=runner,
@@ -188,6 +205,7 @@ def test_v2_external_skip_records_run_without_pipeline_double(tmp_path: Path):
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         paths=paths,
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
@@ -409,6 +427,7 @@ def test_failed_kb_does_not_block_opl(tmp_path: Path):
         cfg,
         timer=False,
         measure=False,
+        now=_in_window(),
         paths=paths,
         lock_backend=MemoryBackend(),
         docker=PingDocker(),
@@ -431,3 +450,169 @@ def test_legacy_reap_ignores_kb_jobs(tmp_path: Path):
     )
     # Legacy reap must stay idle despite a live KB writer in the same SQLite.
     assert reap_jobs(conn, ScriptedDocker(inspect_status="running")) == "idle"
+
+
+# --- Block 5: write window / continue -------------------------------------------
+
+
+def test_window_closes_between_layers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from contour.profiles import LayerResult, run_required_layers
+    from contour.runtime_policy import WriteWindowClosed
+    import contour.profiles as profiles_mod
+
+    cfg = _v2_config(tmp_path)
+    conn = init_db(str(tmp_path / "state.db"))
+    state = StateStore(conn)
+    state.register_database("ubd", "git")
+    run_id = state.start_run("ubd", "r1")
+    calls = {"n": 0}
+    started: list[str] = []
+
+    def may_write() -> str:
+        calls["n"] += 1
+        return "ok" if calls["n"] == 1 else "deferred_window"
+
+    def fake_bsl(*args, **kwargs):
+        del args, kwargs
+        return LayerResult("code_index", "r1", "s", "i")
+
+    def fake_graph(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("graph must not start after window closes")
+
+    monkeypatch.setattr(profiles_mod, "run_bsl_layer", fake_bsl)
+    monkeypatch.setattr(profiles_mod, "run_graph_layer", fake_graph)
+
+    with pytest.raises(WriteWindowClosed):
+        run_required_layers(
+            cfg.databases["ubd"],
+            revision="r1",
+            run_id=run_id,
+            conn=conn,
+            runner=None,
+            may_write=may_write,
+            on_layer_start=started.append,
+            on_layer_result=lambda _item: None,
+            on_layer_error=lambda _layer, _exc: None,
+        )
+    assert started == ["code_index"]
+    assert calls["n"] == 2
+
+
+def test_pipeline_error_continues_next_database(tmp_path: Path):
+    cfg = _v2_config(tmp_path)
+    seen: list[str] = []
+
+    def boom(database, **kwargs):
+        del kwargs
+        seen.append(database.name)
+        if database.name == "kb":
+            raise RuntimeError("kb adapter exploded")
+        return "success"
+
+    paths = RuntimePaths(
+        db_path=str(tmp_path / "state.db"),
+        lock_path=str(tmp_path / "sync.lock"),
+    )
+    result = reconcile(
+        cfg,
+        timer=False,
+        measure=False,
+        now=_in_window(),
+        paths=paths,
+        lock_backend=MemoryBackend(),
+        docker=PingDocker(),
+        database_runner=boom,
+    )
+    assert result == "failed"
+    assert seen == ["ubd", "kb", "klon_opl"]
+    conn = init_db(str(tmp_path / "state.db"))
+    kb = conn.execute(
+        "SELECT result, message FROM runs WHERE database='kb'"
+    ).fetchone()
+    assert kb is not None
+    assert kb["result"] == "failed"
+    assert "exploded" in (kb["message"] or "")
+
+
+def test_full_flag_survives_deferred_window(tmp_path: Path):
+    from contour.index_graph import is_graph_full_needed, set_graph_full_needed
+
+    cfg = _v2_config(tmp_path)
+    paths = RuntimePaths(
+        db_path=str(tmp_path / "state.db"),
+        lock_path=str(tmp_path / "sync.lock"),
+    )
+    conn = init_db(paths.db_path)
+    set_graph_full_needed(conn, "kb", True)
+    conn.close()
+
+    runner = RecordingRunner(default="success")
+    result = reconcile(
+        cfg,
+        timer=False,
+        measure=False,
+        now=_out_of_window(),
+        paths=paths,
+        lock_backend=MemoryBackend(),
+        docker=PingDocker(),
+        database_runner=runner,
+    )
+    assert result == "deferred"
+    assert runner.seen == []
+    conn = init_db(paths.db_path)
+    assert is_graph_full_needed(conn, "kb") is True
+
+
+def test_observation_timeout_does_not_start_duplicate(tmp_path: Path):
+    from contour.runtime_policy import WriterStillAlive
+
+    cfg = _v2_config(tmp_path, disable=frozenset({"ubd", "klon_opl"}))
+    started: list[str] = []
+
+    def runner(database, **kwargs):
+        del kwargs
+        started.append(database.name)
+        raise WriterStillAlive("observation budget exceeded; writer still alive")
+
+    paths = RuntimePaths(
+        db_path=str(tmp_path / "state.db"),
+        lock_path=str(tmp_path / "sync.lock"),
+    )
+    result = reconcile(
+        cfg,
+        timer=False,
+        measure=False,
+        now=_in_window(),
+        paths=paths,
+        lock_backend=MemoryBackend(),
+        docker=PingDocker(),
+        database_runner=runner,
+    )
+    assert result == "deferred"
+    assert started == ["kb"]
+
+
+def test_transient_inspect_retry_is_bounded():
+    from contour.dockerutil import run_readonly_with_retry
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, cmd, *, timeout=None):
+            del cmd, timeout
+            self.calls += 1
+            raise TimeoutError("transient")
+
+    flaky = Flaky()
+    with pytest.raises(TimeoutError):
+        run_readonly_with_retry(
+            flaky,
+            ["docker", "inspect", "x"],
+            timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+            retries=DEFAULT_RUNTIME_POLICY.docker_transient_retries,
+            pause_seconds=0,
+        )
+    assert flaky.calls == DEFAULT_RUNTIME_POLICY.docker_transient_retries

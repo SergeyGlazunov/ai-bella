@@ -135,6 +135,15 @@ def run_required_layers(
 
     results: list[LayerResult] = []
     for layer in profile.required_layers:
+        if may_write is not None:
+            decision = may_write()
+            if decision != "ok":
+                from contour.runtime_policy import WriteWindowClosed
+
+                exc = WriteWindowClosed(str(decision))
+                if on_layer_error is not None:
+                    on_layer_error(layer, exc)
+                raise exc
         if on_layer_start is not None:
             on_layer_start(layer)
         try:

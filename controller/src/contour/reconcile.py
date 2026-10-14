@@ -29,6 +29,7 @@ from contour.reads import (
     wait_server_idle,
 )
 from contour.schedule import duration_warn_seconds, may_write, remaining_write_seconds
+from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, RuntimePolicy, WriterStillAlive
 from contour.state import StateStore
 from contour.verify import (
     Samples,
@@ -1053,7 +1054,7 @@ def _reconcile_v2_locked(
     database: str | None,
     database_runner: DatabaseRunner | None,
 ) -> str:
-    del timer, measure, clock, git, reload_fn, probes  # wired in later Task 8 blocks
+    del git, reload_fn, probes  # filled by the production runner in later wiring
     state = StateStore(conn)
     try:
         selected = select_databases(cfg, database)
@@ -1062,7 +1063,10 @@ def _reconcile_v2_locked(
         return "failed"
 
     try:
-        dockerutil.ping(runner=docker)
+        dockerutil.ping(
+            runner=docker,
+            timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+        )
     except Exception as exc:
         send(cfg, f"docker ping hung or failed: {exc}")
         return "failed"
@@ -1070,8 +1074,25 @@ def _reconcile_v2_locked(
     runner = database_runner or _default_v2_database_runner
     outcomes: list[tuple[str, str]] = []
     all_profiles = list((cfg.databases or {}).values())
+
+    def _fresh_may_write() -> str:
+        return may_write(
+            now=clock(), cfg=cfg, is_timer=timer, measure=measure
+        )
+
     for db in selected:
         state.register_database(db.name, _source_kind(db))
+        window = _fresh_may_write()
+        if window != "ok":
+            message = f"{db.name}: write window closed ({window})"
+            send(cfg, message)
+            try:
+                run_id = state.start_run(db.name, "(pending)")
+                state.finish_run(run_id, "deferred", message)
+            except Exception:
+                pass
+            outcomes.append((db.name, "deferred"))
+            continue
         block = writer_blocks_database(conn, db, all_profiles, docker)
         if block is not None:
             send(cfg, block)
@@ -1090,8 +1111,21 @@ def _reconcile_v2_locked(
                 state=state,
                 docker=docker,
                 send=send,
+                may_write=_fresh_may_write,
+                timer=timer,
+                measure=measure,
+                clock=clock,
             )
             status = _normalize_db_result(str(status))
+        except WriterStillAlive as exc:
+            message = str(exc) or "writer still alive"
+            send(cfg, f"{db.name}: {message}")
+            try:
+                run_id = state.start_run(db.name, "(pending)")
+                state.finish_run(run_id, "deferred", message)
+            except Exception:
+                pass
+            status = "deferred"
         except Exception as exc:
             message = str(exc) or exc.__class__.__name__
             send(cfg, f"{db.name}: {message}")
