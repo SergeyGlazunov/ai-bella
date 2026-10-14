@@ -46,5 +46,5 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 ## Next action
 
 1. Observe tonight’s KB/UBD/OPL LastResult.
-2. Linux-first Tasks 2–4 done (config v2, SQLite StateStore, package validate/claim).
-3. Next: Task 5+ from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md` — no Task Scheduler cutover until Task 11–12.
+2. Linux-first Tasks 2–5 done (config, StateStore, packages, source staging/activation).
+3. Next: Task 6+ from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md` — no Task Scheduler cutover until Task 11–12.

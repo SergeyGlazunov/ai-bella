@@ -99,6 +99,41 @@ def test_ff_only_moves_head_on_clean_fast_forward(tmp_path: Path):
     assert _rev_parse(repo) == sha_remote
 
 
+def test_can_fast_forward_true_when_origin_ahead(tmp_path: Path):
+    remote = _init_bare_remote(tmp_path)
+    repo = _clone_with_initial_commit(tmp_path, remote)
+    writer = tmp_path / "writer-ff"
+    _git(tmp_path, "clone", str(remote), str(writer))
+    _git(writer, "config", "user.email", "test@example.com")
+    _git(writer, "config", "user.name", "Test")
+    (writer / "file.txt").write_text("ahead", encoding="utf-8")
+    _git(writer, "add", "file.txt")
+    _git(writer, "commit", "-m", "ahead")
+    _git(writer, "push", "origin", "HEAD")
+    branch = _current_branch(repo)
+    gitutil.fetch(repo)
+    assert gitutil.can_fast_forward(repo, branch) is True
+
+
+def test_can_fast_forward_false_when_diverged(tmp_path: Path):
+    remote = _init_bare_remote(tmp_path)
+    repo = _clone_with_initial_commit(tmp_path, remote)
+    writer = tmp_path / "writer-div"
+    _git(tmp_path, "clone", str(remote), str(writer))
+    _git(writer, "config", "user.email", "test@example.com")
+    _git(writer, "config", "user.name", "Test")
+    (writer / "file.txt").write_text("remote", encoding="utf-8")
+    _git(writer, "add", "file.txt")
+    _git(writer, "commit", "-m", "remote")
+    _git(writer, "push", "origin", "HEAD")
+    (repo / "file.txt").write_text("local", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-m", "local")
+    branch = _current_branch(repo)
+    gitutil.fetch(repo)
+    assert gitutil.can_fast_forward(repo, branch) is False
+
+
 def test_fetch_prunes_and_updates_remote_tracking(tmp_path: Path):
     remote = _init_bare_remote(tmp_path)
     repo = _clone_with_initial_commit(tmp_path, remote)

@@ -55,3 +55,19 @@ def ff_only(repo: str | Path, branch: str) -> str:
     _run_git(repo, "merge", "--ff-only", f"origin/{branch}")
     result = _run_git(repo, "rev-parse", "HEAD")
     return result.stdout.strip()
+
+
+def rev_parse(repo: str | Path, ref: str = "HEAD") -> str:
+    return _run_git(repo, "rev-parse", ref).stdout.strip()
+
+
+def can_fast_forward(repo: str | Path, branch: str) -> bool:
+    """True when ``HEAD`` is an ancestor of ``origin/<branch>`` (FF-only safe)."""
+    tip = f"origin/{branch}"
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "HEAD", tip],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
