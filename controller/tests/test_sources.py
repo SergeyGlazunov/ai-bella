@@ -14,6 +14,7 @@ from contour.sources import (
     PreparedSource,
     SourceError,
     activate_source,
+    compute_staged_tree_digest,
     rollback_source,
 )
 
@@ -166,6 +167,8 @@ def test_activate_uses_replace_and_preserves_previous_on_failure(
         previous_path=None,
         sources_root=sources_root,
         published_path=published,
+        kind="package",
+        content_digest=compute_staged_tree_digest(staged),
     )
 
     real_replace = Path.replace
@@ -204,6 +207,8 @@ def test_activate_same_revision_is_idempotent(tmp_path: Path):
         previous_path=None,
         sources_root=sources_root,
         published_path=published,
+        kind="package",
+        content_digest=compute_staged_tree_digest(staged),
     )
     prev = activate_source(prepared, published)
     assert prev is None

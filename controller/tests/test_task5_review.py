@@ -13,6 +13,7 @@ from contour.sources import (
     PreparedSource,
     SourceError,
     activate_source,
+    compute_staged_tree_digest,
     rollback_source,
     safe_revision_token,
 )
@@ -58,6 +59,19 @@ def git_provider(tmp_path):
         sources_root=root,
     )
     return root, staging, published, remote, provider
+
+
+def sealed(database, revision, staged, previous, root, published):
+    return PreparedSource(
+        database,
+        revision,
+        staged,
+        previous,
+        sources_root=root,
+        published_path=published,
+        kind="package",
+        content_digest=compute_staged_tree_digest(staged),
+    )
 
 
 def validated_package(tmp_path):
@@ -208,7 +222,7 @@ def test_repeat_prepare_preserves_existing_staging_on_copy_failure(
     def failed_copy(*args, **kwargs):
         raise OSError("injected staging copy failure")
 
-    monkeypatch.setattr("contour.sources.shutil.copytree", failed_copy)
+    monkeypatch.setattr("contour.sources._copy_source_tree", failed_copy)
     with pytest.raises(OSError):
         provider.prepare()
     assert (prepared.staged_path / "Configuration.xml").read_bytes() == old
@@ -219,14 +233,7 @@ def test_activation_retry_keeps_known_previous_path(tmp_path):
     published, previous, staged = root / "kb", root / "kb.prev-r1", staging / "kb" / "r2"
     tree(previous, "r1", "previous")
     tree(staged, "r2", "next")
-    prepared = PreparedSource(
-        "kb",
-        "r2",
-        staged,
-        previous,
-        sources_root=root,
-        published_path=published,
-    )
+    prepared = sealed("kb", "r2", staged, previous, root, published)
     assert activate_source(prepared, published) == previous
 
 
@@ -235,6 +242,7 @@ def test_same_revision_activation_retry_returns_existing_backup(tmp_path):
     published, previous, staged = root / "kb", root / "kb.prev-r1", staging / "kb" / "r2"
     tree(published, "r1", "previous")
     tree(staged, "r2", "next")
+    digest = compute_staged_tree_digest(staged)
     prepared = PreparedSource(
         "kb",
         "r2",
@@ -242,6 +250,8 @@ def test_same_revision_activation_retry_returns_existing_backup(tmp_path):
         None,
         sources_root=root,
         published_path=published,
+        kind="package",
+        content_digest=digest,
     )
     actual_previous = activate_source(prepared, published)
     retry = PreparedSource(
@@ -251,6 +261,8 @@ def test_same_revision_activation_retry_returns_existing_backup(tmp_path):
         actual_previous,
         sources_root=root,
         published_path=published,
+        kind="package",
+        content_digest=digest,
     )
     assert activate_source(retry, published) == actual_previous
 
@@ -264,14 +276,7 @@ def test_second_package_activation_handles_revision_colon(tmp_path):
     staged = staging / "kb" / "next"
     tree(staged, "next-revision", "next")
     previous = activate_source(
-        PreparedSource(
-            "kb",
-            "next-revision",
-            staged,
-            None,
-            sources_root=root,
-            published_path=published,
-        ),
+        sealed("kb", "next-revision", staged, None, root, published),
         published,
     )
     assert previous is not None and previous.is_dir()
@@ -292,14 +297,7 @@ def test_failed_activation_restores_previous_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "replace", fail_stage)
     with pytest.raises(OSError):
         activate_source(
-            PreparedSource(
-                "kb",
-                "r2",
-                staged,
-                None,
-                sources_root=root,
-                published_path=published,
-            ),
+            sealed("kb", "r2", staged, None, root, published),
             published,
         )
     assert (published / "data.txt").read_text(encoding="utf-8") == "previous"
@@ -346,14 +344,7 @@ def test_activation_stage_marker_must_match_prepared_revision(tmp_path):
     tree(staged, "unexpected-revision", "unexpected")
     with pytest.raises(SourceError):
         activate_source(
-            PreparedSource(
-                "kb",
-                "r2",
-                staged,
-                None,
-                sources_root=root,
-                published_path=published,
-            ),
+            sealed("kb", "r2", staged, None, root, published),
             published,
         )
     assert (published / "data.txt").read_text(encoding="utf-8") == "current"
