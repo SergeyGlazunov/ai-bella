@@ -70,10 +70,12 @@ class TrackingProbes:
     code_index: TrackingProbe = field(default_factory=TrackingProbe)
     graph: TrackingProbe | None = field(default_factory=TrackingProbe)
 
-    def run_before_open(self, samples: Samples, required_layers=None) -> None:
+    def run_before_open(self, samples: Samples, required_layers=None) -> list[str]:
         from contour.verify import verify_indexes
 
-        verify_indexes(samples, self, required_layers=required_layers)
+        return list(
+            verify_indexes(samples, self, required_layers=required_layers) or []
+        )
 
 
 @dataclass

@@ -167,13 +167,15 @@ class FakeProbes:
 
     def run_before_open(
         self, samples: Samples, required_layers=None
-    ) -> None:
+    ) -> list[str]:
         self.ran = True
         if self.fail:
             raise RuntimeError("probe failed")
         from contour.verify import verify_indexes
 
-        verify_indexes(samples, self, required_layers=required_layers)
+        return list(
+            verify_indexes(samples, self, required_layers=required_layers) or []
+        )
 
 
 def _prepared(tmp_path: Path, database: str, revision: str) -> PreparedSource:

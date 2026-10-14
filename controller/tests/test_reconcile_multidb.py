@@ -616,3 +616,96 @@ def test_transient_inspect_retry_is_bounded():
             pause_seconds=0,
         )
     assert flaky.calls == DEFAULT_RUNTIME_POLICY.docker_transient_retries
+
+
+# --- Block 6: diagnostics -------------------------------------------------------
+
+
+def test_nightly_aggregate_preserves_failure(tmp_path: Path):
+    cfg = _v2_config(tmp_path)
+    alerts: list[str] = []
+    runner = RecordingRunner(
+        outcomes={"ubd": "success", "kb": "failed", "klon_opl": "success"}
+    )
+    paths = RuntimePaths(
+        db_path=str(tmp_path / "state.db"),
+        lock_path=str(tmp_path / "sync.lock"),
+    )
+    result = reconcile(
+        cfg,
+        timer=False,
+        measure=False,
+        now=_in_window(),
+        paths=paths,
+        lock_backend=MemoryBackend(),
+        docker=PingDocker(),
+        alert_send=lambda _cfg, message: alerts.append(message),
+        database_runner=runner,
+    )
+    assert result == "failed"
+    assert alerts
+    body = alerts[-1]
+    assert "kb" in body
+    assert "failed" in body
+
+
+def test_alert_contains_database_stage_revision_log(tmp_path: Path):
+    from contour.reconcile import format_nightly_alert
+
+    conn = init_db(str(tmp_path / "state.db"))
+    state = StateStore(conn)
+    state.register_database("kb", "package")
+    state.set_lifecycle("kb", "indexing", detail="graph boom")
+    run_id = state.start_run("kb", "rev-kb")
+    state.finish_run(run_id, "failed", "graph boom")
+    conn.execute(
+        """
+        INSERT INTO jobs (
+          database, run_id, stage, status, log_path, started_at, finished_at
+        ) VALUES ('kb', ?, 'graph', 'failed', '/tmp/kb-graph.log', 't', 't')
+        """,
+        (run_id,),
+    )
+    conn.commit()
+    text = format_nightly_alert(conn, [("kb", "failed")])
+    assert "kb" in text
+    assert "graph" in text
+    assert "rev-kb" in text
+    assert "/tmp/kb-graph.log" in text
+
+
+def test_empty_samples_warning_is_visible():
+    from contour.verify import EMPTY_LAYER_SAMPLE_WARNING, Samples, verify_indexes
+
+    class Probe:
+        status = "ready"
+        seen: list[str]
+
+        def __init__(self) -> None:
+            self.seen = []
+
+        def check_bsl(self, path: str) -> None:
+            self.seen.append(path)
+
+        def check_xml(self, path: str) -> None:
+            self.seen.append(path)
+
+        def check_deletion(self, path: str) -> None:
+            self.seen.append(path)
+
+    samples = Samples(
+        bsl_paths=[],
+        xml_paths=["a.xml"],
+        deletions=[],
+        integrity_unknown=False,
+    )
+    code = Probe()
+    graph = Probe()
+    warnings = verify_indexes(
+        samples,
+        type("P", (), {"code_index": code, "graph": graph})(),
+        required_layers=("code_index", "graph"),
+    )
+    assert graph.seen == ["a.xml"]
+    assert code.seen == []
+    assert any(EMPTY_LAYER_SAMPLE_WARNING in item for item in warnings)

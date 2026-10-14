@@ -586,7 +586,9 @@ git commit -m "feat: add verified database pipeline"
 - Consumes: normalized `Config.databases`, `StateStore` and `run_database_pipeline()`.
 - Produces: global scheduling, writer ownership, restart recovery and dashboard-facing aggregate state.
 
-- [ ] **Step 1: Write failing reconciliation tests**
+**Status (kit code, 2026-10-14):** implemented on `main` through Block 6 commits after `f1d5bec`. This is controller kit readiness, **not** live stand cutover (Tasks 11–12). Production default `database_runner` still raises until wired end-to-end against live adapters; inject `database_runner` in tests. Linux/WSL lock path checks were not run on this Windows agent (noted limitation).
+
+- [x] **Step 1: Write failing reconciliation tests**
 
 Cover:
 

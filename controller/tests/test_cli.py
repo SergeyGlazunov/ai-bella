@@ -94,7 +94,9 @@ def test_cli_open_invokes_reopen(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("contour.cli.reopen_reads", fake_reopen)
     cfg = _write_cfg(tmp_path)
-    rc = main(_argv(cfg, tmp_path / "db", tmp_path / "lock", "open"))
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "open", "--database", "ubd")
+    )
     assert rc == 0
     assert seen["called"] is True
 

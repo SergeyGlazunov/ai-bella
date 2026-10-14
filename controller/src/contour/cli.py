@@ -7,7 +7,7 @@ from pathlib import Path
 
 from contour.adapters import CommandEngine, MissingAdapters, build_probes
 from contour.alert import command_is_runnable
-from contour.config import load_config
+from contour.config import enabled_databases, load_config
 from contour.db import get_component, get_meta, init_db
 from contour.dockerutil import SubprocessRunner
 from contour.gitutil import safe_remote
@@ -19,6 +19,8 @@ from contour.reconcile import (
     cleanup_jobs,
     reconcile,
     reopen_reads,
+    resolve_runtime_paths,
+    select_databases,
 )
 
 
@@ -107,6 +109,36 @@ def _print_status(cfg, paths: RuntimePaths) -> None:
                 f"storage_id={row['storage_id']} "
                 f"indexer_version={row['indexer_version']}"
             )
+        if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
+            print("databases:")
+            for db_name in enabled_databases(cfg):
+                row = conn.execute(
+                    """
+                    SELECT lifecycle_status, published_revision, detail, updated_at
+                    FROM database_state WHERE database = ?
+                    """,
+                    (db_name,),
+                ).fetchone()
+                if row is None:
+                    print(f"  {db_name}: (no state)")
+                    continue
+                print(
+                    f"  {db_name}: status={row['lifecycle_status']} "
+                    f"published={row['published_revision'] or '-'} "
+                    f"detail={row['detail'] or '-'}"
+                )
+                layers = conn.execute(
+                    """
+                    SELECT layer, status, applied_revision FROM layer_state
+                    WHERE database = ? ORDER BY layer
+                    """,
+                    (db_name,),
+                ).fetchall()
+                for layer in layers:
+                    print(
+                        f"    {layer['layer']}: {layer['status']} "
+                        f"rev={layer['applied_revision'] or '-'}"
+                    )
     finally:
         conn.close()
 
@@ -174,8 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     # `contour --config X validate` and `contour validate --config X` work.
     global_parser = argparse.ArgumentParser(add_help=False)
     global_parser.add_argument("--config", default="/opt/ai-sync/config.yaml")
-    global_parser.add_argument("--db", default=DEFAULT_DB)
-    global_parser.add_argument("--lock", default=DEFAULT_LOCK)
+    # None defaults so v2 cfg.runtime is not silently overridden by legacy paths.
+    global_parser.add_argument("--db", default=None)
+    global_parser.add_argument("--lock", default=None)
     global_args, rest = global_parser.parse_known_args(raw)
 
     parser = argparse.ArgumentParser(prog="contour")
@@ -189,9 +222,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="optional timing log; does not kill jobs and is not the sole write path",
     )
-    sub.add_parser(
+    update.add_argument(
+        "--database",
+        default=None,
+        help="run a single database profile (schema_version 2)",
+    )
+    open_parser = sub.add_parser(
         "open",
         help="reopen MCP reads only if indexes are consistent and no writer is running",
+    )
+    open_parser.add_argument(
+        "--database",
+        default=None,
+        help="reopen one v2 database; required when multiple profiles are enabled",
     )
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--dry-run", action="store_true")
@@ -213,17 +256,36 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         return 1
 
-    paths = RuntimePaths(db_path=args.db, lock_path=args.lock)
+    paths = resolve_runtime_paths(
+        cfg,
+        db_path=args.db,
+        lock_path=args.lock,
+    )
 
     if args.command == "status":
         _print_status(cfg, paths)
         return 0
 
     if args.command == "update":
+        database = getattr(args, "database", None)
+        if database is not None:
+            try:
+                select_databases(cfg, database)
+            except ValueError as exc:
+                print(str(exc))
+                return 1
         try:
-            if cfg.adapters is None:
-                raise MissingAdapters("adapters section is required")
-            docker = CommandEngine(cfg.adapters.idle_probe)
+            if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
+                # Per-database idle probe: prefer first enabled (or filtered) profile.
+                profiles = select_databases(cfg, database)
+                idle = profiles[0].adapters.idle_probe if profiles else None
+                if not idle:
+                    raise MissingAdapters("database adapters.idle_probe is required")
+                docker = CommandEngine(idle)
+            else:
+                if cfg.adapters is None:
+                    raise MissingAdapters("adapters section is required")
+                docker = CommandEngine(cfg.adapters.idle_probe)
         except MissingAdapters:
             return 1
 
@@ -237,10 +299,26 @@ def main(argv: list[str] | None = None) -> int:
             paths=paths,
             docker=docker,
             watch_reload=_reload,
+            database=database,
         )
         return 0 if result in {"success", "deferred"} else 1
 
     if args.command == "open":
+        database = getattr(args, "database", None)
+        if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
+            enabled = enabled_databases(cfg)
+            if database is None and len(enabled) != 1:
+                print(
+                    "open requires --database when multiple databases are enabled"
+                )
+                return 1
+            if database is not None:
+                try:
+                    select_databases(cfg, database)
+                except ValueError as exc:
+                    print(str(exc))
+                    return 1
+
         def _reload_open() -> None:
             _bsl_watch_reload(cfg)
 
@@ -248,10 +326,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result == "success" else 1
 
     if args.command == "cleanup":
-        held = acquire(args.lock)
+        held = acquire(paths.lock_path)
         if held is None:
             return 1
-        conn = init_db(args.db)
+        conn = init_db(paths.db_path)
         try:
             with held:
                 ids = cleanup_jobs(conn, _docker(), dry_run=bool(args.dry_run))

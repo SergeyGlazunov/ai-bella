@@ -257,12 +257,18 @@ def _verify_empty_layer_status(
             raise RuntimeError(f"graph probe not ready ({graph.status})")
 
 
+EMPTY_LAYER_SAMPLE_WARNING = (
+    "Проверка содержимого слоя не выполнена: нет подходящих файлов"
+)
+
+
 def verify_indexes(
     samples: Samples,
     probes: IndexProbes,
     *,
     required_layers: Sequence[str] | None = None,
-) -> None:
+) -> list[str]:
+    """Verify probes. Return human-readable warnings (never silent content skip)."""
     layers = (
         frozenset(required_layers)
         if required_layers is not None
@@ -271,6 +277,7 @@ def verify_indexes(
     need_code = "code_index" in layers
     need_graph = "graph" in layers
     graph = getattr(probes, "graph", None)
+    warnings: list[str] = []
 
     if samples.is_empty():
         if samples.integrity_unknown:
@@ -278,7 +285,9 @@ def verify_indexes(
                 "empty diff with unknown integrity is not success"
             )
         _verify_empty_layer_status(probes, need_code=need_code, need_graph=need_graph)
-        return
+        if need_code or need_graph:
+            warnings.append(EMPTY_LAYER_SAMPLE_WARNING)
+        return warnings
 
     code_checked = False
     graph_checked = False
@@ -317,14 +326,16 @@ def verify_indexes(
                 graph.check_deletion(path)
                 graph_checked = True
 
-    # Missing suitable samples for a required layer is not silent success:
-    # use the explicit empty-index status contract instead.
+    # Missing suitable samples for a required layer is not silent success.
     if need_code and not code_checked:
         if probes.code_index.status != "ready":
             raise RuntimeError(
                 f"code_index probe not ready ({probes.code_index.status}); "
                 "no BSL samples were available to check"
             )
+        if samples.integrity_unknown:
+            raise RuntimeError(f"code_index: {EMPTY_LAYER_SAMPLE_WARNING}")
+        warnings.append(f"code_index: {EMPTY_LAYER_SAMPLE_WARNING}")
     if need_graph and not graph_checked:
         if graph is None:
             raise RuntimeError("graph probe required for this database")
@@ -333,3 +344,7 @@ def verify_indexes(
                 f"graph probe not ready ({graph.status}); "
                 "no Graph samples were available to check"
             )
+        if samples.integrity_unknown:
+            raise RuntimeError(f"graph: {EMPTY_LAYER_SAMPLE_WARNING}")
+        warnings.append(f"graph: {EMPTY_LAYER_SAMPLE_WARNING}")
+    return warnings

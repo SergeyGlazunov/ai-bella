@@ -22,6 +22,8 @@ from contour.verify import (
     verify_run_layer_results,
 )
 
+_EMPTY_SAMPLE_MARK = "нет подходящих файлов"
+
 
 @dataclass(frozen=True)
 class PipelineResult:
@@ -184,14 +186,23 @@ def run_database_pipeline(
         probe_samples = _resolve_samples(
             samples, prepared, database, profile.required_layers
         )
-        _run_probes(probes, probe_samples, profile.required_layers)
+        probe_warnings = _run_probes(probes, probe_samples, profile.required_layers)
         note("verified")
 
         reads.open()
         log.append("published")
         state.mark_published(name, revision)
-        state.finish_run(run_id, "published", "ok")
-        return PipelineResult(name, revision, "published", "ok", run_id=run_id)
+        message = "ok"
+        if probe_warnings:
+            message = "; ".join(probe_warnings)
+            # Content was not actually probed — do not label the run as ok.
+            if any(_EMPTY_SAMPLE_MARK in item for item in probe_warnings):
+                state.finish_run(run_id, "published", message)
+                return PipelineResult(
+                    name, revision, "published", message, run_id=run_id
+                )
+        state.finish_run(run_id, "published", message)
+        return PipelineResult(name, revision, "published", message, run_id=run_id)
     except WriteWindowClosed as exc:
         message = str(exc) or "deferred_window"
         if entry_read_error:
@@ -275,13 +286,15 @@ def _resolve_samples(
 
 def _run_probes(
     probes: object, samples: Samples, required_layers: Sequence[str]
-) -> None:
+) -> list[str]:
     runner = getattr(probes, "run_before_open", None)
     if callable(runner):
         try:
-            runner(samples, required_layers=required_layers)
-            return
+            result = runner(samples, required_layers=required_layers)
         except TypeError:
-            runner(samples)
-            return
-    verify_indexes(samples, probes, required_layers=required_layers)  # type: ignore[arg-type]
+            result = runner(samples)
+        if isinstance(result, list):
+            return [str(item) for item in result]
+        return []
+    warnings = verify_indexes(samples, probes, required_layers=required_layers)  # type: ignore[arg-type]
+    return list(warnings or [])

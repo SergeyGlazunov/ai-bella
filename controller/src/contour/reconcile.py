@@ -86,6 +86,54 @@ def aggregate_database_results(results: Sequence[tuple[str, str]]) -> str:
     return "success"
 
 
+def format_nightly_alert(
+    conn: sqlite3.Connection, outcomes: Sequence[tuple[str, str]]
+) -> str:
+    """One actionable alert body: database, stage, revision, reason, log_path."""
+    lines: list[str] = ["contour nightly aggregate:"]
+    for name, status in outcomes:
+        if status == "success":
+            continue
+        row = conn.execute(
+            """
+            SELECT lifecycle_status, published_revision, detail
+            FROM database_state WHERE database = ?
+            """,
+            (name,),
+        ).fetchone()
+        run = conn.execute(
+            """
+            SELECT target_revision, result, message FROM runs
+            WHERE database = ? ORDER BY id DESC LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        job = conn.execute(
+            """
+            SELECT stage, log_path FROM jobs
+            WHERE database = ? ORDER BY id DESC LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        stage = (job["stage"] if job is not None else None) or (
+            row["lifecycle_status"] if row is not None else "?"
+        )
+        revision = (run["target_revision"] if run is not None else None) or (
+            row["published_revision"] if row is not None else None
+        ) or "?"
+        reason = (run["message"] if run is not None else None) or (
+            row["detail"] if row is not None else None
+        ) or status
+        log_path = (job["log_path"] if job is not None else None) or "(log unavailable)"
+        lines.append(
+            f"- {name}: stage={stage} revision={revision} "
+            f"result={status} reason={reason} log={log_path}"
+        )
+    if len(lines) == 1:
+        lines.append("- (no failed/deferred databases)")
+    return "\n".join(lines)
+
+
 def select_databases(
     cfg, database: str | None = None
 ) -> list[DatabaseConfig]:
@@ -1138,7 +1186,17 @@ def _reconcile_v2_locked(
             status = "failed"
         outcomes.append((db.name, status))
 
-    return aggregate_database_results(outcomes)
+    aggregate = aggregate_database_results(outcomes)
+    if aggregate != "success":
+        try:
+            send(cfg, format_nightly_alert(conn, outcomes))
+        except Exception as alert_exc:
+            # Alert failure must not rewrite already persisted run results.
+            try:
+                send(cfg, f"alert send failed after aggregate={aggregate}: {alert_exc}")
+            except Exception:
+                pass
+    return aggregate
 
 
 def _maybe_duration_warn(cfg, conn: sqlite3.Connection, started: float, send) -> None:
