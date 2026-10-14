@@ -14,7 +14,7 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import url2pathname
 
 from contour import gitutil
-from contour.config import GitSourceConfig
+from contour.config import DatabaseConfig, GitSourceConfig, PackageSourceConfig
 from contour.packages import ValidatedPackage, validate_package
 
 REVISION_MARKER = ".contour-revision"
@@ -788,3 +788,128 @@ class PackageSourceProvider:
             kind="package",
             content_digest=digest,
         )
+
+
+def contour_sources_root(cfg) -> Path:
+    runtime = getattr(cfg, "runtime", None)
+    if runtime is None or not runtime.root:
+        raise SourceError("cfg.runtime.root is required for source layout")
+    return Path(runtime.root) / "sources"
+
+
+def staging_root_for(cfg) -> Path:
+    return contour_sources_root(cfg) / ".staging"
+
+
+def published_path_for(database: DatabaseConfig) -> Path:
+    source = database.source
+    if isinstance(source, GitSourceConfig):
+        return Path(source.path)
+    if isinstance(source, PackageSourceConfig):
+        return Path(source.source_path)
+    raise SourceError(f"unsupported source type for {database.name}")
+
+
+class PublishedRecoveryProvider:
+    """Stage a local copy of the already-published tree (no remote/inbox)."""
+
+    def __init__(
+        self,
+        database: str,
+        *,
+        published_path: Path,
+        staging_root: Path,
+        sources_root: Path,
+        revision: str | None = None,
+    ) -> None:
+        self._database = database
+        self._published_path = Path(published_path)
+        self._staging_root = Path(staging_root)
+        self._sources_root = Path(sources_root)
+        self._revision = revision
+
+    def prepare(self) -> PreparedSource:
+        sources_root = _resolve(self._sources_root)
+        staging_root = ensure_under_sources_root(self._staging_root, sources_root)
+        published = ensure_under_sources_root(self._published_path, sources_root)
+        _assert_disjoint(staging_root, published)
+        if not published.is_dir():
+            raise SourceError("published source missing for recovery")
+        revision = self._revision or read_revision(published)
+        if not revision:
+            raise SourceError("published source has no revision marker")
+        token = safe_revision_token(revision)
+        db_dir = _ensure_staging_database_dir(
+            staging_root, self._database, sources_root
+        )
+        final = ensure_path_chain_under_sources_root(db_dir / token, sources_root)
+        if final.exists() and _paths_overlap(final, published):
+            raise SourceError("staging target overlaps published source")
+        temp = ensure_path_chain_under_sources_root(
+            db_dir / f".tmp-{uuid.uuid4().hex}", sources_root
+        )
+        if temp.exists():
+            shutil.rmtree(temp)
+        try:
+            _copy_source_tree(published, temp)
+            write_revision(temp, revision)
+            digest = compute_staged_tree_digest(temp)
+            _promote_dir(temp, final)
+            final = ensure_under_sources_root(final, sources_root)
+        except Exception:
+            if temp.exists():
+                shutil.rmtree(temp, ignore_errors=True)
+            raise
+        return PreparedSource(
+            database=self._database,
+            revision=revision,
+            staged_path=final,
+            previous_path=None,
+            sources_root=sources_root,
+            published_path=published,
+            kind="package",
+            content_digest=digest,
+        )
+
+
+def build_source_provider(
+    database: DatabaseConfig,
+    cfg,
+    *,
+    package: ValidatedPackage | None = None,
+    recovery: bool = False,
+    revision: str | None = None,
+) -> SourceProvider:
+    """Factory for the SourceProvider used by one database attempt."""
+    sources_root = contour_sources_root(cfg)
+    sources_root.mkdir(parents=True, exist_ok=True)
+    staging = staging_root_for(cfg)
+    staging.mkdir(parents=True, exist_ok=True)
+    published = published_path_for(database)
+    if recovery:
+        return PublishedRecoveryProvider(
+            database.name,
+            published_path=published,
+            staging_root=staging,
+            sources_root=sources_root,
+            revision=revision,
+        )
+    source = database.source
+    if isinstance(source, GitSourceConfig):
+        return GitSourceProvider(
+            source,
+            staging_root=staging,
+            published_path=published,
+            sources_root=sources_root,
+            database=database.name,
+        )
+    if isinstance(source, PackageSourceConfig):
+        if package is None:
+            raise SourceError(f"no package selected for {database.name}")
+        return PackageSourceProvider(
+            package,
+            staging_root=staging,
+            published_path=published,
+            sources_root=sources_root,
+        )
+    raise SourceError(f"unsupported source type for {database.name}")

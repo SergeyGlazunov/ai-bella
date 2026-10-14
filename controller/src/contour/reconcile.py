@@ -274,6 +274,37 @@ def databases_share_storage(left: DatabaseConfig, right: DatabaseConfig) -> bool
     return bool(storage_volumes_for(left) & storage_volumes_for(right))
 
 
+def storage_identity_changed(
+    conn: sqlite3.Connection,
+    database: str,
+    layer: str,
+    *,
+    current_storage_id: str | None,
+    current_indexer_version: str | None,
+) -> bool:
+    """True when recorded layer identity no longer matches live storage/image."""
+    row = conn.execute(
+        """
+        SELECT storage_id, indexer_version, status, applied_revision
+        FROM layer_state
+        WHERE database = ? AND layer = ?
+        """,
+        (database, layer),
+    ).fetchone()
+    if row is None:
+        return True
+    if str(row["status"] or "") != "ready":
+        return True
+    if current_storage_id is not None and str(row["storage_id"] or "") != current_storage_id:
+        return True
+    if (
+        current_indexer_version is not None
+        and str(row["indexer_version"] or "") != current_indexer_version
+    ):
+        return True
+    return False
+
+
 def writer_blocks_database(
     conn: sqlite3.Connection,
     database: DatabaseConfig,

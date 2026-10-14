@@ -307,6 +307,62 @@ def _parse_manifest(
     )
 
 
+def iter_ready_package_dirs(inbox: Path) -> list[Path]:
+    """Return inbox children that look like completed ``ready-*`` exports."""
+    root = Path(inbox)
+    if not root.is_dir():
+        return []
+    found: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if not child.name.startswith("ready-"):
+            continue
+        ready = child / "READY"
+        if ready.is_file() and not _is_reparse_point(ready):
+            found.append(child)
+    return found
+
+
+def choose_newest_valid_package(
+    inbox: Path,
+    database: str,
+    *,
+    required_operations: Mapping[str, frozenset[str]] | None = None,
+) -> tuple[ValidatedPackage | None, list[str]]:
+    """Pick the newest valid READY package for ``database``.
+
+    Sort key: ``finished_at`` descending, then ``export_id`` descending as a
+    stable tie-break. Corrupt candidates are reported and skipped; they must
+    not block other databases.
+    """
+    warnings: list[str] = []
+    candidates: list[ValidatedPackage] = []
+    for path in iter_ready_package_dirs(inbox):
+        try:
+            package = validate_package(
+                path,
+                frozenset({database}),
+                required_operations=required_operations,
+            )
+        except PackageError as exc:
+            warnings.append(f"{path.name}: {exc}")
+            continue
+        if package.manifest.database != database:
+            warnings.append(
+                f"{path.name}: unexpected database {package.manifest.database}"
+            )
+            continue
+        candidates.append(package)
+    if not candidates:
+        return None, warnings
+    candidates.sort(
+        key=lambda item: (item.manifest.finished_at, item.manifest.export_id),
+        reverse=True,
+    )
+    return candidates[0], warnings
+
+
 def validate_package(
     path: Path,
     allowed_databases: frozenset[str],
