@@ -7,22 +7,24 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 SUPPORTED_MANIFEST_SCHEMA = 1
 _EXCLUDED_FROM_CHECKSUM = frozenset({"READY", "manifest.json"})
 _SUCCESS_OPERATION = "ok"
-# Manifest schema v1 operation contract (Windows exporter Task 9 must match):
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+# Default operation policy by well-known profile (Windows exporter Task 9):
 # - kb: DumpConfigToFiles + UpdateCfg + UpdateDBCfg must all be "ok"
 # - klon_opl: DumpConfigToFiles must be "ok" (no configuration store update)
-_REQUIRED_OPS_BY_DATABASE = {
+# Other allowed package profiles default to DumpConfigToFiles-only unless an
+# explicit required_operations policy is passed to validate_package.
+_DEFAULT_REQUIRED_OPS = {
     "kb": frozenset({"DumpConfigToFiles", "UpdateCfg", "UpdateDBCfg"}),
     "klon_opl": frozenset({"DumpConfigToFiles"}),
 }
-_TIMESTAMP_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
-)
+_DEFAULT_PACKAGE_OPS = frozenset({"DumpConfigToFiles"})
 _CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
 _EXPORT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -72,9 +74,30 @@ def _is_symlink(path: Path) -> bool:
         return False
 
 
-def _assert_real_directory(path: Path, *, label: str) -> None:
+def _is_reparse_point(path: Path) -> bool:
+    """True for symlinks, NTFS junctions and other reparse points (Py3.11+)."""
     if _is_symlink(path):
-        raise PackageError(f"{label} must be a real directory, not a symlink")
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            if is_junction():
+                return True
+        except OSError:
+            pass
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    attrs = int(getattr(st, "st_file_attributes", 0) or 0)
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _assert_real_directory(path: Path, *, label: str) -> None:
+    if _is_reparse_point(path):
+        raise PackageError(
+            f"{label} must be a real directory, not a symlink/junction"
+        )
     if not path.is_dir():
         raise PackageError(f"{label} is not a directory: {path}")
 
@@ -84,7 +107,7 @@ def _assert_safe_entry(root: Path, path: Path) -> None:
         mode = path.lstat().st_mode
     except OSError as exc:
         raise PackageError(f"unsafe path: {path}") from exc
-    if stat.S_ISLNK(mode) or _is_symlink(path):
+    if _is_reparse_point(path) or stat.S_ISLNK(mode):
         raise PackageError(
             f"symlink not allowed: {path.relative_to(root).as_posix()}"
         )
@@ -114,14 +137,17 @@ def _reject_unsafe_paths(package_root: Path) -> None:
 def count_source_files(package_root: Path) -> int:
     """Count regular files under ``src/`` (READY/manifest are outside src)."""
     src = package_root / "src"
-    if _is_symlink(src) or not src.is_dir():
-        raise PackageError("missing src directory")
+    _assert_real_directory(src, label="src")
     count = 0
     for path in src.rglob("*"):
         mode = path.lstat().st_mode
-        if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+        if _is_reparse_point(path) or stat.S_ISLNK(mode):
+            raise PackageError(
+                f"symlink not allowed: {path.relative_to(package_root).as_posix()}"
+            )
+        if stat.S_ISDIR(mode):
             continue
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+        if not stat.S_ISREG(mode):
             raise PackageError(
                 f"unsupported file type: {path.relative_to(package_root).as_posix()}"
             )
@@ -165,7 +191,57 @@ def artifact_identity(package: ValidatedPackage) -> str:
     return f"{m.database}:{m.export_id}:{m.checksum}"
 
 
-def _parse_operations(raw: Any, database: str) -> dict[str, str]:
+def required_operations_for(
+    database: str,
+    required_operations: Mapping[str, frozenset[str]] | None = None,
+) -> frozenset[str]:
+    """Resolve required 1C operation names for a package profile."""
+    if required_operations is not None:
+        if database not in required_operations:
+            raise PackageError(
+                f"no required_operations policy for database: {database}"
+            )
+        return frozenset(required_operations[database])
+    if database in _DEFAULT_REQUIRED_OPS:
+        return _DEFAULT_REQUIRED_OPS[database]
+    return _DEFAULT_PACKAGE_OPS
+
+
+def _parse_timestamp(value: str, field: str) -> datetime:
+    """Parse timezone-aware ISO-8601; reject impossible calendar values."""
+    normalized = value.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise PackageError(f"{field} is not a valid timestamp") from exc
+    if dt.tzinfo is None:
+        raise PackageError(f"{field} must include a timezone offset")
+    # Round-trip through the calendar components to catch pathological inputs
+    # that some parsers accept loosely.
+    try:
+        rebuilt = datetime(
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second,
+            dt.microsecond,
+            tzinfo=dt.tzinfo,
+        )
+    except ValueError as exc:
+        raise PackageError(f"{field} is not a valid timestamp") from exc
+    if rebuilt != dt:
+        raise PackageError(f"{field} is not a valid timestamp")
+    return dt
+
+
+def _parse_operations(
+    raw: Any,
+    database: str,
+    *,
+    required: frozenset[str],
+) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise PackageError("operations must be a mapping")
     ops: dict[str, str] = {}
@@ -175,9 +251,6 @@ def _parse_operations(raw: Any, database: str) -> dict[str, str]:
         if not isinstance(value, str):
             raise PackageError(f"operations.{key} must be a string")
         ops[key] = value
-    required = _REQUIRED_OPS_BY_DATABASE.get(database)
-    if required is None:
-        raise PackageError(f"unexpected database: {database}")
     for name in sorted(required):
         if name not in ops:
             raise PackageError(f"operations missing required {name}")
@@ -188,7 +261,11 @@ def _parse_operations(raw: Any, database: str) -> dict[str, str]:
     return ops
 
 
-def _parse_manifest(raw: dict[str, Any]) -> PackageManifest:
+def _parse_manifest(
+    raw: dict[str, Any],
+    *,
+    required_operations: Mapping[str, frozenset[str]] | None = None,
+) -> PackageManifest:
     schema_version = _require_int(raw.get("schema_version"), "schema_version")
     database = _require_str(raw.get("database"), "database")
     export_id = _require_str(raw.get("export_id"), "export_id")
@@ -204,16 +281,19 @@ def _parse_manifest(raw: dict[str, Any]) -> PackageManifest:
         raise PackageError("invalid export_id")
     if ".." in database or "/" in database or "\\" in database:
         raise PackageError(f"invalid database name: {database}")
-    if not _TIMESTAMP_RE.fullmatch(started_at):
-        raise PackageError("started_at must be an ISO-8601 timestamp")
-    if not _TIMESTAMP_RE.fullmatch(finished_at):
-        raise PackageError("finished_at must be an ISO-8601 timestamp")
+    started_dt = _parse_timestamp(started_at, "started_at")
+    finished_dt = _parse_timestamp(finished_at, "finished_at")
+    if finished_dt < started_dt:
+        raise PackageError("finished_at must be >= started_at")
     if not _CHECKSUM_RE.fullmatch(checksum):
         raise PackageError("checksum must be a lowercase sha256 hex digest")
     if file_count < 0:
         raise PackageError("file_count must be non-negative")
 
-    operations = _parse_operations(raw.get("operations"), database)
+    required = required_operations_for(database, required_operations)
+    operations = _parse_operations(
+        raw.get("operations"), database, required=required
+    )
     return PackageManifest(
         schema_version=schema_version,
         database=database,
@@ -228,19 +308,22 @@ def _parse_manifest(raw: dict[str, Any]) -> PackageManifest:
 
 
 def validate_package(
-    path: Path, allowed_databases: frozenset[str]
+    path: Path,
+    allowed_databases: frozenset[str],
+    *,
+    required_operations: Mapping[str, frozenset[str]] | None = None,
 ) -> ValidatedPackage:
     root = Path(path)
     _assert_real_directory(root, label="package root")
 
     ready = root / "READY"
-    if not ready.is_file() or _is_symlink(ready):
+    if not ready.is_file() or _is_reparse_point(ready):
         raise PackageError("missing READY")
     manifest_path = root / "manifest.json"
-    if not manifest_path.is_file() or _is_symlink(manifest_path):
+    if not manifest_path.is_file() or _is_reparse_point(manifest_path):
         raise PackageError("missing manifest.json")
     config_xml = root / "src" / "Configuration.xml"
-    if not config_xml.is_file() or _is_symlink(config_xml):
+    if not config_xml.is_file() or _is_reparse_point(config_xml):
         raise PackageError("missing src/Configuration.xml")
 
     _reject_unsafe_paths(root)
@@ -252,7 +335,7 @@ def validate_package(
     if not isinstance(raw, dict):
         raise PackageError("manifest.json must be a JSON object")
 
-    manifest = _parse_manifest(raw)
+    manifest = _parse_manifest(raw, required_operations=required_operations)
     if manifest.database not in allowed_databases:
         raise PackageError(f"unexpected database: {manifest.database}")
 
@@ -302,7 +385,7 @@ def claim_package(package: ValidatedPackage, accepted_root: Path) -> Path:
     accepted_root.mkdir(parents=True, exist_ok=True)
     dest = accepted_root / f"ready-{package.manifest.export_id}"
 
-    if _is_symlink(dest):
+    if _is_reparse_point(dest):
         raise PackageError(
             f"claim collision for export_id={package.manifest.export_id!r}"
         )
