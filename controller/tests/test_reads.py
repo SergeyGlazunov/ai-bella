@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from contour.config import Config, load_config
-from contour.db import get_meta, init_db
+from contour.db import get_meta, init_db, set_meta
 from contour.reads import apply_close, open_reads, request_close, verify_closed, wait_server_idle
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "contour.example.yaml"
@@ -350,3 +350,163 @@ def test_open_reads_starts_graph_reconnects_unblocks(tmp_path: Path):
     ]
     assert iptables_delete
     assert verify_closed(cfg, docker) is False
+
+
+# --- Task 8 Block 3: DatabaseReadController --------------------------------------
+
+
+@dataclass
+class FlexibleReadsDocker:
+    graph_status: str = "running"
+    connected_networks: set[str] = field(default_factory=lambda: {"ai-stack_default"})
+    calls: list[list[str]] = field(default_factory=list)
+    fail_on_network_disconnect: bool = False
+
+    def idle_probe(self) -> bool:
+        return True
+
+    def run(self, cmd: list[str], *, timeout: float | None = None):
+        del timeout
+        self.calls.append(list(cmd))
+        if cmd[:2] == ["docker", "stop"]:
+            self.graph_status = "exited"
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "start"]:
+            self.graph_status = "running"
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:3] == ["docker", "network", "disconnect"]:
+            if self.fail_on_network_disconnect:
+                self.connected_networks.discard(cmd[3])
+                raise RuntimeError("bsl network disconnect failed")
+            self.connected_networks.discard(cmd[3])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:3] == ["docker", "network", "connect"]:
+            self.connected_networks.add(cmd[3])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            fmt = cmd[cmd.index("-f") + 1] if "-f" in cmd else ""
+            if "Network" in fmt:
+                nets = "\n".join(sorted(self.connected_networks))
+                return subprocess.CompletedProcess(cmd, 0, stdout=nets + "\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=self.graph_status + "\n", stderr=""
+            )
+        if cmd and cmd[0] == "iptables":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+
+def test_opl_read_controller_never_touches_graph(tmp_path: Path):
+    from contour.reads import DatabaseReadController, scoped_read_key
+
+    cfg = _make_config(tmp_path)
+    opl = cfg.databases["klon_opl"]
+    toml = tmp_path / "opl-daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    opl = replace(
+        opl,
+        services=replace(opl.services, bsl_daemon_toml=str(toml)),
+    )
+    conn = _init_conn(tmp_path)
+    docker = FlexibleReadsDocker()
+    ctrl = DatabaseReadController(opl, conn, docker)
+    ctrl.close()
+    assert ctrl.is_closed() is True
+    assert not any(c[:2] == ["docker", "stop"] for c in docker.calls)
+    assert get_meta(
+        conn, scoped_read_key("reads_closed", "klon_opl", "code_index")
+    ) == "1"
+    assert get_meta(conn, "reads_closed") in (None, "")
+
+
+def test_partial_close_restores_previous_availability(tmp_path: Path):
+    from contour.reads import DatabaseReadController
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    conn = _init_conn(tmp_path)
+    docker = FlexibleReadsDocker(fail_on_network_disconnect=True)
+    ctrl = DatabaseReadController(ubd, conn, docker)
+    with pytest.raises(RuntimeError, match="network disconnect"):
+        ctrl.close()
+    # Graph may already be stopped; restore what this attempt closed when safe.
+    ctrl.reopen_if_safe_after_pre_activation_failure()
+    assert docker.graph_status == "running"
+    assert ubd.services.webui_network in docker.connected_networks
+
+
+def test_prior_recovery_close_is_preserved(tmp_path: Path):
+    from contour.reads import DatabaseReadController, scoped_read_key
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    conn = _init_conn(tmp_path)
+    for layer in ("code_index", "graph"):
+        set_meta(conn, scoped_read_key("reads_closed", "ubd", layer), "1")
+    docker = FlexibleReadsDocker(graph_status="exited", connected_networks=set())
+    ctrl = DatabaseReadController(ubd, conn, docker)
+    assert ctrl.is_closed() is True
+    # Simulate prepare failure path: no close attempted this run.
+    ctrl.reopen_if_safe_after_pre_activation_failure()
+    assert ctrl.is_closed() is True
+    assert docker.graph_status == "exited"
+
+
+def test_graph_failure_keeps_verified_bsl_available(tmp_path: Path):
+    from contour.reads import DatabaseReadController, scoped_read_key
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    conn = _init_conn(tmp_path)
+    docker = FlexibleReadsDocker()
+    ctrl = DatabaseReadController(ubd, conn, docker)
+    ctrl.close()
+    # Graph failed verification — leave graph closed, reopen verified BSL.
+    ctrl.open_layer("code_index")
+    assert ctrl.is_closed("code_index") is False
+    assert ctrl.is_closed("graph") is True
+    assert get_meta(conn, scoped_read_key("reads_closed", "ubd", "graph")) == "1"
+    assert ubd.services.webui_network in docker.connected_networks
+
+
+def test_watcher_stays_paused_during_active_job(tmp_path: Path):
+    from contour.reads import DatabaseReadController
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    conn = _init_conn(tmp_path)
+    docker = FlexibleReadsDocker()
+    reloads: list[str] = []
+    ctrl = DatabaseReadController(
+        ubd,
+        conn,
+        docker,
+        watch_reload=lambda: reloads.append("reload"),
+        active_writer=True,
+    )
+    ctrl.close_layer("code_index")
+    with pytest.raises(RuntimeError, match="active writer"):
+        ctrl.open_layer("code_index")
+    assert "path = \"/repos/SRC\"" not in toml.read_text(encoding="utf-8")

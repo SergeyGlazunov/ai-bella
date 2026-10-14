@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import shutil
+import sqlite3
 import subprocess
 import time
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from contour.db import set_meta
+from contour.config import DatabaseConfig
+from contour.db import get_meta, set_meta
+from contour.watch_bsl import pause_watch, restore_watch, watch_is_paused
 
 # Host DROP on bsl_publish_port is optional (ADM-SAPHX-TECH: no host/LAN MCP
 # clients; updates off-hours). Required close = graph stop + WebUI network cut.
 _FW_ERRORS = (subprocess.CalledProcessError, FileNotFoundError, OSError)
+
+_LAYER_ORDER = ("code_index", "graph")
 
 
 @runtime_checkable
@@ -18,6 +26,11 @@ class ReadsDocker(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
     def idle_probe(self) -> bool: ...
+
+
+def scoped_read_key(flag: str, database: str, layer: str) -> str:
+    """Per-database / per-layer read-state meta key (v2)."""
+    return f"{flag}:{database}:{layer}"
 
 
 def request_close(db) -> None:
@@ -133,21 +146,283 @@ def wait_server_idle(
     *,
     attempts: int = 30,
     interval: float = 1.0,
+    required_layers: Sequence[str] | None = None,
 ) -> None:
     """Poll graph inspect + IdleProbe until idle, or raise. Not sleep-N-as-drain."""
     if attempts < 1:
         attempts = 1
+    layers = (
+        frozenset(required_layers)
+        if required_layers is not None
+        else frozenset({"code_index", "graph"})
+    )
+    need_graph = "graph" in layers
+    need_code = "code_index" in layers
     last_status = ""
     last_idle = False
     for i in range(attempts):
-        last_status = _inspect_status(cfg, docker)
-        last_idle = bool(docker.idle_probe())
-        if last_status != "running" and last_idle:
+        last_status = _inspect_status(cfg, docker) if need_graph else "exited"
+        last_idle = bool(docker.idle_probe()) if need_code else True
+        graph_idle = (not need_graph) or last_status != "running"
+        code_idle = (not need_code) or last_idle
+        if graph_idle and code_idle:
             return
         if i + 1 < attempts and interval > 0:
             time.sleep(interval)
-    if last_status == "running":
+    if need_graph and last_status == "running":
         raise RuntimeError(f"graph mcp still running ({cfg.services.graph_mcp})")
-    if not last_idle:
+    if need_code and not last_idle:
         raise RuntimeError("bsl idle probe busy")
     raise RuntimeError("wait_server_idle exceeded attempts")
+
+
+class DatabaseReadController:
+    """Per-database ReadController for ``run_database_pipeline``.
+
+    Layer-scoped meta keys: ``reads_close_requested:<db>:<layer>`` and
+    ``reads_closed:<db>:<layer>``. Legacy global flags are not written for
+    non-UBD profiles. OPL (no graph in required_layers) never stops Graph MCP.
+    """
+
+    def __init__(
+        self,
+        database: DatabaseConfig,
+        conn: sqlite3.Connection,
+        docker: ReadsDocker,
+        *,
+        watch_reload: Callable[[], None] | None = None,
+        active_writer: bool = False,
+        index_mutated: bool = False,
+    ) -> None:
+        self.database = database
+        self.conn = conn
+        self.docker = docker
+        self.watch_reload = watch_reload or (lambda: None)
+        self.active_writer = active_writer
+        self.index_mutated = index_mutated
+        self.required_layers = tuple(
+            layer for layer in _LAYER_ORDER if layer in database.required_layers
+        )
+        self._closed_on_entry = {
+            layer: self._layer_flag_closed(layer) for layer in self.required_layers
+        }
+        self.close_attempted = False
+        self._watch_backup: str | None = None
+
+    def _layer_flag_closed(self, layer: str) -> bool:
+        key = scoped_read_key("reads_closed", self.database.name, layer)
+        if get_meta(self.conn, key) == "1":
+            return True
+        # Legacy global flags apply only to UBD during v2 coexistence.
+        if self.database.name == "ubd" and get_meta(self.conn, "reads_closed") == "1":
+            return True
+        return False
+
+    def is_closed(self, layer: str | None = None) -> bool:
+        layers = (layer,) if layer is not None else self.required_layers
+        if not layers:
+            return True
+        return all(self._layer_flag_closed(item) for item in layers)
+
+    def close(self, layer: str | None = None) -> None:
+        layers = (layer,) if layer is not None else self.required_layers
+        self.close_attempted = True
+        errors: list[str] = []
+        for item in layers:
+            try:
+                self.close_layer(item)
+            except Exception as exc:
+                errors.append(f"{item}: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def open(self, layer: str | None = None) -> None:
+        layers = (layer,) if layer is not None else self.required_layers
+        errors: list[str] = []
+        for item in layers:
+            try:
+                self.open_layer(item)
+            except Exception as exc:
+                errors.append(f"{item}: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def close_layer(self, layer: str) -> None:
+        if layer not in self.required_layers:
+            raise ValueError(
+                f"layer {layer!r} is not required for {self.database.name}"
+            )
+        name = self.database.name
+        services = self.database.services
+        set_meta(self.conn, scoped_read_key("reads_close_requested", name, layer), "1")
+        if layer == "graph":
+            status = self._graph_status()
+            if status == "running":
+                self.docker.run(["docker", "stop", services.graph_mcp])
+        elif layer == "code_index":
+            self._pause_watcher()
+            self._try_firewall_drop()
+            if services.webui_network in self._network_names():
+                self.docker.run(
+                    [
+                        "docker",
+                        "network",
+                        "disconnect",
+                        services.webui_network,
+                        services.bsl_container,
+                    ]
+                )
+        else:
+            raise ValueError(f"unknown layer: {layer}")
+        if not self._layer_verify_closed(layer):
+            raise RuntimeError(f"verify closed failed for {name}/{layer}")
+        set_meta(self.conn, scoped_read_key("reads_closed", name, layer), "1")
+
+    def open_layer(self, layer: str) -> None:
+        if layer not in self.required_layers:
+            raise ValueError(
+                f"layer {layer!r} is not required for {self.database.name}"
+            )
+        name = self.database.name
+        services = self.database.services
+        if layer == "graph":
+            if self._graph_status() != "running":
+                self.docker.run(["docker", "start", services.graph_mcp])
+        elif layer == "code_index":
+            if self.active_writer:
+                raise RuntimeError(
+                    f"refusing to restore watcher for {name}: active writer"
+                )
+            if services.webui_network not in self._network_names():
+                self.docker.run(
+                    [
+                        "docker",
+                        "network",
+                        "connect",
+                        services.webui_network,
+                        services.bsl_container,
+                    ]
+                )
+            self._try_firewall_undrop()
+            self._restore_watcher()
+        else:
+            raise ValueError(f"unknown layer: {layer}")
+        set_meta(self.conn, scoped_read_key("reads_closed", name, layer), "")
+        set_meta(self.conn, scoped_read_key("reads_close_requested", name, layer), "")
+
+    def reopen_if_safe_after_pre_activation_failure(self) -> None:
+        """Restore reads this attempt may have partially closed (pre-activation)."""
+        if self.index_mutated:
+            return
+        if not self.close_attempted:
+            return
+        for layer in self.required_layers:
+            if self._closed_on_entry.get(layer):
+                continue
+            self.open_layer(layer)
+
+    def _layer_verify_closed(self, layer: str) -> bool:
+        services = self.database.services
+        if layer == "graph":
+            return self._graph_status() != "running"
+        if layer == "code_index":
+            return services.webui_network not in self._network_names()
+        return False
+
+    def _graph_status(self) -> str:
+        result = self.docker.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{.State.Status}}",
+                self.database.services.graph_mcp,
+            ]
+        )
+        return (result.stdout or "").strip()
+
+    def _network_names(self) -> str:
+        result = self.docker.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}",
+                self.database.services.bsl_container,
+            ]
+        )
+        return result.stdout or ""
+
+    def _try_firewall_drop(self) -> None:
+        port = str(self.database.services.bsl_publish_port)
+        try:
+            check = self.docker.run(
+                ["iptables", "-C", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP"]
+            )
+            if check.returncode == 0:
+                return
+            self.docker.run(
+                ["iptables", "-I", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP"]
+            )
+        except _FW_ERRORS:
+            return
+
+    def _try_firewall_undrop(self) -> None:
+        port = str(self.database.services.bsl_publish_port)
+        while True:
+            try:
+                check = self.docker.run(
+                    [
+                        "iptables",
+                        "-C",
+                        "INPUT",
+                        "-p",
+                        "tcp",
+                        "--dport",
+                        port,
+                        "-j",
+                        "DROP",
+                    ]
+                )
+                if check.returncode != 0:
+                    return
+                self.docker.run(
+                    [
+                        "iptables",
+                        "-D",
+                        "INPUT",
+                        "-p",
+                        "tcp",
+                        "--dport",
+                        port,
+                        "-j",
+                        "DROP",
+                    ]
+                )
+            except _FW_ERRORS:
+                return
+
+    def _pause_watcher(self) -> None:
+        toml_path = self.database.services.bsl_daemon_toml
+        path = Path(toml_path)
+        if not path.is_file():
+            return
+        backup = toml_path + ".bak"
+        if not Path(backup).is_file():
+            shutil.copy2(path, backup)
+        self._watch_backup = backup
+        if not watch_is_paused(lambda: path.read_text(encoding="utf-8")):
+            pause_watch(toml_path, self.watch_reload)
+
+    def _restore_watcher(self) -> None:
+        if self.active_writer:
+            raise RuntimeError(
+                f"refusing watcher restore for {self.database.name}: active writer"
+            )
+        toml_path = self.database.services.bsl_daemon_toml
+        backup = self._watch_backup or (toml_path + ".bak")
+        path = Path(toml_path)
+        if not path.is_file() or not Path(backup).is_file():
+            return
+        if watch_is_paused(lambda: path.read_text(encoding="utf-8")):
+            restore_watch(toml_path, backup, self.watch_reload)
