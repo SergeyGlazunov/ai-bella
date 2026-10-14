@@ -15,7 +15,11 @@ from contour.adapters import MissingAdapters, build_probes, require_idle_adapter
 from contour.config import DatabaseConfig, GitSourceConfig, enabled_databases
 from contour.db import get_component, get_meta, init_db, set_meta
 from contour.index_bsl import index_bsl
-from contour.index_graph import copy_job_logs, index_graph
+from contour.index_graph import (
+    copy_job_logs,
+    index_graph,
+    set_graph_full_needed,
+)
 from contour.lock import acquire
 from contour.reads import (
     apply_close,
@@ -242,31 +246,115 @@ def _container_status(docker, container_id: str) -> str:
     return status
 
 
-def reap_jobs(conn: sqlite3.Connection, docker) -> str:
-    """Return 'idle' or 'busy'. Raise WriterStateUnknown if a job cannot be classified."""
-    rows = conn.execute(
-        """
-        SELECT id, container_id, exec_id, status FROM jobs
-        WHERE status NOT IN ('ok', 'failed', 'removed')
-        """
-    ).fetchall()
+# Job stage → index layer (single mapping for reap / recovery).
+JOB_STAGE_LAYER: dict[str, str] = {
+    "bsl_index": "code_index",
+    "bsl_clean": "code_index",
+    "graph": "graph",
+    "graph_full": "graph",
+}
+
+
+def job_stage_layer(stage: str) -> str | None:
+    return JOB_STAGE_LAYER.get(stage)
+
+
+def storage_volumes_for(database: DatabaseConfig) -> frozenset[str]:
+    """Physical index volumes owned by a database profile."""
+    volumes: set[str] = set()
+    layers = database.required_layers
+    if "code_index" in layers and database.storage.code_index_volume:
+        volumes.add(database.storage.code_index_volume)
+    if "graph" in layers and database.storage.graph_volume:
+        volumes.add(database.storage.graph_volume)
+    return frozenset(volumes)
+
+
+def databases_share_storage(left: DatabaseConfig, right: DatabaseConfig) -> bool:
+    return bool(storage_volumes_for(left) & storage_volumes_for(right))
+
+
+def writer_blocks_database(
+    conn: sqlite3.Connection,
+    database: DatabaseConfig,
+    peers: Sequence[DatabaseConfig],
+    docker,
+) -> str | None:
+    """Reason to skip a new writer, or None when the index is free to write."""
+    own = reap_database_jobs(conn, database.name, docker)
+    if own == "busy":
+        return f"{database.name}: previous indexer still running"
+    if own == "unknown":
+        return f"{database.name}: previous writer state unknown"
+    for peer in peers:
+        if peer.name == database.name:
+            continue
+        if not databases_share_storage(database, peer):
+            continue
+        peer_state = reap_database_jobs(conn, peer.name, docker)
+        if peer_state == "busy":
+            return (
+                f"{database.name}: shared storage busy "
+                f"(writer in {peer.name})"
+            )
+        if peer_state == "unknown":
+            return (
+                f"{database.name}: shared storage writer unknown "
+                f"({peer.name})"
+            )
+    return None
+
+
+def _reap_unfinished_rows(
+    conn: sqlite3.Connection,
+    docker,
+    *,
+    database: str | None,
+    raise_unknown: bool,
+) -> str:
+    """Reap unfinished jobs. Return idle|busy. Unknown → raise or return via caller."""
+    if database is None:
+        rows = conn.execute(
+            """
+            SELECT id, database, stage, container_id, exec_id, status FROM jobs
+            WHERE status NOT IN ('ok', 'failed', 'removed')
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, database, stage, container_id, exec_id, status FROM jobs
+            WHERE database = ?
+              AND status NOT IN ('ok', 'failed', 'removed')
+            """,
+            (database,),
+        ).fetchall()
     busy = False
     for row in rows:
+        job_db = str(row["database"] or "ubd")
         cid = row["container_id"] or ""
         exec_id = row["exec_id"] or ""
         if exec_id:
             if not cid:
-                raise WriterStateUnknown(f"job {row['id']} has exec_id but no container")
+                exc = WriterStateUnknown(
+                    f"job {row['id']} has exec_id but no container"
+                )
+                if raise_unknown:
+                    raise exc
+                raise exc
             try:
                 running = dockerutil.list_exec_ids(cid, runner=docker)
             except Exception as exc:
-                raise WriterStateUnknown(
+                err = WriterStateUnknown(
                     f"cannot list exec ids for {cid}: {exc}"
-                ) from exc
+                )
+                if raise_unknown:
+                    raise err from exc
+                raise err from exc
             if exec_id in running:
                 busy = True
                 continue
-            # Never started (crash between INSERT and start_exec) — cancel, not busy forever.
+            # Never started (crash between INSERT and start_exec) — cancel.
             if (row["status"] or "") == "created":
                 now = datetime.now(timezone.utc).isoformat()
                 conn.execute(
@@ -282,9 +370,12 @@ def reap_jobs(conn: sqlite3.Connection, docker) -> str:
             try:
                 exit_code = int(dockerutil.wait_exec(cid, exec_id, runner=docker))
             except Exception as exc:
-                raise WriterStateUnknown(
+                err = WriterStateUnknown(
                     f"wait_exec failed for {exec_id}: {exc}"
-                ) from exc
+                )
+                if raise_unknown:
+                    raise err from exc
+                raise err from exc
             now = datetime.now(timezone.utc).isoformat()
             job_status = "ok" if exit_code == 0 else "failed"
             conn.execute(
@@ -298,9 +389,17 @@ def reap_jobs(conn: sqlite3.Connection, docker) -> str:
             conn.commit()
             continue
         if not cid:
-            raise WriterStateUnknown(f"job {row['id']} has no container_id")
-        status = _container_status(docker, cid)
-        # created = never started → cancel; do not treat as busy forever (R04 edge).
+            err = WriterStateUnknown(f"job {row['id']} has no container_id")
+            if raise_unknown:
+                raise err
+            raise err
+        try:
+            status = _container_status(docker, cid)
+        except WriterStateUnknown:
+            if raise_unknown:
+                raise
+            raise
+        # created = never started → cancel; do not treat as busy forever.
         if status == "created":
             now = datetime.now(timezone.utc).isoformat()
             conn.execute(
@@ -320,11 +419,15 @@ def reap_jobs(conn: sqlite3.Connection, docker) -> str:
             result = docker.run(["docker", "wait", cid])
             exit_code = _parse_wait_exit(getattr(result, "stdout", "") or "")
         except Exception as exc:
-            raise WriterStateUnknown(
-                f"wait failed for writer {cid}: {exc}"
-            ) from exc
+            err = WriterStateUnknown(f"wait failed for writer {cid}: {exc}")
+            if raise_unknown:
+                raise err from exc
+            raise err from exc
         if exit_code is None:
-            raise WriterStateUnknown(f"empty wait output for writer {cid}")
+            err = WriterStateUnknown(f"empty wait output for writer {cid}")
+            if raise_unknown:
+                raise err
+            raise err
         log_path = None
         try:
             log_path = copy_job_logs(docker, cid)
@@ -340,10 +443,33 @@ def reap_jobs(conn: sqlite3.Connection, docker) -> str:
             """,
             (exit_code, job_status, now, log_path, row["id"]),
         )
-        if exit_code == 3:
-            set_meta(conn, "graph_full_needed", "1")
+        if exit_code == 3 and job_stage_layer(str(row["stage"] or "")) == "graph":
+            set_graph_full_needed(conn, job_db, True)
         conn.commit()
     return "busy" if busy else "idle"
+
+
+def reap_database_jobs(
+    conn: sqlite3.Connection, database: str, docker
+) -> str:
+    """Reap unfinished jobs for one database. Return idle|busy|unknown."""
+    try:
+        return _reap_unfinished_rows(
+            conn, docker, database=database, raise_unknown=False
+        )
+    except WriterStateUnknown:
+        return "unknown"
+
+
+def reap_jobs(conn: sqlite3.Connection, docker) -> str:
+    """Legacy UBD-only reap. Return idle|busy; raise WriterStateUnknown if unknown.
+
+    Filters to ``database='ubd'`` so KB/OPL jobs in a shared SQLite do not block
+    or mutate the legacy UBD path after a v2 pass.
+    """
+    return _reap_unfinished_rows(
+        conn, docker, database="ubd", raise_unknown=True
+    )
 
 
 _PERMANENT_NAMES = frozenset(
@@ -912,8 +1038,19 @@ def _reconcile_v2_locked(
 
     runner = database_runner or _default_v2_database_runner
     outcomes: list[tuple[str, str]] = []
+    all_profiles = list((cfg.databases or {}).values())
     for db in selected:
         state.register_database(db.name, _source_kind(db))
+        block = writer_blocks_database(conn, db, all_profiles, docker)
+        if block is not None:
+            send(cfg, block)
+            try:
+                run_id = state.start_run(db.name, "(pending)")
+                state.finish_run(run_id, "deferred", block)
+            except Exception:
+                pass
+            outcomes.append((db.name, "deferred"))
+            continue
         try:
             status = runner(
                 db,

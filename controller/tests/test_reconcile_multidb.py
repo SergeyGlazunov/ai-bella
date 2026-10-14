@@ -5,6 +5,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
 import yaml
 
 from contour.config import load_config
@@ -217,3 +218,216 @@ def test_legacy_reconcile_contract_unchanged(tmp_path: Path):
     assert result == "deferred"
     assert git.writes == []
     assert "fetch" in git.calls
+
+
+# --- Block 2: unfinished jobs / writer ownership ---------------------------------
+
+
+def _insert_run_job(
+    conn,
+    *,
+    database: str,
+    stage: str,
+    status: str,
+    container_id: str | None = None,
+    exec_id: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO runs (database, target_commit, started_at) VALUES (?, ?, ?)",
+        (database, "rev", "2026-09-20T00:00:00Z"),
+    )
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO jobs (
+          database, run_id, stage, status, container_id, exec_id, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            database,
+            run_id,
+            stage,
+            status,
+            container_id,
+            exec_id,
+            "2026-09-20T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+
+@dataclass
+class ScriptedDocker:
+    """Minimal docker for reap_database_jobs state transitions."""
+
+    inspect_status: str = "exited"
+    wait_exit: int = 0
+    exec_running: frozenset[str] = frozenset()
+    fail_inspect: bool = False
+
+    def run(self, cmd: list[str], *, timeout: float | None = None):
+        del timeout
+        if cmd[:2] == ["docker", "info"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            if self.fail_inspect:
+                raise RuntimeError("inspect unavailable")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{self.inspect_status}\n", stderr=""
+            )
+        if cmd[:2] == ["docker", "wait"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{self.wait_exit}\n", stderr=""
+            )
+        if cmd[:2] == ["docker", "logs"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="log", stderr="")
+        raise AssertionError(cmd)
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("running", "busy"),
+        ("exited_ok", "idle"),
+        ("created_never_started", "idle"),
+        ("unknown_inspect", "unknown"),
+    ],
+)
+def test_reap_database_job_states(tmp_path: Path, case: str, expected: str):
+    from contour.reconcile import reap_database_jobs
+
+    conn = init_db(str(tmp_path / "state.db"))
+    docker: ScriptedDocker
+    if case == "running":
+        _insert_run_job(
+            conn,
+            database="kb",
+            stage="graph",
+            status="running",
+            container_id="cid-kb",
+        )
+        docker = ScriptedDocker(inspect_status="running")
+    elif case == "exited_ok":
+        _insert_run_job(
+            conn,
+            database="kb",
+            stage="graph",
+            status="running",
+            container_id="cid-kb",
+        )
+        docker = ScriptedDocker(inspect_status="exited", wait_exit=0)
+    elif case == "created_never_started":
+        _insert_run_job(
+            conn,
+            database="kb",
+            stage="graph",
+            status="created",
+            container_id="cid-kb",
+        )
+        docker = ScriptedDocker(inspect_status="created")
+    else:
+        _insert_run_job(
+            conn,
+            database="kb",
+            stage="graph",
+            status="running",
+            container_id="cid-kb",
+        )
+        docker = ScriptedDocker(fail_inspect=True)
+    assert reap_database_jobs(conn, "kb", docker) == expected
+    if case == "exited_ok":
+        row = conn.execute("SELECT status, exit_code FROM jobs").fetchone()
+        assert row["status"] == "ok"
+        assert row["exit_code"] == 0
+    if case == "created_never_started":
+        row = conn.execute("SELECT status, exit_code FROM jobs").fetchone()
+        assert row["status"] == "failed"
+        assert row["exit_code"] == -1
+
+
+def test_kb_exit3_does_not_set_ubd_full(tmp_path: Path):
+    from contour.index_graph import is_graph_full_needed
+    from contour.reconcile import reap_database_jobs
+
+    conn = init_db(str(tmp_path / "state.db"))
+    _insert_run_job(
+        conn,
+        database="kb",
+        stage="graph",
+        status="running",
+        container_id="cid-kb",
+    )
+    docker = ScriptedDocker(inspect_status="exited", wait_exit=3)
+    assert reap_database_jobs(conn, "kb", docker) == "idle"
+    assert is_graph_full_needed(conn, "kb") is True
+    assert is_graph_full_needed(conn, "ubd") is False
+
+
+def test_busy_writer_blocks_same_storage(tmp_path: Path):
+    from contour.reconcile import writer_blocks_database
+
+    cfg = _v2_config(tmp_path)
+    # Force KB to share UBD's graph volume (misconfig / shared resource).
+    kb = cfg.databases["kb"]
+    ubd = cfg.databases["ubd"]
+    shared = type(kb)(
+        name=kb.name,
+        source=kb.source,
+        required_layers=kb.required_layers,
+        services=kb.services,
+        storage=type(kb.storage)(
+            graph_volume=ubd.storage.graph_volume,
+            code_index_volume=kb.storage.code_index_volume,
+        ),
+        adapters=kb.adapters,
+        enabled=kb.enabled,
+    )
+    conn = init_db(str(tmp_path / "state.db"))
+    _insert_run_job(
+        conn,
+        database="kb",
+        stage="graph",
+        status="running",
+        container_id="cid-kb",
+    )
+    docker = ScriptedDocker(inspect_status="running")
+    reason = writer_blocks_database(conn, ubd, [ubd, shared], docker)
+    assert reason is not None
+    assert "shared storage" in reason
+
+
+def test_failed_kb_does_not_block_opl(tmp_path: Path):
+    cfg = _v2_config(tmp_path)
+    runner = RecordingRunner(
+        outcomes={"ubd": "success", "kb": "failed", "klon_opl": "success"}
+    )
+    paths = RuntimePaths(
+        db_path=str(tmp_path / "state.db"),
+        lock_path=str(tmp_path / "sync.lock"),
+    )
+    result = reconcile(
+        cfg,
+        timer=False,
+        measure=False,
+        paths=paths,
+        lock_backend=MemoryBackend(),
+        docker=PingDocker(),
+        database_runner=runner,
+    )
+    assert result == "failed"
+    assert runner.seen == ["ubd", "kb", "klon_opl"]
+
+
+def test_legacy_reap_ignores_kb_jobs(tmp_path: Path):
+    from contour.reconcile import reap_jobs
+
+    conn = init_db(str(tmp_path / "state.db"))
+    _insert_run_job(
+        conn,
+        database="kb",
+        stage="graph",
+        status="running",
+        container_id="cid-kb",
+    )
+    # Legacy reap must stay idle despite a live KB writer in the same SQLite.
+    assert reap_jobs(conn, ScriptedDocker(inspect_status="running")) == "idle"
