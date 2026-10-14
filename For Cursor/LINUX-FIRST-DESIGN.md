@@ -1,7 +1,8 @@
 # Design: Linux-first migration for AI-Contour
 
 **Date:** 2026-10-12  
-**Status:** proposed, awaiting written review  
+**Updated:** 2026-10-14  
+**Status:** accepted for implementation (operational priority)  
 **Scope:** migrate orchestration and indexing from Windows-managed execution to WSL/Linux while keeping Windows as a temporary 1C exporter.
 
 ## 1. Purpose
@@ -9,6 +10,25 @@
 AI-Contour currently depends on Windows Task Scheduler, PowerShell, WSL and Docker. The target is to move all orchestration, state, indexing and runtime services into WSL/Linux. Windows remains only where the 1C platform is required for reliable configuration export.
 
 An independent Linux server and a Linux installation of the 1C platform are optional future steps. They are not required for the first successful migration.
+
+### 1.1. Operational priority
+
+The primary goal is a stable internal stand and the ability to resume update after a failure. Prefer working nightly paths, recovery, clear error causes and moderate implementation complexity over exotic hardening.
+
+Acceptable failure behaviour:
+
+1. If the update has not yet touched an index, keep serving the previous data.
+2. If indexing was interrupted, the affected Graph or BSL tool may be temporarily unavailable.
+3. Other independent databases and tools must keep working.
+4. Published sources must remain so the index can be finished or rebuilt.
+5. The error is recorded; an evening operator can inspect it and retry.
+6. After a successful recovery, reopen only the affected tool.
+
+Do not guarantee that the previous index generation survives a partial overwrite. Keep in-place updates. Do not introduce a second index generation, blue-green publish or extra copies solely for continuous availability.
+
+Do not spend significant effort on adversarial input, injection and exotic filesystem scenarios. This is a controlled internal stand. Keep basic secret hygiene and checks that prevent accidental source deletion, data loss or a second concurrent writer.
+
+Implementation and review must prioritize breakage of the first or next normal night, recovery blockers, loss of working data, hidden errors and false success. Other rare defensive cases may be deferred with an explicit reason.
 
 ## 2. Success criteria
 
@@ -18,10 +38,10 @@ The required migration is complete when:
 2. Windows does not manage Docker or indexing and does not decide whether the nightly cycle succeeded.
 3. Windows exports KB and `klon_opl`, creates complete transfer packages and sends them to the Linux inbox.
 4. UBD is updated by Git directly from WSL/Linux.
-5. SQLite is the single operational source of truth for source revisions, runs, jobs and published index state.
+5. SQLite is the single operational source of truth for source revisions, runs, jobs and published index state, including fields needed by an update-status dashboard.
 6. UBD, KB and `klon_opl` complete a verified nightly cycle under one orchestrator.
-7. A failed write leaves reads closed until indexes are reconciled and verified.
-8. The system recovers deterministically after an orchestrator or container failure.
+7. A failed or partial index update never reports the affected tool as successfully updated; only that tool is taken out of service until recovery.
+8. After process stop or host reboot the orchestrator resumes from SQLite: unfinished jobs are reconciled, sources remain, and an operator or the next night can retry a single database.
 
 The migration does not require a separate Linux machine or the removal of the Windows 1C exporter.
 
@@ -220,7 +240,7 @@ Only `contour` starts index writers. Long-running MCP containers must not indepe
 
 ## 9. Job execution and recovery
 
-Before starting a Docker job, `contour` creates its SQLite job record. It then creates the container or exec, records its identity and starts it.
+Before starting a Docker job, `contour` creates its SQLite job record. It then creates the container or exec, records its identity and starts it. Limited retries cover transient failures; hung jobs are bounded by timeouts. Before a retry, the orchestrator checks whether an indexer for that layer is already running.
 
 After restart, the orchestrator:
 
@@ -229,21 +249,28 @@ After restart, the orchestrator:
 3. compares them with Docker state;
 4. records a confirmed exit code when available;
 5. finishes verification or marks the job unknown;
-6. never starts a second writer while a live or unknown writer may exist.
+6. never starts a second writer for the same index while a live or unknown writer may exist;
+7. leaves independent databases runnable even when one database failed.
 
-If the failure occurred before source mutation, reads remain open. If it occurred after mutation began, reads remain closed until a known revision is fully indexed and verified.
+If the failure occurred before any index write, previous reads for that tool stay available. If indexing was interrupted after mutation began, only the affected Graph or BSL tool is marked unavailable and must not be advertised as current. Published sources are retained so the index can be completed or rebuilt. A partial index is never recorded as a successful publish.
+
+Operator needs:
+
+- clear error with database, stage, revision, reason and path to the detailed log;
+- ability to retry one database manually;
+- dashboard-facing state: running, published, failed or tool unavailable.
 
 ## 10. Rollback and retention
 
-The design keeps one active set of indexes. It does not introduce blue-green index generations.
+The design keeps one active set of indexes. It does not introduce blue-green index generations and does not promise that an overwritten index fragment can be rolled back without rebuild.
 
-Rollback therefore means:
+Recovery therefore means:
 
-1. keep reads closed;
-2. restore the previous confirmed source revision;
-3. rebuild or reconcile Graph and BSL against that revision;
+1. keep the affected tool offline or marked unavailable;
+2. prefer finishing or rebuilding against the current published source when that source is intact;
+3. restore a previous source directory only when activation left a recoverable previous handle and the operator chooses that path;
 4. run verification;
-5. reopen reads only after success.
+5. reopen only the recovered tool after success.
 
 Retention defaults:
 
@@ -344,19 +371,24 @@ The required migration does not include:
 - removal of Windows;
 - installation of the 1C platform on Linux;
 - blue-green or generational indexes;
+- continuous availability of an index mid-update;
+- adversarial hardening against malicious packages, symlink/junction escapes or injection;
 - migration or replacement of Open WebUI and OmniRoute;
 - high availability;
 - direct remote access to SQLite;
 - a second orchestration system alongside `contour`.
 
+Basic checks that prevent accidental source loss, secret leakage in logs and a second concurrent writer remain in scope.
+
 ## 15. Key decisions
 
 - Required target: WSL/Linux control plane with a Windows 1C exporter.
 - Optional targets: dedicated Linux host and Linux 1C exporter.
-- SQLite remains the operational source of truth and lives on the host.
+- SQLite remains the operational source of truth and lives on the host; it also feeds the update-status dashboard.
 - `contour` remains a host service.
 - Workloads and index jobs run in containers.
 - Windows packages are immutable and accepted only after manifest and checksum validation.
-- One writer owns every index.
-- Failure after mutation is fail-closed.
-- Existing indexes remain single-generation; rollback rebuilds them against a confirmed source revision.
+- One writer owns each index; databases are isolated from each other's failures.
+- Partial index updates must not report success; only the affected tool is taken offline.
+- Existing indexes remain single-generation; recovery rebuilds or finishes against a confirmed published source.
+- Review and implementation follow the operational priority in §1.1, not maximal defensive coverage.
