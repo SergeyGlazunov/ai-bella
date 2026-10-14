@@ -52,14 +52,34 @@ def _existing_compose_files(compose_dir: str) -> list[str]:
     return files
 
 
-def _insert_job(conn: sqlite3.Connection, run_id: int, stage: str, container_id: str) -> int:
+def _database_for_run(cfg, conn: sqlite3.Connection, run_id: int) -> str:
+    name = getattr(cfg, "name", None)
+    if name:
+        return str(name)
+    row = conn.execute(
+        "SELECT database FROM runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is not None:
+        return str(row["database"] if hasattr(row, "keys") else row[0])
+    return "ubd"
+
+
+def _insert_job(
+    conn: sqlite3.Connection,
+    run_id: int,
+    stage: str,
+    container_id: str,
+    *,
+    database: str,
+) -> int:
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         """
-        INSERT INTO jobs (run_id, stage, status, container_id, started_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO jobs (database, run_id, stage, status, container_id, started_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (run_id, stage, "created", container_id, now),
+        (database, run_id, stage, "created", container_id, now),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -208,7 +228,8 @@ def _run_graph_job(
         files=files,
         container_name=container_name,
     )
-    job_id = _insert_job(conn, run_id, stage, container_id)
+    database = _database_for_run(cfg, conn, run_id)
+    job_id = _insert_job(conn, run_id, stage, container_id, database=database)
     start(container_id, runner=docker)
     exit_code = wait(container_id, runner=docker)
     log_path = _copy_logs(docker, container_id)

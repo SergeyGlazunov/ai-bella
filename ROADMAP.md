@@ -23,10 +23,10 @@ Plan: `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`
 
 | Stage | Tasks | Status |
 |-------|-------|--------|
-| 0 Design accepted | — | proposed; follow plan |
-| 1 Repo baseline | Task 1 | **this branch** (STATUS/ROADMAP/VENDOR/manifest) |
-| 2 Config + SQLite + inbox | Tasks 2–5 | pending |
-| 3 Contour pipeline | Tasks 6–8 | pending — core Python orchestrator work |
+| 0 Design accepted | — | accepted with operational priority §1.1 |
+| 1 Repo baseline | Task 1 | done |
+| 2 Config + SQLite + inbox + sources | Tasks 2–5 | **done in kit** (ops subset; exotic FS deferred) |
+| 3 Contour pipeline | Tasks 6–8 | Task 6 done; **next: Task 7** |
 | 4 Windows = exporter only | Task 9 | pending |
 | 5 Host install (`/srv/ai-contour`, systemd) | Task 10 | pending |
 | 6 Dry-run acceptance | Task 11 | pending |

@@ -19,21 +19,36 @@ def _runner(runner: DockerRunner | None) -> DockerRunner:
     return runner if runner is not None else SubprocessRunner()
 
 
+def _database_for_run(cfg, conn: sqlite3.Connection, run_id: int) -> str:
+    name = getattr(cfg, "name", None)
+    if name:
+        return str(name)
+    row = conn.execute(
+        "SELECT database FROM runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is not None:
+        return str(row["database"] if hasattr(row, "keys") else row[0])
+    return "ubd"
+
+
 def _insert_exec_job(
     conn: sqlite3.Connection,
     run_id: int,
     stage: str,
     container_id: str,
     exec_id: str,
+    *,
+    database: str,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         """
         INSERT INTO jobs (
-          run_id, stage, status, container_id, exec_id, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+          database, run_id, stage, status, container_id, exec_id, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (run_id, stage, "created", container_id, exec_id, now),
+        (database, run_id, stage, "created", container_id, exec_id, now),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -79,7 +94,10 @@ def _run_exec(
     env = [f"CODE_INDEX_HOME={CODE_INDEX_HOME}"]
     cmd = ["bsl-indexer", *args]
     exec_id = create_exec(container, cmd, env=env, runner=docker)
-    job_id = _insert_exec_job(conn, run_id, stage, container, exec_id)
+    database = _database_for_run(cfg, conn, run_id)
+    job_id = _insert_exec_job(
+        conn, run_id, stage, container, exec_id, database=database
+    )
     start_exec(exec_id, detach=True, runner=docker)
     _mark_exec_running(conn, job_id)
     exit_code = wait_exec(container, exec_id, runner=docker)

@@ -2,28 +2,30 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move AI-Contour orchestration, state, source intake and indexing into WSL/Linux while Windows remains only a 1C export-and-transfer worker.
+**Goal:** Move AI-Contour orchestration, state, source intake and indexing into WSL/Linux while Windows remains only a 1C export-and-transfer worker. Prioritize stable nightly cycles, recovery after stop/reboot, clear errors and moderate complexity.
 
 **Architecture:** `contour` runs as a systemd host service, stores operational state in SQLite and owns all Docker index writers. UBD comes from Git; KB and `klon_opl` arrive as immutable packages through a Linux inbox. A separate Linux machine and Linux-based 1C export remain optional.
 
 **Tech Stack:** Python 3.11+, SQLite, pytest, PyYAML, systemd, Docker Engine/Compose, PowerShell 5.1+, 1C Designer.
 
-**Spec:** `docs/superpowers/specs/2026-10-12-linux-first-migration-design.md`
+**Spec:** `For Cursor/LINUX-FIRST-DESIGN.md` (operational priority §1.1)
 
 ## Global Constraints
 
-- Read `AGENT.md`, `STATUS.md` when it exists, the design spec above and this plan before editing.
-- Work in a real Git clone. Do not execute this plan against the current history-less copy.
-- Preserve the current fail-closed rule: after source mutation, reads stay closed until all required layers are verified.
-- Only `contour` may start index writers; no concurrent PowerShell or watcher writer is allowed.
+- Read `AGENT.md`, `STATUS.md`, the design spec above and this plan before editing.
+- Work in a real Git clone. Do not execute this plan against a history-less copy.
+- Follow the operational priority in the design: normal nights, recovery, no false success, per-database isolation. Do not expand scope into adversarial filesystem or injection hardening unless it prevents accidental source loss or a second writer.
+- After a partial index update, the affected tool must not be marked published; previous data may remain available only when that index was not overwritten.
+- Only `contour` may start index writers; no concurrent PowerShell or watcher writer is allowed. Before retry, check for an already running indexer.
 - Windows must not call Docker, edit SQLite or decide overall nightly success.
 - Mutable Linux data must live under `/srv/ai-contour`, not `/mnt/c`.
 - Keep Open WebUI and OmniRoute unchanged unless a verified endpoint must be updated.
 - Do not create blue-green index generations or a second active copy of indexes.
-- Never commit `.env`, connection profiles, source dumps, logs, SQLite files or live credentials.
+- Never commit `.env`, connection profiles, source dumps, logs, SQLite files or live credentials. Do not put credentials in error text or argv.
 - Use TDD for Python and PowerShell helper logic. Run the smallest relevant test first, then the complete suite.
 - Commit after every task. Do not combine repository cleanup, control-plane changes and stand cutover in one commit.
 - Any step marked **STAND ONLY** requires the target machine, operator approval and a recorded rollback point.
+- Live stand cutover always needs a separate explicit permission.
 
 ## Cursor execution contract
 
@@ -41,11 +43,16 @@ When actual container names, ports or paths differ from the repository documenta
 
 ## Review Focus
 
-1. An incomplete or corrupted package must remain ignored and must not replace the published source; Task 4 tests this.
-2. A crash after source mutation must keep reads closed and prevent a second writer; Tasks 7 and 8 test this.
-3. Legacy UBD configuration and state must migrate without silently losing the last published commit; Tasks 2 and 3 test this.
-4. A skipped mandatory Graph or BSL stage must make the run fail; Task 7 tests this for all three database profiles.
-5. Windows transfer retries must be idempotent and must never expose a partial `READY` package; Task 9 tests this.
+Fix first what breaks the next normal night, blocks recovery, loses working data, hides an error or reports false success. Defer rare defensive cases with a written reason.
+
+1. Incomplete or corrupted packages must not replace the published source; Task 4.
+2. Crash or reboot mid-job must not start a second writer; unfinished jobs must be reconcilable; Tasks 7–8.
+3. Legacy UBD config/state must keep the last published commit; Tasks 2–3.
+4. A skipped mandatory Graph or BSL stage fails that database run and must not be marked published; Task 7.
+5. Failure of one database must not stop other independent databases; Task 8.
+6. Errors and dashboard state must expose database, stage, revision, reason and log path; Tasks 7–8.
+7. Windows transfer retries must be idempotent and must never expose a partial `READY` package; Task 9.
+8. Do not require symlink/junction escape suites, adversarial package content or blue-green continuity proofs unless they map to an item above.
 
 ---
 
@@ -364,6 +371,8 @@ git commit -m "feat: validate immutable export packages"
 
 ### Task 5: Add source staging and atomic activation
 
+**Status:** done in kit (operational subset). Further exotic FS hardening is deferred unless a real night or recovery path needs it.
+
 **Files:**
 - Create: `controller/src/contour/sources.py`
 - Create: `controller/tests/test_sources.py`
@@ -374,7 +383,18 @@ git commit -m "feat: validate immutable export packages"
 - Consumes: `GitSourceConfig`, `ValidatedPackage` and source root paths.
 - Produces: a common `PreparedSource` and reversible activation operations.
 
-- [ ] **Step 1: Write failing source tests**
+**Must keep working:**
+
+- first publication of a package/Git source without a previous backup;
+- idempotent retry after a completed first publish;
+- failed activation restores the entry published tree (not an older unrelated backup);
+- Git origin matches configured remote before fetch (no silent wrong remote);
+- staged content must match the prepared revision before published replace;
+- secrets/userinfo must not appear in source errors.
+
+**Deferred on purpose:** parent-symlink/junction escape matrices, adversarial post-validate reparse planting, and similar controlled-stand edge cases.
+
+- [x] **Step 1: Write failing source tests**
 
 Cover:
 
@@ -384,13 +404,13 @@ Cover:
 - a failed activation preserves the previous published source;
 - retrying the same revision is idempotent;
 - rollback restores the previous revision directory;
-- source paths cannot escape `/srv/ai-contour/sources`.
+- accidental path escape outside the configured sources root is rejected when easy to detect.
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `python -m pytest tests/test_sources.py tests/test_gitutil.py -v`.
 
-- [ ] **Step 3: Implement the source interface**
+- [x] **Step 3: Implement the source interface**
 
 ```python
 @dataclass(frozen=True)
@@ -409,11 +429,11 @@ def rollback_source(published_path: Path, previous_path: Path) -> None: ...
 
 Implement `GitSourceProvider` and `PackageSourceProvider`. Keep package retention separate from activation.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `python -m pytest tests/test_sources.py tests/test_gitutil.py -v`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add controller/src/contour/sources.py controller/src/contour/gitutil.py controller/tests/test_sources.py controller/tests/test_gitutil.py
@@ -423,6 +443,8 @@ git commit -m "feat: stage and activate source revisions"
 ## Work package C: generalized orchestration
 
 ### Task 6: Introduce database profiles and layer adapters
+
+**Status:** done in kit.
 
 **Files:**
 - Create: `controller/src/contour/profiles.py`
@@ -435,7 +457,7 @@ git commit -m "feat: stage and activate source revisions"
 - Consumes: `DatabaseConfig`, Docker runner, SQLite connection, run ID and source revision.
 - Produces: `DatabaseProfile` and uniform index-layer calls.
 
-- [ ] **Step 1: Write failing profile tests**
+- [x] **Step 1: Write failing profile tests**
 
 Assert:
 
@@ -445,11 +467,11 @@ Assert:
 - skipped required layers raise an error;
 - every job is recorded with database and target revision before start.
 
-- [ ] **Step 2: Run focused tests and verify failure**
+- [x] **Step 2: Run focused tests and verify failure**
 
 Run: `python -m pytest tests/test_profiles.py tests/test_index_graph.py -v`.
 
-- [ ] **Step 3: Implement profile interfaces**
+- [x] **Step 3: Implement profile interfaces**
 
 ```python
 @dataclass(frozen=True)
@@ -471,11 +493,11 @@ def run_graph_layer(database: DatabaseConfig, revision: str, run_id: int, conn: 
 
 Refactor existing index functions behind these interfaces without changing the graph exit-code-3 FULL contract.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `python -m pytest tests/test_profiles.py tests/test_index_graph.py -v`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add controller/src/contour/profiles.py controller/src/contour/index_bsl.py controller/src/contour/index_graph.py controller/tests/test_profiles.py controller/tests/test_index_graph.py
@@ -546,7 +568,7 @@ Run: `python -m pytest tests/test_pipeline.py tests/test_verify.py -v`.
 
 ```bash
 git add controller/src/contour/pipeline.py controller/src/contour/verify.py controller/tests/test_pipeline.py controller/tests/test_verify.py
-git commit -m "feat: add fail-closed database pipeline"
+git commit -m "feat: add verified database pipeline"
 ```
 
 ### Task 8: Reconcile multiple databases and recover unfinished jobs
@@ -559,7 +581,7 @@ git commit -m "feat: add fail-closed database pipeline"
 
 **Interfaces:**
 - Consumes: normalized `Config.databases`, `StateStore` and `run_database_pipeline()`.
-- Produces: global scheduling, writer ownership and restart recovery.
+- Produces: global scheduling, writer ownership, restart recovery and dashboard-facing aggregate state.
 
 - [ ] **Step 1: Write failing reconciliation tests**
 
@@ -567,12 +589,14 @@ Cover:
 
 - databases run in configured deterministic order;
 - only one global writer lock exists;
-- a live unfinished Docker job blocks a second writer;
+- a live unfinished Docker job blocks a second writer for the same index;
 - a confirmed completed job is reaped and its exit code persisted;
-- an unknown job keeps affected reads closed;
+- an unknown or partial job marks only the affected tool unavailable;
 - a failed KB run does not falsely mark the entire nightly successful;
-- a later database does not start after a fail-closed mutation failure;
-- legacy UBD-only configuration still follows its existing behavior.
+- failure of one database does not prevent later independent databases from running;
+- limited retries/timeouts cover transient and hung jobs without overlapping writers;
+- legacy UBD-only configuration still follows its existing behavior;
+- aggregate result and alert include database, stage, revision, reason and log path.
 
 - [ ] **Step 2: Run focused tests and verify failure**
 
@@ -584,13 +608,14 @@ Keep `reconcile(...)` as the public entry point. It must:
 
 1. initialize/migrate SQLite;
 2. acquire the global lock;
-3. reconcile unfinished jobs;
+3. reconcile unfinished jobs and detect already-running indexers before retry;
 4. evaluate the write window;
-5. run configured database pipelines in order;
+5. run configured database pipelines in order, continuing past an isolated database failure;
 6. report one aggregate result without masking a failed database;
-7. send one actionable alert containing database, stage and log path.
+7. send one actionable alert containing database, stage, revision, reason and log path;
+8. expose enough state for a dashboard (per database/tool: running, published, failed, unavailable).
 
-Scope read-state meta keys by database. Preserve the rule that a database with unknown or partial index state cannot reopen.
+Scope read-state meta keys by database and layer. A database/tool with unknown or partial index state must not be marked published; other databases may remain available.
 
 - [ ] **Step 4: Run tests**
 
