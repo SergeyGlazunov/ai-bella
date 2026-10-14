@@ -259,3 +259,30 @@ class StateStore:
             return int(cur.lastrowid)
 
         return self._tx(work)
+
+    def update_run_revision(self, run_id: int, target_revision: str) -> None:
+        def work() -> None:
+            self._conn.execute(
+                """
+                UPDATE runs
+                SET target_revision = ?, target_commit = ?
+                WHERE id = ?
+                """,
+                (target_revision, target_revision, run_id),
+            )
+
+        self._tx(work)
+
+    def finish_run(self, run_id: int, result: str, message: str) -> None:
+        def work() -> None:
+            now = _utc_now()
+            self._conn.execute(
+                """
+                UPDATE runs
+                SET finished_at = ?, result = ?, message = ?
+                WHERE id = ?
+                """,
+                (now, result, message, run_id),
+            )
+
+        self._tx(work)

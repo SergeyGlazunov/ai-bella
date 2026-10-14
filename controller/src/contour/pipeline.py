@@ -5,16 +5,21 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
-from contour.config import DatabaseConfig
+from contour.config import DatabaseConfig, GitSourceConfig, PackageSourceConfig
 from contour.index_graph import is_graph_full_needed
 from contour.profiles import (
     LayerResult,
     profile_from_config,
     run_required_layers,
 )
-from contour.sources import SourceProvider, activate_source
+from contour.sources import PreparedSource, SourceProvider, activate_source
 from contour.state import StateStore
-from contour.verify import Samples, verify_indexes, verify_layers_at_revision
+from contour.verify import (
+    Samples,
+    sample_current_tree,
+    verify_indexes,
+    verify_run_layer_results,
+)
 
 
 @dataclass(frozen=True)
@@ -23,6 +28,7 @@ class PipelineResult:
     revision: str
     result: Literal["published", "deferred", "failed"]
     message: str
+    run_id: int | None = None
 
 
 @runtime_checkable
@@ -44,6 +50,9 @@ class LayerRunnerRegistry(Protocol):
         *,
         full_needed: bool = False,
         may_write: Callable[[], str] | None = None,
+        on_layer_start: Callable[[str], None] | None = None,
+        on_layer_result: Callable[[LayerResult], None] | None = None,
+        on_layer_error: Callable[[str, BaseException], None] | None = None,
     ) -> list[LayerResult]: ...
 
 
@@ -63,6 +72,9 @@ class ProfilesLayerRunner:
         *,
         full_needed: bool = False,
         may_write: Callable[[], str] | None = None,
+        on_layer_start: Callable[[str], None] | None = None,
+        on_layer_result: Callable[[LayerResult], None] | None = None,
+        on_layer_error: Callable[[str, BaseException], None] | None = None,
     ) -> list[LayerResult]:
         return run_required_layers(
             database,
@@ -72,6 +84,9 @@ class ProfilesLayerRunner:
             runner=self.docker_runner,  # type: ignore[arg-type]
             may_write=may_write or self.may_write,
             full_needed=full_needed,
+            on_layer_start=on_layer_start,
+            on_layer_result=on_layer_result,
+            on_layer_error=on_layer_error,
         )
 
 
@@ -91,21 +106,31 @@ def run_database_pipeline(
     """Run one database through prepare → activate → index → verify → publish.
 
     Scheduling and the global writer lock stay outside. Graph FULL recovery
-    reads the saved per-database meta flag unless the layer runner is given an
-    explicit override via its ``full_needed`` argument from this function.
+    reads the saved per-database meta flag and passes it as ``full_needed``.
     """
     name = database.name
     revision = ""
     activated = False
+    closed_by_this_run = False
+    run_id: int | None = None
     log = transitions if transitions is not None else []
+    reads_closed_on_entry = True
+    entry_read_error: str | None = None
+    try:
+        reads_closed_on_entry = bool(reads.is_closed())
+    except Exception as read_exc:
+        entry_read_error = str(read_exc) or read_exc.__class__.__name__
+        reads_closed_on_entry = True
 
     def note(stage: str) -> None:
         log.append(stage)
         state.set_lifecycle(name, stage)
 
     try:
+        run_id = state.start_run(name, "(pending)")
         prepared = source.prepare()
         revision = prepared.revision
+        state.update_run_revision(run_id, revision)
         state.record_received(name, revision, None)
         note("received")
         note("validated")
@@ -113,76 +138,118 @@ def run_database_pipeline(
         note("staged")
 
         reads.close()
+        closed_by_this_run = True
         note("reads_closed")
 
         activate_source(prepared, prepared.published_path)
         activated = True
 
-        run_id = state.start_run(name, revision)
         note("indexing")
         full_needed = is_graph_full_needed(conn, name)
+        profile = profile_from_config(database)
+
+        def on_start(layer: str) -> None:
+            state.mark_layer(name, layer, revision, "building", None, None)
+
+        def on_result(item: LayerResult) -> None:
+            state.mark_layer(
+                name,
+                item.layer,
+                item.revision,
+                "ready",
+                item.storage_id,
+                item.indexer_version,
+            )
+
+        def on_error(layer: str, exc: BaseException) -> None:
+            del exc
+            state.mark_layer(name, layer, revision, "failed", None, None)
+
         results = layers.run(
             database,
             revision,
             run_id,
             full_needed=full_needed,
             may_write=may_write,
+            on_layer_start=on_start,
+            on_layer_result=on_result,
+            on_layer_error=on_error,
         )
-        _record_layer_results(state, name, results)
+        # Publish gate uses this run's results only — not stale ready rows.
+        verify_run_layer_results(results, profile.required_layers, revision)
 
-        profile = profile_from_config(database)
-        verify_layers_at_revision(conn, name, revision, profile.required_layers)
-
-        probe_samples = samples or Samples(
-            bsl_paths=[], xml_paths=[], deletions=[]
-        )
-        _run_probes(probes, probe_samples)
+        probe_samples = _resolve_samples(samples, prepared, database)
+        _run_probes(probes, probe_samples, profile.required_layers)
         note("verified")
 
         reads.open()
         log.append("published")
         state.mark_published(name, revision)
-        return PipelineResult(name, revision, "published", "ok")
+        state.finish_run(run_id, "published", "ok")
+        return PipelineResult(name, revision, "published", "ok", run_id=run_id)
     except Exception as exc:
         message = str(exc) or exc.__class__.__name__
+        if entry_read_error:
+            message = f"{message}; also could not read prior reads state: {entry_read_error}"
         if activated:
-            # Source already moved; keep reads closed for recovery.
-            try:
-                state.set_lifecycle(name, "failed", detail=message)
-            except Exception:
-                pass
-            return PipelineResult(name, revision or "unknown", "failed", message)
-        # Failure before successful activation: previous published data stays
-        # available — reopen if we already closed.
-        if reads.is_closed():
+            _finish_failed(state, name, run_id, message)
+            return PipelineResult(
+                name, revision or "unknown", "failed", message, run_id=run_id
+            )
+        # Pre-activation failure: reopen only if THIS attempt closed previously
+        # open reads. Do not clear a close left by an unfinished earlier run.
+        if closed_by_this_run and reads_closed_on_entry is False:
             try:
                 reads.open()
-            except Exception:
-                pass
-        try:
-            state.set_lifecycle(name, "failed", detail=message)
-        except Exception:
-            pass
-        return PipelineResult(name, revision or "unknown", "failed", message)
-
-
-def _record_layer_results(
-    state: StateStore, database: str, results: Sequence[LayerResult]
-) -> None:
-    for item in results:
-        state.mark_layer(
-            database,
-            item.layer,
-            item.revision,
-            "ready",
-            item.storage_id,
-            item.indexer_version,
+            except Exception as open_exc:
+                message = f"{message}; also failed to reopen reads: {open_exc}"
+        _finish_failed(state, name, run_id, message)
+        return PipelineResult(
+            name, revision or "unknown", "failed", message, run_id=run_id
         )
 
 
-def _run_probes(probes: object, samples: Samples) -> None:
+def _finish_failed(
+    state: StateStore, database: str, run_id: int | None, message: str
+) -> None:
+    try:
+        state.set_lifecycle(database, "failed", detail=message)
+    except Exception:
+        pass
+    if run_id is not None:
+        try:
+            state.finish_run(run_id, "failed", message)
+        except Exception:
+            pass
+
+
+def _resolve_samples(
+    samples: Samples | None,
+    prepared: PreparedSource,
+    database: DatabaseConfig,
+) -> Samples:
+    if samples is not None:
+        return samples
+    root = prepared.staged_path if prepared.staged_path.exists() else prepared.published_path
+    workspace = ""
+    src = database.source
+    if isinstance(src, GitSourceConfig):
+        workspace = src.workspace_subdir or ""
+    elif isinstance(src, PackageSourceConfig):
+        # Staged package snapshot is already the src/ tree.
+        workspace = ""
+    return sample_current_tree(root, workspace_subdir=workspace)
+
+
+def _run_probes(
+    probes: object, samples: Samples, required_layers: Sequence[str]
+) -> None:
     runner = getattr(probes, "run_before_open", None)
     if callable(runner):
-        runner(samples)
-        return
-    verify_indexes(samples, probes)  # type: ignore[arg-type]
+        try:
+            runner(samples, required_layers=required_layers)
+            return
+        except TypeError:
+            runner(samples)
+            return
+    verify_indexes(samples, probes, required_layers=required_layers)  # type: ignore[arg-type]

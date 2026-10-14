@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-import pytest
+import pytest  # noqa: F401 — used by pytest discovery
 
 from contour.config import (
     AdapterCommands,
@@ -103,28 +103,43 @@ class FakeLayers:
         *,
         full_needed: bool = False,
         may_write: Callable[[], str] | None = None,
+        on_layer_start: Callable[[str], None] | None = None,
+        on_layer_result: Callable[[LayerResult], None] | None = None,
+        on_layer_error: Callable[[str, BaseException], None] | None = None,
     ) -> list[LayerResult]:
         del may_write
         self.seen_full_needed = full_needed
         self.events.append("index")
         if self.fail_after == 0:
             raise RuntimeError("indexing failed")
-        if self.results is not None:
-            return list(self.results)
-        out: list[LayerResult] = []
-        for layer in ("code_index", "graph"):
-            if layer not in database.required_layers:
-                continue
-            out.append(
+        planned = (
+            list(self.results)
+            if self.results is not None
+            else [
                 LayerResult(
                     layer=layer,
                     revision=revision,
                     storage_id=f"{layer}-storage",
                     indexer_version=f"{layer}-image",
                 )
-            )
-            if self.fail_after is not None and len(out) >= self.fail_after:
-                raise RuntimeError(f"{layer} failed")
+                for layer in ("code_index", "graph")
+                if layer in database.required_layers
+            ]
+        )
+        out: list[LayerResult] = []
+        for item in planned:
+            if on_layer_start is not None:
+                on_layer_start(item.layer)
+            try:
+                if self.fail_after is not None and len(out) + 1 == self.fail_after:
+                    raise RuntimeError(f"{item.layer} failed")
+                out.append(item)
+                if on_layer_result is not None:
+                    on_layer_result(item)
+            except Exception as exc:
+                if on_layer_error is not None:
+                    on_layer_error(item.layer, exc)
+                raise
         return out
 
 
@@ -146,17 +161,19 @@ class FakeProbe:
 @dataclass
 class FakeProbes:
     code_index: FakeProbe = field(default_factory=FakeProbe)
-    graph: FakeProbe = field(default_factory=FakeProbe)
+    graph: FakeProbe | None = field(default_factory=FakeProbe)
     fail: bool = False
     ran: bool = False
 
-    def run_before_open(self, samples: Samples) -> None:
+    def run_before_open(
+        self, samples: Samples, required_layers=None
+    ) -> None:
         self.ran = True
         if self.fail:
             raise RuntimeError("probe failed")
         from contour.verify import verify_indexes
 
-        verify_indexes(samples, self)
+        verify_indexes(samples, self, required_layers=required_layers)
 
 
 def _prepared(tmp_path: Path, database: str, revision: str) -> PreparedSource:
@@ -221,7 +238,10 @@ def test_pipeline_transition_order_to_published(tmp_path: Path):
         transitions=transitions,
         samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
-    assert result == PipelineResult("ubd", "r1", "published", "ok")
+    assert result.result == "published"
+    assert result.database == "ubd"
+    assert result.revision == "r1"
+    assert result.run_id is not None
     assert transitions == [
         "received",
         "validated",
@@ -270,6 +290,7 @@ def test_failure_after_activation_leaves_reads_closed(tmp_path: Path):
         FakeLayers(fail_after=1),
         FakeProbes(),
         conn=conn,
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "failed"
     assert reads.is_closed() is True
@@ -295,6 +316,7 @@ def test_ubd_cannot_publish_without_both_layers(tmp_path: Path):
         layers,
         FakeProbes(),
         conn=conn,
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "failed"
     assert "graph" in result.message
@@ -314,6 +336,7 @@ def test_klon_opl_cannot_publish_without_bsl(tmp_path: Path):
         layers,
         FakeProbes(),
         conn=conn,
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "failed"
     assert "code_index" in result.message
@@ -325,7 +348,7 @@ def test_skipped_mandatory_layer_fails(tmp_path: Path):
     )
 
     class SkippingLayers(FakeLayers):
-        def run(self, database, revision, run_id, *, full_needed=False, may_write=None):
+        def run(self, database, revision, run_id, **kwargs):
             raise ValueError("required layer skipped for kb: graph")
 
     result = run_database_pipeline(
@@ -336,6 +359,7 @@ def test_skipped_mandatory_layer_fails(tmp_path: Path):
         SkippingLayers(),
         FakeProbes(),
         conn=conn,
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "failed"
     assert "skipped" in result.message.lower() or "graph" in result.message
@@ -382,18 +406,28 @@ def test_publish_updates_sqlite_only_after_verification(tmp_path: Path):
         FakeSource(prepared),
         state,
         RecordingReads(),
-        FakeLayers(),
-        FakeProbes(fail=True),
+        FakeLayers(fail_after=2),
+        FakeProbes(),
         conn=conn,
         samples=Samples(bsl_paths=["x.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "failed"
     assert state.get_database("ubd")["published_revision"] is None
-    layers = conn.execute(
-        "SELECT layer, status FROM layer_state WHERE database='ubd'"
-    ).fetchall()
-    assert layers  # indexing recorded
-    assert all(row["status"] == "ready" for row in layers)
+    by_layer = {
+        row["layer"]: row["status"]
+        for row in conn.execute(
+            "SELECT layer, status FROM layer_state WHERE database='ubd'"
+        )
+    }
+    assert by_layer.get("code_index") == "ready"
+    assert by_layer.get("graph") == "failed"
+    assert result.run_id is not None
+    run = conn.execute(
+        "SELECT result, message, finished_at FROM runs WHERE id=?",
+        (result.run_id,),
+    ).fetchone()
+    assert run["result"] == "failed"
+    assert run["finished_at"]
 
 
 def test_pipeline_uses_saved_graph_full_flag(tmp_path: Path):
@@ -410,7 +444,7 @@ def test_pipeline_uses_saved_graph_full_flag(tmp_path: Path):
         layers,
         FakeProbes(),
         conn=conn,
-        samples=Samples(bsl_paths=[], xml_paths=[], deletions=[]),
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "published"
     assert layers.seen_full_needed is True

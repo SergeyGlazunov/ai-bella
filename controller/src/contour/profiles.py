@@ -115,6 +115,9 @@ def run_required_layers(
     only_layers: Sequence[str] | None = None,
     may_write: Callable[[], str] | None = None,
     full_needed: bool = False,
+    on_layer_start: Callable[[str], None] | None = None,
+    on_layer_result: Callable[[LayerResult], None] | None = None,
+    on_layer_error: Callable[[str, BaseException], None] | None = None,
 ) -> list[LayerResult]:
     """Run required layers in order, or fail if a required layer is skipped."""
     profile = profile_from_config(database)
@@ -132,13 +135,15 @@ def run_required_layers(
 
     results: list[LayerResult] = []
     for layer in profile.required_layers:
-        if layer == "code_index":
-            results.append(
-                run_bsl_layer(database, revision, run_id, conn, runner=runner)
-            )
-        elif layer == "graph":
-            results.append(
-                run_graph_layer(
+        if on_layer_start is not None:
+            on_layer_start(layer)
+        try:
+            if layer == "code_index":
+                item = run_bsl_layer(
+                    database, revision, run_id, conn, runner=runner
+                )
+            elif layer == "graph":
+                item = run_graph_layer(
                     database,
                     revision,
                     run_id,
@@ -147,9 +152,15 @@ def run_required_layers(
                     may_write=may_write,
                     full_needed=full_needed,
                 )
-            )
-        else:  # pragma: no cover - guarded by profile_from_config
-            raise ValueError(f"unsupported layer: {layer}")
+            else:  # pragma: no cover - guarded by profile_from_config
+                raise ValueError(f"unsupported layer: {layer}")
+        except Exception as exc:
+            if on_layer_error is not None:
+                on_layer_error(layer, exc)
+            raise
+        if on_layer_result is not None:
+            on_layer_result(item)
+        results.append(item)
     return results
 
 

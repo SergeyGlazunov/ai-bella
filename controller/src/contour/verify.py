@@ -183,32 +183,80 @@ def verify_layers_at_revision(
             )
 
 
-def verify_indexes(samples: Samples, probes: IndexProbes) -> None:
+def verify_run_layer_results(
+    results: Sequence[object],
+    required_layers: Sequence[str],
+    revision: str,
+) -> None:
+    """Gate publish on this run's layer results, ignoring stale SQLite rows."""
+    by_layer = {str(getattr(item, "layer")): item for item in results}
+    for layer in required_layers:
+        item = by_layer.get(layer)
+        if item is None:
+            raise RuntimeError(
+                f"required layer missing from this run: {layer}"
+            )
+        item_rev = str(getattr(item, "revision", "") or "")
+        if item_rev != revision:
+            raise RuntimeError(
+                f"required layer revision mismatch for {layer}: "
+                f"{item_rev!r} != {revision!r}"
+            )
+
+
+def verify_indexes(
+    samples: Samples,
+    probes: IndexProbes,
+    *,
+    required_layers: Sequence[str] | None = None,
+) -> None:
+    layers = (
+        frozenset(required_layers)
+        if required_layers is not None
+        else frozenset({"code_index", "graph"})
+    )
+    need_code = "code_index" in layers
+    need_graph = "graph" in layers
+    graph = getattr(probes, "graph", None)
+
     if samples.is_empty():
         if samples.integrity_unknown:
             raise RuntimeError(
                 "empty diff with unknown integrity is not success"
             )
-        if probes.code_index.status != "ready":
+        if need_code and probes.code_index.status != "ready":
             raise RuntimeError(
                 f"code_index probe not ready ({probes.code_index.status})"
             )
-        if probes.graph.status != "ready":
-            raise RuntimeError(f"graph probe not ready ({probes.graph.status})")
+        if need_graph:
+            if graph is None:
+                raise RuntimeError("graph probe required for this database")
+            if graph.status != "ready":
+                raise RuntimeError(f"graph probe not ready ({graph.status})")
         return
 
-    for path in samples.bsl_paths:
-        probes.code_index.check_bsl(path)
-        if getattr(probes.graph, "check_bsl_cmd", None):
-            probes.graph.check_bsl(path)
-    for path in samples.xml_paths:
-        probes.graph.check_xml(path)
+    if need_code:
+        for path in samples.bsl_paths:
+            probes.code_index.check_bsl(path)
+    if need_graph:
+        if graph is None:
+            raise RuntimeError("graph probe required for this database")
+        for path in samples.bsl_paths:
+            if getattr(graph, "check_bsl_cmd", None):
+                graph.check_bsl(path)
+        for path in samples.xml_paths:
+            graph.check_xml(path)
     for path in samples.deletions:
         if path.endswith(".bsl"):
-            probes.code_index.check_deletion(path)
-            probes.graph.check_deletion(path)
+            if need_code:
+                probes.code_index.check_deletion(path)
+            if need_graph and graph is not None:
+                graph.check_deletion(path)
         elif path.endswith(".xml"):
-            probes.graph.check_deletion(path)
+            if need_graph and graph is not None:
+                graph.check_deletion(path)
         else:
-            probes.code_index.check_deletion(path)
-            probes.graph.check_deletion(path)
+            if need_code:
+                probes.code_index.check_deletion(path)
+            if need_graph and graph is not None:
+                graph.check_deletion(path)

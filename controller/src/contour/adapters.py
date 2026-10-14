@@ -53,7 +53,7 @@ class CommandProbe:
 @dataclass
 class CommandProbes:
     code_index: CommandProbe
-    graph: CommandProbe
+    graph: CommandProbe | None = None
 
 
 class CommandEngine:
@@ -86,29 +86,43 @@ class CommandEngine:
         return int(getattr(result, "returncode", 1) or 0) == 0
 
 
-def build_probes(cfg, docker) -> CommandProbes:
+def build_probes(
+    cfg,
+    docker,
+    *,
+    required_layers: frozenset[str] | None = None,
+) -> CommandProbes:
     adapters = getattr(cfg, "adapters", None)
     if adapters is None:
         raise MissingAdapters("adapters section is required")
+    layers = required_layers or frozenset({"code_index", "graph"})
     code_raw = getattr(adapters, "code_index", None)
-    graph_raw = getattr(adapters, "graph", None)
-    if code_raw is None or graph_raw is None:
-        raise MissingAdapters("adapters.code_index and adapters.graph are required")
+    if "code_index" in layers and code_raw is None:
+        raise MissingAdapters("adapters.code_index is required")
     code_index = CommandProbe(
-        check_bsl_cmd=_require_cmd("code_index", "check_bsl", getattr(code_raw, "check_bsl", None)),
+        check_bsl_cmd=_require_cmd(
+            "code_index", "check_bsl", getattr(code_raw, "check_bsl", None)
+        ),
         check_deletion_cmd=_require_cmd(
             "code_index", "check_deletion", getattr(code_raw, "check_deletion", None)
         ),
         runner=docker,
     )
-    graph = CommandProbe(
-        check_bsl_cmd=getattr(graph_raw, "check_bsl", None),
-        check_xml_cmd=_require_cmd("graph", "check_xml", getattr(graph_raw, "check_xml", None)),
-        check_deletion_cmd=_require_cmd(
-            "graph", "check_deletion", getattr(graph_raw, "check_deletion", None)
-        ),
-        runner=docker,
-    )
+    graph = None
+    if "graph" in layers:
+        graph_raw = getattr(adapters, "graph", None)
+        if graph_raw is None:
+            raise MissingAdapters("adapters.graph is required")
+        graph = CommandProbe(
+            check_bsl_cmd=getattr(graph_raw, "check_bsl", None),
+            check_xml_cmd=_require_cmd(
+                "graph", "check_xml", getattr(graph_raw, "check_xml", None)
+            ),
+            check_deletion_cmd=_require_cmd(
+                "graph", "check_deletion", getattr(graph_raw, "check_deletion", None)
+            ),
+            runner=docker,
+        )
     return CommandProbes(code_index=code_index, graph=graph)
 
 
