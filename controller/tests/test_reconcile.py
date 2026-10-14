@@ -37,29 +37,49 @@ def _now(hour: int, minute: int = 0) -> datetime:
 def _make_config(
     tmp_path: Path, drop_adapters: bool = False, **schedule_overrides: object
 ) -> Config:
+    """Build schema_version=1 UBD config for legacy reconcile contract tests.
+
+    Multi-db v2 coverage lives in test_reconcile_multidb.py. Task 8 routes v2
+    through a separate loop; these tests must stay on the historical path.
+    """
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    raw["schedule"].update(schedule_overrides)
     ubd = raw["databases"]["ubd"]
     toml_path = tmp_path / "daemon.toml"
     toml_path.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
     assert toml_path.resolve() != LIVE_DAEMON.resolve()
-    ubd["services"]["bsl_daemon_toml"] = str(toml_path)
+    services = dict(ubd["services"])
+    services["bsl_daemon_toml"] = str(toml_path)
     compose_dir = tmp_path / "compose"
     compose_dir.mkdir()
     (compose_dir / "docker-compose.yml").write_text(
         "services:\n  metadata-indexer:\n    image: alpine\n",
         encoding="utf-8",
     )
-    ubd["services"]["graph_compose_dir"] = str(compose_dir)
+    services["graph_compose_dir"] = str(compose_dir)
     repo = tmp_path / "ubd"
     repo.mkdir()
     assert repo.resolve() != LIVE_REPO.resolve()
-    ubd["source"]["path"] = str(repo)
-    if drop_adapters:
-        # Force Contour.adapters=None while keeping per-DB adapters valid for schema v2.
-        raw["adapters"] = None
+    schedule = dict(raw["schedule"])
+    schedule.update(schedule_overrides)
+    adapters = None if drop_adapters else ubd.get("adapters")
+    legacy = {
+        "schema_version": 1,
+        "repo": {
+            "path": str(repo),
+            "remote": ubd["source"]["remote"],
+            "branch": ubd["source"]["branch"],
+            "workspace_subdir": ubd["source"].get("workspace_subdir") or "src",
+        },
+        "schedule": schedule,
+        "alert": raw["alert"],
+        "services": services,
+        "storage": ubd["storage"],
+        "features": {"graph": True, "code_index": True, "mdd": False},
+    }
+    if adapters is not None:
+        legacy["adapters"] = adapters
     cfg_path = tmp_path / "contour.yaml"
-    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg_path.write_text(yaml.dump(legacy, sort_keys=False), encoding="utf-8")
     return load_config(str(cfg_path))
 
 

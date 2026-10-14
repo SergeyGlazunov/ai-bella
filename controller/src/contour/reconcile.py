@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 from contour import alert as alert_mod
 from contour import dockerutil, gitutil
 from contour.adapters import MissingAdapters, build_probes, require_idle_adapter
+from contour.config import DatabaseConfig, GitSourceConfig, enabled_databases
 from contour.db import get_component, get_meta, init_db, set_meta
 from contour.index_bsl import index_bsl
 from contour.index_graph import copy_job_logs, index_graph
@@ -23,6 +25,7 @@ from contour.reads import (
     wait_server_idle,
 )
 from contour.schedule import duration_warn_seconds, may_write, remaining_write_seconds
+from contour.state import StateStore
 from contour.verify import (
     Samples,
     SubprocessGitDiffRunner,
@@ -35,11 +38,87 @@ from contour.watch_bsl import pause_watch, restore_watch, watch_is_paused
 DEFAULT_DB = "/srv/ai/state.db"
 DEFAULT_LOCK = "/srv/ai/sync.lock"
 
+DatabaseRunner = Callable[..., str]
+
 
 @dataclass(frozen=True)
 class RuntimePaths:
     db_path: str
     lock_path: str
+
+
+def resolve_runtime_paths(
+    cfg,
+    *,
+    paths: RuntimePaths | None = None,
+    db_path: str | None = None,
+    lock_path: str | None = None,
+) -> RuntimePaths:
+    """Resolve SQLite/lock paths without letting empty CLI defaults win.
+
+    Priority: explicit ``paths`` → explicit ``db_path``/``lock_path`` kwargs →
+    ``cfg.runtime`` → legacy defaults.
+    """
+    if paths is not None:
+        return paths
+    runtime = getattr(cfg, "runtime", None)
+    resolved_db = db_path
+    resolved_lock = lock_path
+    if resolved_db is None:
+        resolved_db = runtime.db_path if runtime is not None else DEFAULT_DB
+    if resolved_lock is None:
+        resolved_lock = runtime.lock_path if runtime is not None else DEFAULT_LOCK
+    return RuntimePaths(db_path=resolved_db, lock_path=resolved_lock)
+
+
+def aggregate_database_results(results: Sequence[tuple[str, str]]) -> str:
+    """Combine per-database outcomes: any failed → failed; else deferred; else success."""
+    statuses = [status for _name, status in results]
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if any(status == "deferred" for status in statuses):
+        return "deferred"
+    return "success"
+
+
+def select_databases(
+    cfg, database: str | None = None
+) -> list[DatabaseConfig]:
+    """Enabled databases in YAML order, optionally filtered to one name."""
+    databases = cfg.databases or {}
+    if database is not None:
+        selected = databases.get(database)
+        if selected is None:
+            raise ValueError(f"unknown database: {database}")
+        if not selected.enabled:
+            raise ValueError(f"database disabled: {database}")
+        return [selected]
+    return list(enabled_databases(cfg).values())
+
+
+def _normalize_db_result(status: str) -> str:
+    if status == "published":
+        return "success"
+    return status
+
+
+def _source_kind(database: DatabaseConfig) -> str:
+    return "git" if isinstance(database.source, GitSourceConfig) else "package"
+
+
+def _default_v2_database_runner(
+    database: DatabaseConfig,
+    *,
+    cfg,
+    conn: sqlite3.Connection,
+    state: StateStore,
+    **kwargs,
+) -> str:
+    del cfg, conn, state, kwargs
+    raise RuntimeError(
+        f"v2 database runner is not wired for {database.name}; "
+        "Task 8 later blocks provide the production runner"
+    )
 
 
 class _GitutilOps:
@@ -742,12 +821,13 @@ def reconcile(
     alert_send=None,
     watch_reload=None,
     probes=None,
+    database: str | None = None,
+    database_runner: DatabaseRunner | None = None,
 ) -> str:
     if timer:
         measure = False
-    runtime = paths or RuntimePaths(
-        db_path=db_path or DEFAULT_DB,
-        lock_path=lock_path or DEFAULT_LOCK,
+    runtime = resolve_runtime_paths(
+        cfg, paths=paths, db_path=db_path, lock_path=lock_path
     )
     git = git if git is not None else _GitutilOps()
     docker = docker if docker is not None else _Engine()
@@ -760,9 +840,31 @@ def reconcile(
     if held is None:
         return "deferred"
 
-    conn = init_db(runtime.db_path)
-    try:
-        with held:
+    # Always enter the lock context so init_db failures still release it.
+    with held:
+        try:
+            conn = init_db(runtime.db_path)
+        except Exception:
+            raise
+        try:
+            if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
+                return _reconcile_v2_locked(
+                    cfg,
+                    conn,
+                    timer=timer,
+                    measure=measure,
+                    clock=clock,
+                    docker=docker,
+                    git=git,
+                    send=send,
+                    reload_fn=reload_fn,
+                    probes=probes,
+                    database=database,
+                    database_runner=database_runner,
+                )
+            if database is not None:
+                send(cfg, f"database filter requires schema_version 2: {database}")
+                return "failed"
             return _reconcile_locked(
                 cfg,
                 conn,
@@ -775,8 +877,66 @@ def reconcile(
                 reload_fn=reload_fn,
                 probes=probes,
             )
-    finally:
-        conn.close()
+        finally:
+            conn.close()
+
+
+def _reconcile_v2_locked(
+    cfg,
+    conn: sqlite3.Connection,
+    *,
+    timer: bool,
+    measure: bool,
+    clock,
+    docker,
+    git,
+    send,
+    reload_fn,
+    probes,
+    database: str | None,
+    database_runner: DatabaseRunner | None,
+) -> str:
+    del timer, measure, clock, git, reload_fn, probes  # wired in later Task 8 blocks
+    state = StateStore(conn)
+    try:
+        selected = select_databases(cfg, database)
+    except ValueError as exc:
+        send(cfg, str(exc))
+        return "failed"
+
+    try:
+        dockerutil.ping(runner=docker)
+    except Exception as exc:
+        send(cfg, f"docker ping hung or failed: {exc}")
+        return "failed"
+
+    runner = database_runner or _default_v2_database_runner
+    outcomes: list[tuple[str, str]] = []
+    for db in selected:
+        state.register_database(db.name, _source_kind(db))
+        try:
+            status = runner(
+                db,
+                cfg=cfg,
+                conn=conn,
+                state=state,
+                docker=docker,
+                send=send,
+            )
+            status = _normalize_db_result(str(status))
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            send(cfg, f"{db.name}: {message}")
+            # External loop owns the attempt record when the runner did not.
+            try:
+                run_id = state.start_run(db.name, "(pending)")
+                state.finish_run(run_id, "failed", message)
+            except Exception:
+                pass
+            status = "failed"
+        outcomes.append((db.name, status))
+
+    return aggregate_database_results(outcomes)
 
 
 def _maybe_duration_warn(cfg, conn: sqlite3.Connection, started: float, send) -> None:
