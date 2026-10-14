@@ -8,7 +8,7 @@ from typing import Any
 from contour import dockerutil
 from contour.config import VALID_LAYERS, DatabaseConfig
 from contour.dockerutil import DockerRunner
-from contour.index_bsl import index_bsl
+from contour.index_bsl import index_bsl, should_resume_bsl_stages
 from contour.index_graph import index_graph
 
 # Stable execution order for required layers.
@@ -52,7 +52,17 @@ def run_bsl_layer(
 ) -> LayerResult:
     """Run the code_index layer for ``database`` and return a verified result."""
     _ensure_run_revision(conn, run_id, database.name, revision)
-    index_bsl(database, conn, run_id, runner=runner, may_write=may_write)
+    resume = should_resume_bsl_stages(
+        database, conn, revision=revision, runner=runner
+    )
+    index_bsl(
+        database,
+        conn,
+        run_id,
+        runner=runner,
+        may_write=may_write,
+        resume=resume,
+    )
     storage_id = dockerutil.volume_identity(
         database.storage.code_index_volume, runner=runner
     )

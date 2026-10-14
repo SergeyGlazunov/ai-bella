@@ -392,6 +392,8 @@ def _docker_api_json(
     body: dict | None,
     runner: DockerRunner,
 ) -> dict:
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     api_fn = getattr(runner, "docker_api", None)
     if callable(api_fn):
         payload = api_fn(method, path, body)
@@ -400,15 +402,17 @@ def _docker_api_json(
         return payload
 
     sock_path = "/var/run/docker.sock"
+    budget = DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds
 
     class UnixHTTPConnection(http.client.HTTPConnection):
         def connect(self) -> None:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(budget)
             self.sock.connect(sock_path)
 
     data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"} if body is not None else {}
-    conn = UnixHTTPConnection("localhost")
+    conn = UnixHTTPConnection("localhost", timeout=budget)
     try:
         conn.request(method, path, body=data, headers=headers)
         response = conn.getresponse()

@@ -25,20 +25,21 @@ def _render(command: list[str], path: str) -> list[str]:
 
 
 def profile_adapter_env(database) -> dict[str, str]:
-    """Environment so idle/probe scripts target this profile's containers."""
+    """Environment so idle/probe scripts target this profile's containers.
+
+    ``NEO4J_CONTAINER`` is set only from explicit ``services.neo4j_container``.
+    It is never invented from ``storage.graph_volume``. When unset, the process
+    environment / script default remains in effect.
+    """
     env: dict[str, str] = {}
     services = getattr(database, "services", None)
     if services is not None:
         bsl = getattr(services, "bsl_container", None) or ""
         if bsl:
             env["BSL_CONTAINER"] = str(bsl)
-    storage = getattr(database, "storage", None)
-    if storage is not None:
-        graph_vol = (getattr(storage, "graph_volume", None) or "").strip()
-        if graph_vol:
-            neo = graph_vol[:-5] if graph_vol.endswith("-data") else graph_vol
-            if neo:
-                env["NEO4J_CONTAINER"] = neo
+        neo = getattr(services, "neo4j_container", None) or ""
+        if str(neo).strip():
+            env["NEO4J_CONTAINER"] = str(neo).strip()
     return env
 
 

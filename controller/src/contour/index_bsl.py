@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
+from contour import dockerutil
 from contour.dockerutil import (
     DockerRunner,
     SubprocessRunner,
@@ -144,6 +145,65 @@ def _stage_succeeded_for_revision(
     return row is not None
 
 
+def should_resume_bsl_stages(
+    cfg,
+    conn: sqlite3.Connection,
+    *,
+    revision: str,
+    runner: DockerRunner | None = None,
+) -> bool:
+    """Resume unfinished stages only when live storage still matches the attempt.
+
+    ``applied_revision`` stays on the last successful publish while status is
+    building/failed (Task 3). Resume is allowed when:
+    - layer is building/failed (interrupted attempt), and
+    - applied is empty (never succeeded) or equals this revision, and
+    - recorded storage/image is empty or matches live identity.
+
+    Historical ok jobs on a recreated volume must not suppress rebuild.
+    """
+    database = getattr(cfg, "name", None) or "ubd"
+    row = conn.execute(
+        """
+        SELECT status, applied_revision, storage_id, indexer_version
+        FROM layer_state
+        WHERE database = ? AND layer = 'code_index'
+        """,
+        (str(database),),
+    ).fetchone()
+    if row is None:
+        return False
+    status = str(row["status"] or "")
+    if status not in {"building", "failed"}:
+        return False
+    applied = str(row["applied_revision"] or "")
+    # building r2 while applied is still r1 → new revision, not resume of r1 jobs.
+    if applied and applied != revision:
+        return False
+    docker = _runner(runner)
+    try:
+        # Call through the module so tests can patch dockerutil.volume_identity.
+        live_storage = dockerutil.volume_identity(
+            cfg.storage.code_index_volume, runner=docker
+        )
+        live_image = dockerutil.image_id(
+            cfg.services.bsl_container, runner=docker
+        )
+    except Exception:
+        # Unknown identity → do not skip; rebuild rather than assume resume.
+        return False
+    stored = row["storage_id"]
+    stored_image = row["indexer_version"]
+    if stored in (None, ""):
+        # Interrupted before first successful identity — resume stages.
+        return True
+    if str(stored) != live_storage:
+        return False
+    if stored_image not in (None, "") and str(stored_image) != live_image:
+        return False
+    return True
+
+
 def index_bsl(
     cfg,
     conn: sqlite3.Connection,
@@ -151,12 +211,22 @@ def index_bsl(
     *,
     runner: DockerRunner | None = None,
     may_write=None,
+    resume: bool | None = None,
 ) -> None:
     docker = _runner(runner)
     database = _database_for_run(cfg, conn, run_id)
     revision = _run_revision(conn, run_id)
-    if revision is None or not _stage_succeeded_for_revision(
-        conn, database, "bsl_index", revision
+    if resume is None:
+        resume = bool(
+            revision
+            and should_resume_bsl_stages(
+                cfg, conn, revision=revision, runner=docker
+            )
+        )
+    if not (
+        resume
+        and revision is not None
+        and _stage_succeeded_for_revision(conn, database, "bsl_index", revision)
     ):
         _run_exec(
             cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker
@@ -167,8 +237,10 @@ def index_bsl(
             from contour.runtime_policy import WriteWindowClosed
 
             raise WriteWindowClosed(str(decision))
-    if revision is None or not _stage_succeeded_for_revision(
-        conn, database, "bsl_clean", revision
+    if not (
+        resume
+        and revision is not None
+        and _stage_succeeded_for_revision(conn, database, "bsl_clean", revision)
     ):
         _run_exec(
             cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker

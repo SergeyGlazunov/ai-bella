@@ -157,15 +157,24 @@ class StateStore:
             now = _utc_now()
             prior = self._conn.execute(
                 """
-                SELECT applied_revision FROM layer_state
+                SELECT applied_revision, storage_id, indexer_version
+                FROM layer_state
                 WHERE database = ? AND layer = ?
                 """,
                 (database, layer),
             ).fetchone()
+            keep_storage = storage_id
+            keep_version = indexer_version
             if status in _LAYER_SUCCESS:
                 applied = revision
             elif prior is not None:
+                # building/failed keep last successful applied_revision (Task 3).
                 applied = prior["applied_revision"]
+                # Preserve identity so resume can tell same volume from rebuild.
+                if keep_storage is None:
+                    keep_storage = prior["storage_id"]
+                if keep_version is None:
+                    keep_version = prior["indexer_version"]
             else:
                 applied = None
             self._conn.execute(
@@ -186,8 +195,8 @@ class StateStore:
                     layer,
                     status,
                     applied,
-                    storage_id,
-                    indexer_version,
+                    keep_storage,
+                    keep_version,
                     now,
                 ),
             )

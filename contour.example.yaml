@@ -42,6 +42,10 @@ databases:
       graph_project: ai2-mcp-ubd
       graph_service: metadata-indexer
       graph_mcp: mcp-metadata-graph
+      # Neo4j container for probe_graph.sh (NEO4J_CONTAINER). Required per DB when
+      # graph probes run; not derived from storage.graph_volume. Set the real
+      # compose service/container name on the stand (do not guess from the volume).
+      neo4j_container: ""
       bsl_compose_dir: /srv/ai-contour/compose/bsl-ubd
       bsl_project: ai2-bsl-ubd
       bsl_container: bsl-indexer
@@ -89,6 +93,7 @@ databases:
       graph_project: ai2-mcp-kb
       graph_service: metadata-indexer
       graph_mcp: mcp-graph-kb
+      neo4j_container: ""
       bsl_compose_dir: /srv/ai-contour/compose/bsl-kb
       bsl_project: ai2-bsl-kb
       bsl_container: bsl-kb
@@ -137,6 +142,7 @@ databases:
       graph_project: ""
       graph_service: ""
       graph_mcp: ""
+      neo4j_container: ""
       bsl_compose_dir: /srv/ai-contour/compose/bsl-klon-opl
       bsl_project: ai2-bsl-klon-opl
       bsl_container: bsl-klon-opl

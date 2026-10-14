@@ -118,6 +118,8 @@ class ServicesConfig:
     bsl_publish_port: int
     bsl_daemon_toml: str
     webui_network: str
+    # Explicit Neo4j container for probe_graph.sh — not derived from graph_volume.
+    neo4j_container: str = ""
 
 
 @dataclass(frozen=True)
@@ -273,6 +275,7 @@ def _parse_alert(alert_raw: dict[str, Any]) -> AlertConfig:
 
 
 def _parse_services(services_raw: dict[str, Any]) -> ServicesConfig:
+    neo = services_raw.get("neo4j_container", "")
     return ServicesConfig(
         graph_compose_dir=str(services_raw["graph_compose_dir"]),
         graph_project=str(services_raw["graph_project"]),
@@ -284,6 +287,7 @@ def _parse_services(services_raw: dict[str, Any]) -> ServicesConfig:
         bsl_publish_port=int(services_raw["bsl_publish_port"]),
         bsl_daemon_toml=str(services_raw["bsl_daemon_toml"]),
         webui_network=str(services_raw["webui_network"]),
+        neo4j_container=str(neo or "").strip(),
     )
 
 

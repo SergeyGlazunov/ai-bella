@@ -146,9 +146,18 @@ def _log_directory() -> Path:
 
 
 def copy_job_logs(docker: DockerRunner, container_id: str) -> str | None:
-    """Write container logs under /srv/ai/logs if it exists, else tempfile."""
+    """Write container logs under /srv/ai/logs if it exists, else tempfile.
+
+    Bounded by the docker command timeout. Failure returns None without
+    affecting the caller's job exit_code.
+    """
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     try:
-        result = docker.run(["docker", "logs", container_id])
+        result = docker.run(
+            ["docker", "logs", container_id],
+            timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+        )
     except Exception:
         return None
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in container_id)
