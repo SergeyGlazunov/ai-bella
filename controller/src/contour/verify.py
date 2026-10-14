@@ -120,9 +120,44 @@ def sample_paths(
 
 
 def sample_current_tree(
-    repo: str | Path, *, workspace_subdir: str = "", limit: int = 32
+    repo: str | Path,
+    *,
+    workspace_subdir: str = "",
+    limit: int = 32,
+    required_layers: Sequence[str] | None = None,
+    bsl_limit: int | None = None,
+    xml_limit: int | None = None,
 ) -> Samples:
-    """Recovery samples from working tree under workspace_subdir (capped)."""
+    """Recovery samples from working tree under workspace_subdir (capped).
+
+    Limits for BSL and XML are independent so XML-heavy trees cannot starve the
+    BSL probe required by ``code_index``. Unused layer types get a zero quota
+    (e.g. klon_opl does not spend budget on XML).
+    """
+    layers = (
+        frozenset(required_layers)
+        if required_layers is not None
+        else frozenset({"code_index", "graph"})
+    )
+    want_bsl = "code_index" in layers or "graph" in layers
+    want_xml = "graph" in layers
+    if bsl_limit is not None:
+        max_bsl = bsl_limit
+    elif want_bsl and want_xml:
+        max_bsl = max(1, limit // 2)
+    elif want_bsl:
+        max_bsl = limit
+    else:
+        max_bsl = 0
+    if xml_limit is not None:
+        max_xml = xml_limit
+    elif want_bsl and want_xml:
+        max_xml = max(1, limit // 2)
+    elif want_xml:
+        max_xml = limit
+    else:
+        max_xml = 0
+
     root = Path(repo)
     sub = (workspace_subdir or "").replace("\\", "/").strip().strip("/")
     walk = root / sub if sub else root
@@ -136,11 +171,13 @@ def sample_current_tree(
             if ".git" in rel.parts:
                 continue
             posix = rel.as_posix()
-            if posix.endswith(".bsl"):
+            if posix.endswith(".bsl") and len(bsl_paths) < max_bsl:
                 bsl_paths.append(posix)
-            elif posix.endswith(".xml"):
+            elif posix.endswith(".xml") and len(xml_paths) < max_xml:
                 xml_paths.append(posix)
-            if len(bsl_paths) + len(xml_paths) >= limit:
+            bsl_done = len(bsl_paths) >= max_bsl
+            xml_done = len(xml_paths) >= max_xml
+            if bsl_done and xml_done:
                 break
     return Samples(
         bsl_paths=bsl_paths,
@@ -204,6 +241,22 @@ def verify_run_layer_results(
             )
 
 
+def _verify_empty_layer_status(
+    probes: IndexProbes, *, need_code: bool, need_graph: bool
+) -> None:
+    """Explicit empty-index contract: status must be ready, probes are not skipped."""
+    if need_code and probes.code_index.status != "ready":
+        raise RuntimeError(
+            f"code_index probe not ready ({probes.code_index.status})"
+        )
+    if need_graph:
+        graph = getattr(probes, "graph", None)
+        if graph is None:
+            raise RuntimeError("graph probe required for this database")
+        if graph.status != "ready":
+            raise RuntimeError(f"graph probe not ready ({graph.status})")
+
+
 def verify_indexes(
     samples: Samples,
     probes: IndexProbes,
@@ -224,39 +277,59 @@ def verify_indexes(
             raise RuntimeError(
                 "empty diff with unknown integrity is not success"
             )
-        if need_code and probes.code_index.status != "ready":
-            raise RuntimeError(
-                f"code_index probe not ready ({probes.code_index.status})"
-            )
-        if need_graph:
-            if graph is None:
-                raise RuntimeError("graph probe required for this database")
-            if graph.status != "ready":
-                raise RuntimeError(f"graph probe not ready ({graph.status})")
+        _verify_empty_layer_status(probes, need_code=need_code, need_graph=need_graph)
         return
+
+    code_checked = False
+    graph_checked = False
 
     if need_code:
         for path in samples.bsl_paths:
             probes.code_index.check_bsl(path)
+            code_checked = True
     if need_graph:
         if graph is None:
             raise RuntimeError("graph probe required for this database")
         for path in samples.bsl_paths:
             if getattr(graph, "check_bsl_cmd", None):
                 graph.check_bsl(path)
+                graph_checked = True
         for path in samples.xml_paths:
             graph.check_xml(path)
+            graph_checked = True
     for path in samples.deletions:
         if path.endswith(".bsl"):
             if need_code:
                 probes.code_index.check_deletion(path)
+                code_checked = True
             if need_graph and graph is not None:
                 graph.check_deletion(path)
+                graph_checked = True
         elif path.endswith(".xml"):
             if need_graph and graph is not None:
                 graph.check_deletion(path)
+                graph_checked = True
         else:
             if need_code:
                 probes.code_index.check_deletion(path)
+                code_checked = True
             if need_graph and graph is not None:
                 graph.check_deletion(path)
+                graph_checked = True
+
+    # Missing suitable samples for a required layer is not silent success:
+    # use the explicit empty-index status contract instead.
+    if need_code and not code_checked:
+        if probes.code_index.status != "ready":
+            raise RuntimeError(
+                f"code_index probe not ready ({probes.code_index.status}); "
+                "no BSL samples were available to check"
+            )
+    if need_graph and not graph_checked:
+        if graph is None:
+            raise RuntimeError("graph probe required for this database")
+        if graph.status != "ready":
+            raise RuntimeError(
+                f"graph probe not ready ({graph.status}); "
+                "no Graph samples were available to check"
+            )

@@ -111,7 +111,7 @@ def run_database_pipeline(
     name = database.name
     revision = ""
     activated = False
-    closed_by_this_run = False
+    close_attempted = False
     run_id: int | None = None
     log = transitions if transitions is not None else []
     reads_closed_on_entry = True
@@ -137,8 +137,10 @@ def run_database_pipeline(
         state.record_staged(name, revision)
         note("staged")
 
+        # Mark attempt before close(): partial apply_close may leave reads
+        # unavailable even when the call raises.
+        close_attempted = True
         reads.close()
-        closed_by_this_run = True
         note("reads_closed")
 
         activate_source(prepared, prepared.published_path)
@@ -178,7 +180,9 @@ def run_database_pipeline(
         # Publish gate uses this run's results only — not stale ready rows.
         verify_run_layer_results(results, profile.required_layers, revision)
 
-        probe_samples = _resolve_samples(samples, prepared, database)
+        probe_samples = _resolve_samples(
+            samples, prepared, database, profile.required_layers
+        )
         _run_probes(probes, probe_samples, profile.required_layers)
         note("verified")
 
@@ -196,9 +200,10 @@ def run_database_pipeline(
             return PipelineResult(
                 name, revision or "unknown", "failed", message, run_id=run_id
             )
-        # Pre-activation failure: reopen only if THIS attempt closed previously
-        # open reads. Do not clear a close left by an unfinished earlier run.
-        if closed_by_this_run and reads_closed_on_entry is False:
+        # Pre-activation failure: reopen only if THIS attempt touched previously
+        # open reads (including partial close). Do not clear a close left by an
+        # unfinished earlier run, and do not open when entry state was unknown.
+        if close_attempted and reads_closed_on_entry is False:
             try:
                 reads.open()
             except Exception as open_exc:
@@ -227,6 +232,7 @@ def _resolve_samples(
     samples: Samples | None,
     prepared: PreparedSource,
     database: DatabaseConfig,
+    required_layers: Sequence[str],
 ) -> Samples:
     if samples is not None:
         return samples
@@ -238,7 +244,11 @@ def _resolve_samples(
     elif isinstance(src, PackageSourceConfig):
         # Staged package snapshot is already the src/ tree.
         workspace = ""
-    return sample_current_tree(root, workspace_subdir=workspace)
+    return sample_current_tree(
+        root,
+        workspace_subdir=workspace,
+        required_layers=required_layers,
+    )
 
 
 def _run_probes(

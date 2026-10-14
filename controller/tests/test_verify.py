@@ -192,6 +192,51 @@ def test_sample_current_tree_empty_unknown_fails(tmp_path: Path):
         verify_indexes(samples, probes)
 
 
+def test_sample_current_tree_separate_limits_keep_bsl(tmp_path: Path):
+    repo = tmp_path / "mixed"
+    repo.mkdir()
+    for i in range(32):
+        (repo / f"A{i:03d}.xml").write_text("<x/>", encoding="utf-8")
+    (repo / "ZModule.bsl").write_text("// z", encoding="utf-8")
+    samples = sample_current_tree(
+        repo, required_layers=("code_index", "graph"), limit=32
+    )
+    assert "ZModule.bsl" in samples.bsl_paths
+    assert len(samples.xml_paths) == 16
+
+
+def test_sample_current_tree_code_index_only_ignores_xml_quota(tmp_path: Path):
+    repo = tmp_path / "opl"
+    repo.mkdir()
+    for i in range(40):
+        (repo / f"A{i:03d}.xml").write_text("<x/>", encoding="utf-8")
+    (repo / "ZModule.bsl").write_text("// z", encoding="utf-8")
+    samples = sample_current_tree(
+        repo, required_layers=("code_index",), limit=32
+    )
+    assert samples.bsl_paths == ["ZModule.bsl"]
+    assert samples.xml_paths == []
+
+
+def test_verify_indexes_xml_only_uses_empty_code_contract():
+    samples = Samples(
+        bsl_paths=[],
+        xml_paths=["a.xml"],
+        deletions=[],
+        integrity_unknown=False,
+    )
+    code = FakeProbe(status="not_ready")
+    graph = FakeProbe(status="ready")
+    with pytest.raises(RuntimeError, match="(?i)code_index|no BSL"):
+        verify_indexes(
+            samples,
+            FakeProbes(code_index=code, graph=graph),
+            required_layers=("code_index", "graph"),
+        )
+    assert code.bsl_checked == []
+    assert graph.xml_checked == ["a.xml"]
+
+
 def test_verify_layers_at_revision_requires_ready_layers(tmp_path: Path):
     conn = init_db(str(tmp_path / "state.db"))
     conn.execute(
