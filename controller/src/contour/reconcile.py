@@ -12,7 +12,12 @@ from pathlib import Path
 from contour import alert as alert_mod
 from contour import dockerutil, gitutil
 from contour.adapters import MissingAdapters, build_probes, require_idle_adapter
-from contour.config import DatabaseConfig, GitSourceConfig, enabled_databases
+from contour.config import (
+    DatabaseConfig,
+    GitSourceConfig,
+    PackageSourceConfig,
+    enabled_databases,
+)
 from contour.db import get_component, get_meta, init_db, set_meta
 from contour.index_bsl import index_bsl
 from contour.index_graph import (
@@ -103,28 +108,39 @@ def format_nightly_alert(
         ).fetchone()
         run = conn.execute(
             """
-            SELECT target_revision, result, message FROM runs
+            SELECT id, target_revision, result, message FROM runs
             WHERE database = ? ORDER BY id DESC LIMIT 1
             """,
             (name,),
         ).fetchone()
-        job = conn.execute(
-            """
-            SELECT stage, log_path FROM jobs
-            WHERE database = ? ORDER BY id DESC LIMIT 1
-            """,
-            (name,),
-        ).fetchone()
-        stage = (job["stage"] if job is not None else None) or (
-            row["lifecycle_status"] if row is not None else "?"
-        )
-        revision = (run["target_revision"] if run is not None else None) or (
-            row["published_revision"] if row is not None else None
-        ) or "?"
+        job = None
+        if run is not None:
+            job = conn.execute(
+                """
+                SELECT stage, log_path FROM jobs
+                WHERE database = ? AND run_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (name, int(run["id"])),
+            ).fetchone()
         reason = (run["message"] if run is not None else None) or (
             row["detail"] if row is not None else None
         ) or status
-        log_path = (job["log_path"] if job is not None else None) or "(log unavailable)"
+        if job is not None:
+            stage = str(job["stage"] or "?")
+            log_path = str(job["log_path"] or "(log unavailable)")
+        else:
+            # Prefer explicit stage= from the run message over a stale job.
+            stage = "?"
+            if isinstance(reason, str) and "stage=" in reason:
+                part = reason.split("stage=", 1)[1]
+                stage = part.split()[0].strip(",") or "?"
+            elif row is not None and row["lifecycle_status"]:
+                stage = str(row["lifecycle_status"])
+            log_path = "(log unavailable)"
+        revision = (run["target_revision"] if run is not None else None) or (
+            row["published_revision"] if row is not None else None
+        ) or "?"
         lines.append(
             f"- {name}: stage={stage} revision={revision} "
             f"result={status} reason={reason} log={log_path}"
@@ -132,6 +148,13 @@ def format_nightly_alert(
     if len(lines) == 1:
         lines.append("- (no failed/deferred databases)")
     return "\n".join(lines)
+
+
+def _safe_send(send, cfg, message: str) -> None:
+    try:
+        send(cfg, message)
+    except Exception:
+        pass
 
 
 def select_databases(
@@ -165,13 +188,99 @@ def _default_v2_database_runner(
     cfg,
     conn: sqlite3.Connection,
     state: StateStore,
+    docker=None,
+    send=None,
+    may_write=None,
+    watch_reload=None,
     **kwargs,
 ) -> str:
-    del cfg, conn, state, kwargs
-    raise RuntimeError(
-        f"v2 database runner is not wired for {database.name}; "
-        "Task 8 later blocks provide the production runner"
+    """Production path: package/git source → ReadController → pipeline."""
+    del kwargs
+    from contour.adapters import build_probes
+    from contour.index_graph import is_graph_full_needed
+    from contour.packages import (
+        PackageError,
+        choose_newest_valid_package,
+        claim_package,
+        validate_package,
     )
+    from contour.pipeline import ProfilesLayerRunner, run_database_pipeline
+    from contour.reads import DatabaseReadController
+    from contour.sources import (
+        build_source_provider,
+        published_path_for,
+        read_revision,
+    )
+
+    if isinstance(database.source, PackageSourceConfig):
+        chosen, warnings = choose_newest_valid_package(
+            Path(database.source.inbox), database.name
+        )
+        for item in warnings:
+            if send is not None:
+                _safe_send(send, cfg, f"{database.name}: package candidate: {item}")
+        if chosen is None:
+            run_id = state.start_run(database.name, "(pending)")
+            state.finish_run(run_id, "deferred", "no new package")
+            state.set_lifecycle(database.name, "deferred", detail="no new package")
+            return "deferred"
+        accepted_root = Path(cfg.runtime.root) / "accepted" / database.name
+        try:
+            claimed = claim_package(chosen, accepted_root)
+            package = validate_package(
+                claimed, frozenset({database.name})
+            )
+        except (PackageError, OSError) as exc:
+            raise RuntimeError(f"package claim failed: {exc}") from exc
+        published = published_path_for(database)
+        current = read_revision(published) if published.is_dir() else None
+        if (
+            current == package.revision
+            and not is_graph_full_needed(conn, database.name)
+        ):
+            layers_ok = True
+            for layer in database.required_layers:
+                row = conn.execute(
+                    """
+                    SELECT status, applied_revision FROM layer_state
+                    WHERE database = ? AND layer = ?
+                    """,
+                    (database.name, layer),
+                ).fetchone()
+                if (
+                    row is None
+                    or str(row["status"]) != "ready"
+                    or str(row["applied_revision"] or "") != package.revision
+                ):
+                    layers_ok = False
+                    break
+            if layers_ok:
+                run_id = state.start_run(database.name, package.revision)
+                state.finish_run(run_id, "deferred", "already published")
+                return "deferred"
+        provider = build_source_provider(database, cfg, package=package)
+    else:
+        provider = build_source_provider(database, cfg)
+
+    reload_fn = watch_reload if watch_reload is not None else (lambda: None)
+    reads = DatabaseReadController(
+        database, conn, docker, watch_reload=reload_fn
+    )
+    probes = build_probes(
+        database, docker, required_layers=frozenset(database.required_layers)
+    )
+    layers = ProfilesLayerRunner(conn=conn, docker_runner=docker, may_write=may_write)
+    result = run_database_pipeline(
+        database,
+        provider,
+        state,
+        reads,
+        layers,
+        probes,
+        conn=conn,
+        may_write=may_write,
+    )
+    return _normalize_db_result(result.result)
 
 
 class _GitutilOps:
@@ -319,8 +428,19 @@ def storage_volumes_for(database: DatabaseConfig) -> frozenset[str]:
     return frozenset(volumes)
 
 
+def writer_resource_keys(database: DatabaseConfig) -> frozenset[str]:
+    """Volumes and writer containers that must not host a second contour writer."""
+    keys: set[str] = set(storage_volumes_for(database))
+    layers = database.required_layers
+    if "code_index" in layers and database.services.bsl_container:
+        keys.add(f"bsl:{database.services.bsl_container}")
+    if "graph" in layers and database.services.graph_mcp:
+        keys.add(f"graph:{database.services.graph_mcp}")
+    return frozenset(keys)
+
+
 def databases_share_storage(left: DatabaseConfig, right: DatabaseConfig) -> bool:
-    return bool(storage_volumes_for(left) & storage_volumes_for(right))
+    return bool(writer_resource_keys(left) & writer_resource_keys(right))
 
 
 def storage_identity_changed(
@@ -897,15 +1017,26 @@ def reopen_reads(
     alert_send=None,
     git=None,
     probes=None,
+    database: str | None = None,
 ) -> str:
     """Operator reopen: open_reads + verify-open; clear flags only if verify succeeds."""
-    runtime = paths or RuntimePaths(
-        db_path=db_path or DEFAULT_DB,
-        lock_path=lock_path or DEFAULT_LOCK,
+    runtime = resolve_runtime_paths(
+        cfg, paths=paths, db_path=db_path, lock_path=lock_path
     )
     docker = docker if docker is not None else _Engine()
     reload_fn = watch_reload if watch_reload is not None else (lambda: None)
     send = alert_send if alert_send is not None else alert_mod.send
+
+    if int(getattr(cfg, "schema_version", 1) or 1) >= 2 and database is not None:
+        return _reopen_reads_v2_database(
+            cfg,
+            database=database,
+            runtime=runtime,
+            lock_backend=lock_backend,
+            docker=docker,
+            watch_reload=reload_fn,
+            send=send,
+        )
 
     held = acquire(runtime.lock_path, backend=lock_backend)
     if held is None:
@@ -954,6 +1085,55 @@ def reopen_reads(
             except Exception as exc:
                 send(cfg, f"reopen failed: {exc}")
                 _alert_if_reads_closed(cfg, conn, send)
+                return "failed"
+            return "success"
+    finally:
+        conn.close()
+
+
+def _reopen_reads_v2_database(
+    cfg,
+    *,
+    database: str,
+    runtime: RuntimePaths,
+    lock_backend,
+    docker,
+    watch_reload,
+    send,
+) -> str:
+    """Reopen one v2 database using its own services/layers (not primary UBD)."""
+    from contour.index_graph import is_graph_full_needed
+    from contour.reads import DatabaseReadController
+
+    try:
+        selected = select_databases(cfg, database)
+    except ValueError as exc:
+        _safe_send(send, cfg, str(exc))
+        return "failed"
+    db = selected[0]
+    held = acquire(runtime.lock_path, backend=lock_backend)
+    if held is None:
+        return "deferred"
+    conn = init_db(runtime.db_path)
+    try:
+        with held:
+            writer = reap_database_jobs(conn, db.name, docker)
+            if writer == "busy":
+                _safe_send(send, cfg, f"reopen refused: {db.name} indexer still running")
+                return "failed"
+            if writer == "unknown":
+                _safe_send(send, cfg, f"reopen refused: {db.name} writer state unknown")
+                return "failed"
+            if is_graph_full_needed(conn, db.name):
+                _safe_send(send, cfg, f"reopen refused: {db.name} graph FULL still needed")
+                return "failed"
+            ctrl = DatabaseReadController(
+                db, conn, docker, watch_reload=watch_reload
+            )
+            try:
+                ctrl.open()
+            except Exception as exc:
+                _safe_send(send, cfg, f"reopen failed for {db.name}: {exc}")
                 return "failed"
             return "success"
     finally:
@@ -1102,12 +1282,12 @@ def _reconcile_v2_locked(
     database: str | None,
     database_runner: DatabaseRunner | None,
 ) -> str:
-    del git, reload_fn, probes  # filled by the production runner in later wiring
+    del git, probes  # optional hooks for specialized runners
     state = StateStore(conn)
     try:
         selected = select_databases(cfg, database)
     except ValueError as exc:
-        send(cfg, str(exc))
+        _safe_send(send, cfg, str(exc))
         return "failed"
 
     try:
@@ -1116,7 +1296,7 @@ def _reconcile_v2_locked(
             timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
         )
     except Exception as exc:
-        send(cfg, f"docker ping hung or failed: {exc}")
+        _safe_send(send, cfg, f"docker ping hung or failed: {exc}")
         return "failed"
 
     runner = database_runner or _default_v2_database_runner
@@ -1128,27 +1308,35 @@ def _reconcile_v2_locked(
             now=clock(), cfg=cfg, is_timer=timer, measure=measure
         )
 
+    # Reap unfinished jobs for every selected database before the write gate so
+    # completed Docker work is recorded even outside the window.
     for db in selected:
         state.register_database(db.name, _source_kind(db))
+        try:
+            reap_database_jobs(conn, db.name, docker)
+        except Exception as exc:
+            _safe_send(send, cfg, f"{db.name}: reap failed: {exc}")
+
+    for db in selected:
         window = _fresh_may_write()
         if window != "ok":
             message = f"{db.name}: write window closed ({window})"
-            send(cfg, message)
             try:
                 run_id = state.start_run(db.name, "(pending)")
                 state.finish_run(run_id, "deferred", message)
             except Exception:
                 pass
+            _safe_send(send, cfg, message)
             outcomes.append((db.name, "deferred"))
             continue
         block = writer_blocks_database(conn, db, all_profiles, docker)
         if block is not None:
-            send(cfg, block)
             try:
                 run_id = state.start_run(db.name, "(pending)")
                 state.finish_run(run_id, "deferred", block)
             except Exception:
                 pass
+            _safe_send(send, cfg, block)
             outcomes.append((db.name, "deferred"))
             continue
         try:
@@ -1163,39 +1351,32 @@ def _reconcile_v2_locked(
                 timer=timer,
                 measure=measure,
                 clock=clock,
+                watch_reload=reload_fn,
             )
             status = _normalize_db_result(str(status))
         except WriterStillAlive as exc:
             message = str(exc) or "writer still alive"
-            send(cfg, f"{db.name}: {message}")
             try:
                 run_id = state.start_run(db.name, "(pending)")
                 state.finish_run(run_id, "deferred", message)
             except Exception:
                 pass
+            _safe_send(send, cfg, f"{db.name}: {message}")
             status = "deferred"
         except Exception as exc:
             message = str(exc) or exc.__class__.__name__
-            send(cfg, f"{db.name}: {message}")
-            # External loop owns the attempt record when the runner did not.
             try:
                 run_id = state.start_run(db.name, "(pending)")
                 state.finish_run(run_id, "failed", message)
             except Exception:
                 pass
+            _safe_send(send, cfg, f"{db.name}: {message}")
             status = "failed"
         outcomes.append((db.name, status))
 
     aggregate = aggregate_database_results(outcomes)
     if aggregate != "success":
-        try:
-            send(cfg, format_nightly_alert(conn, outcomes))
-        except Exception as alert_exc:
-            # Alert failure must not rewrite already persisted run results.
-            try:
-                send(cfg, f"alert send failed after aggregate={aggregate}: {alert_exc}")
-            except Exception:
-                pass
+        _safe_send(send, cfg, format_nightly_alert(conn, outcomes))
     return aggregate
 
 

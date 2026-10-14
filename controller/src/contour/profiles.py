@@ -48,10 +48,11 @@ def run_bsl_layer(
     run_id: int,
     conn: sqlite3.Connection,
     runner: DockerRunner | None = None,
+    may_write: Callable[[], str] | None = None,
 ) -> LayerResult:
     """Run the code_index layer for ``database`` and return a verified result."""
     _ensure_run_revision(conn, run_id, database.name, revision)
-    index_bsl(database, conn, run_id, runner=runner)
+    index_bsl(database, conn, run_id, runner=runner, may_write=may_write)
     storage_id = dockerutil.volume_identity(
         database.storage.code_index_volume, runner=runner
     )
@@ -149,7 +150,12 @@ def run_required_layers(
         try:
             if layer == "code_index":
                 item = run_bsl_layer(
-                    database, revision, run_id, conn, runner=runner
+                    database,
+                    revision,
+                    run_id,
+                    conn,
+                    runner=runner,
+                    may_write=may_write,
                 )
             elif layer == "graph":
                 item = run_graph_layer(

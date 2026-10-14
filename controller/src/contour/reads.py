@@ -208,15 +208,30 @@ class DatabaseReadController:
         }
         self.close_attempted = False
         self._watch_backup: str | None = None
+        self._migrate_legacy_ubd_flags()
+
+    def _migrate_legacy_ubd_flags(self) -> None:
+        """Copy legacy UBD global closed flag into per-layer keys once."""
+        if self.database.name != "ubd":
+            return
+        if get_meta(self.conn, "reads_closed") != "1":
+            return
+        for layer in self.required_layers:
+            key = scoped_read_key("reads_closed", "ubd", layer)
+            if get_meta(self.conn, key) != "1":
+                set_meta(self.conn, key, "1")
 
     def _layer_flag_closed(self, layer: str) -> bool:
         key = scoped_read_key("reads_closed", self.database.name, layer)
-        if get_meta(self.conn, key) == "1":
-            return True
-        # Legacy global flags apply only to UBD during v2 coexistence.
-        if self.database.name == "ubd" and get_meta(self.conn, "reads_closed") == "1":
-            return True
-        return False
+        return get_meta(self.conn, key) == "1"
+
+    def _clear_legacy_ubd_if_open(self) -> None:
+        if self.database.name != "ubd":
+            return
+        if any(self._layer_flag_closed(layer) for layer in self.required_layers):
+            return
+        set_meta(self.conn, "reads_closed", "")
+        set_meta(self.conn, "reads_close_requested", "")
 
     def is_closed(self, layer: str | None = None) -> bool:
         layers = (layer,) if layer is not None else self.required_layers
@@ -260,6 +275,10 @@ class DatabaseReadController:
             if status == "running":
                 self.docker.run(["docker", "stop", services.graph_mcp])
         elif layer == "code_index":
+            if not bool(self.docker.idle_probe()):
+                raise RuntimeError(
+                    f"bsl idle probe busy for {name}; refusing close/write"
+                )
             self._pause_watcher()
             self._try_firewall_drop()
             if services.webui_network in self._network_names():
@@ -309,6 +328,7 @@ class DatabaseReadController:
             raise ValueError(f"unknown layer: {layer}")
         set_meta(self.conn, scoped_read_key("reads_closed", name, layer), "")
         set_meta(self.conn, scoped_read_key("reads_close_requested", name, layer), "")
+        self._clear_legacy_ubd_if_open()
 
     def reopen_if_safe_after_pre_activation_failure(self) -> None:
         """Restore reads this attempt may have partially closed (pre-activation)."""
@@ -406,7 +426,9 @@ class DatabaseReadController:
         toml_path = self.database.services.bsl_daemon_toml
         path = Path(toml_path)
         if not path.is_file():
-            return
+            raise RuntimeError(
+                f"daemon.toml missing for {self.database.name}: {toml_path}"
+            )
         backup = toml_path + ".bak"
         if not Path(backup).is_file():
             shutil.copy2(path, backup)

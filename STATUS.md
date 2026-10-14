@@ -36,7 +36,7 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 | Python | 3.12.10 (`controller` venv; needs `tzdata` on Windows for tests) |
 | Docker Engine | via `DOCKER_HOST=tcp://127.0.0.1:2375` |
 | WSL | Ubuntu Running (v2) |
-| pytest | **273 passed, 6 skipped** (2026-10-14, Task 8 kit) |
+| pytest | **273 passed, 6 skipped** + Task8 review 13 passed (2026-10-15) |
 
 ## Blockers / open
 
@@ -48,6 +48,6 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 ## Next action
 
 1. Observe PS/ai2 nightly LastResult on the stand (operator).
-2. Linux-first kit: Tasks 2–8 done for operational subset (code readiness only — **no stand cutover**).
+2. Linux-first kit: Tasks 2–8 done with production v2 runner (code readiness only — **no stand cutover**).
 3. Next kit work: **Task 9** (Windows package exporters) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
-4. Task 8 residual: wire production `database_runner` end-to-end; Linux/WSL lock checks on a WSL host; Tasks 11–12 for dry-run/cutover.
+4. Before stand dry-run: Linux/WSL lock/path checks on a WSL host; Tasks 11–12 for dry-run/cutover.

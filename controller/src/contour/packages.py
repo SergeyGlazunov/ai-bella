@@ -357,7 +357,10 @@ def choose_newest_valid_package(
     if not candidates:
         return None, warnings
     candidates.sort(
-        key=lambda item: (item.manifest.finished_at, item.manifest.export_id),
+        key=lambda item: (
+            _parse_timestamp(item.manifest.finished_at, "finished_at"),
+            item.manifest.export_id,
+        ),
         reverse=True,
     )
     return candidates[0], warnings

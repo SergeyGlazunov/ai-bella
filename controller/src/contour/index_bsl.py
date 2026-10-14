@@ -112,11 +112,18 @@ def index_bsl(
     run_id: int,
     *,
     runner: DockerRunner | None = None,
+    may_write=None,
 ) -> None:
     docker = _runner(runner)
     _run_exec(
         cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker
     )
+    if may_write is not None:
+        decision = may_write()
+        if decision != "ok":
+            from contour.runtime_policy import WriteWindowClosed
+
+            raise WriteWindowClosed(str(decision))
     _run_exec(
         cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker
     )

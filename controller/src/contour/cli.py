@@ -322,7 +322,12 @@ def main(argv: list[str] | None = None) -> int:
         def _reload_open() -> None:
             _bsl_watch_reload(cfg)
 
-        result = reopen_reads(cfg, paths=paths, watch_reload=_reload_open)
+        result = reopen_reads(
+            cfg,
+            paths=paths,
+            watch_reload=_reload_open,
+            database=database,
+        )
         return 0 if result == "success" else 1
 
     if args.command == "cleanup":

@@ -233,9 +233,28 @@ def start(container_id: str, *, runner: DockerRunner | None = None) -> None:
     docker_runner.run(["docker", "start", container_id])
 
 
-def wait(container_id: str, *, runner: DockerRunner | None = None) -> int:
+def wait(
+    container_id: str,
+    *,
+    runner: DockerRunner | None = None,
+    timeout: float | None = None,
+) -> int:
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriterStillAlive
+
     docker_runner = runner if runner is not None else _get_default_runner()
-    result = docker_runner.run(["docker", "wait", container_id])
+    budget = (
+        timeout
+        if timeout is not None
+        else DEFAULT_RUNTIME_POLICY.writer_observation_budget_seconds
+    )
+    try:
+        result = docker_runner.run(
+            ["docker", "wait", container_id], timeout=budget
+        )
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise WriterStillAlive(
+            f"observation budget exceeded waiting for {container_id}"
+        ) from exc
     return int(result.stdout.strip())
 
 

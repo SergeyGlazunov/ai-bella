@@ -835,9 +835,15 @@ class PublishedRecoveryProvider:
         _assert_disjoint(staging_root, published)
         if not published.is_dir():
             raise SourceError("published source missing for recovery")
-        revision = self._revision or read_revision(published)
-        if not revision:
+        actual = read_revision(published)
+        if not actual:
             raise SourceError("published source has no revision marker")
+        if self._revision is not None and self._revision != actual:
+            raise SourceError(
+                f"recovery revision mismatch: requested {self._revision!r} "
+                f"but published marker is {actual!r}"
+            )
+        revision = actual
         token = safe_revision_token(revision)
         db_dir = _ensure_staging_database_dir(
             staging_root, self._database, sources_root

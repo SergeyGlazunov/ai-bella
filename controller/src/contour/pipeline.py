@@ -14,7 +14,7 @@ from contour.profiles import (
 )
 from contour.sources import PreparedSource, SourceProvider, activate_source
 from contour.state import StateStore
-from contour.runtime_policy import WriteWindowClosed
+from contour.runtime_policy import WriteWindowClosed, WriterStillAlive
 from contour.verify import (
     Samples,
     sample_current_tree,
@@ -203,15 +203,14 @@ def run_database_pipeline(
                 )
         state.finish_run(run_id, "published", message)
         return PipelineResult(name, revision, "published", message, run_id=run_id)
-    except WriteWindowClosed as exc:
-        message = str(exc) or "deferred_window"
+    except (WriteWindowClosed, WriterStillAlive) as exc:
+        message = str(exc) or exc.__class__.__name__
         if entry_read_error:
             message = f"{message}; also could not read prior reads state: {entry_read_error}"
-        if not activated and close_attempted and reads_closed_on_entry is False:
-            try:
-                reads.open()
-            except Exception as open_exc:
-                message = f"{message}; also failed to reopen reads: {open_exc}"
+        if not activated:
+            message = _reopen_reads_after_pre_activation(
+                reads, close_attempted, reads_closed_on_entry, message
+            )
         if run_id is not None:
             try:
                 state.finish_run(run_id, "deferred", message)
@@ -233,18 +232,36 @@ def run_database_pipeline(
             return PipelineResult(
                 name, revision or "unknown", "failed", message, run_id=run_id
             )
-        # Pre-activation failure: reopen only if THIS attempt touched previously
-        # open reads (including partial close). Do not clear a close left by an
-        # unfinished earlier run, and do not open when entry state was unknown.
-        if close_attempted and reads_closed_on_entry is False:
-            try:
-                reads.open()
-            except Exception as open_exc:
-                message = f"{message}; also failed to reopen reads: {open_exc}"
+        # Pre-activation: restore only layers this attempt closed; keep prior
+        # recovery closes intact (per-layer reopen when available).
+        message = _reopen_reads_after_pre_activation(
+            reads, close_attempted, reads_closed_on_entry, message
+        )
         _finish_failed(state, name, run_id, message)
         return PipelineResult(
             name, revision or "unknown", "failed", message, run_id=run_id
         )
+
+
+def _reopen_reads_after_pre_activation(
+    reads: ReadController,
+    close_attempted: bool,
+    reads_closed_on_entry: bool,
+    message: str,
+) -> str:
+    safe = getattr(reads, "reopen_if_safe_after_pre_activation_failure", None)
+    if callable(safe):
+        try:
+            safe()
+        except Exception as open_exc:
+            message = f"{message}; also failed to reopen reads: {open_exc}"
+        return message
+    if close_attempted and reads_closed_on_entry is False:
+        try:
+            reads.open()
+        except Exception as open_exc:
+            message = f"{message}; also failed to reopen reads: {open_exc}"
+    return message
 
 
 def _finish_failed(

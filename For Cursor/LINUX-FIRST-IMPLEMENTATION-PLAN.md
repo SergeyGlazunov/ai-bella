@@ -586,7 +586,7 @@ git commit -m "feat: add verified database pipeline"
 - Consumes: normalized `Config.databases`, `StateStore` and `run_database_pipeline()`.
 - Produces: global scheduling, writer ownership, restart recovery and dashboard-facing aggregate state.
 
-**Status (kit code, 2026-10-14):** implemented on `main` through Block 6 commits after `f1d5bec`. This is controller kit readiness, **not** live stand cutover (Tasks 11–12). Production default `database_runner` still raises until wired end-to-end against live adapters; inject `database_runner` in tests. Linux/WSL lock path checks were not run on this Windows agent (noted limitation).
+**Status (kit code, 2026-10-15):** Task 8 follow-up after review of `d4f8835` — production `_default_v2_database_runner` wired (package noop, claim, ReadController, pipeline); open `--database`; observation timeouts; per-layer reopen; shared container ownership; safe alerts. Review file `For Cursor/test_task8_review_d4f8835.py` passes. This is controller kit readiness, **not** live stand cutover (Tasks 11–12). Linux/WSL lock path checks still pending on a WSL host.
 
 - [x] **Step 1: Write failing reconciliation tests**
 
