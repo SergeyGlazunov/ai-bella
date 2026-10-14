@@ -60,6 +60,15 @@ def _make_package(
     if ready:
         (root / "READY").write_text("", encoding="utf-8")
     if manifest:
+        if database == "kb":
+            operations = {
+                "DumpConfigToFiles": "ok",
+                "UpdateCfg": "ok",
+                "UpdateDBCfg": "ok",
+            }
+        else:
+            operations = {"DumpConfigToFiles": "ok"}
+        src_file_count = sum(1 for rel in files if rel.startswith("src/"))
         body = {
             "schema_version": schema_version,
             "database": database,
@@ -67,8 +76,8 @@ def _make_package(
             "started_at": "2026-10-14T00:00:00Z",
             "finished_at": "2026-10-14T00:01:00Z",
             "platform_version": "8.3.25",
-            "operations": {"DumpConfigToFiles": "ok"},
-            "file_count": len(files),
+            "operations": operations,
+            "file_count": src_file_count,
             "checksum": checksum if checksum is not None else _checksum_for(root),
         }
         if manifest_overrides:
