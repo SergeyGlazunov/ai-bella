@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from contour import dockerutil
 from contour.config import VALID_LAYERS, DatabaseConfig
 from contour.dockerutil import DockerRunner
 from contour.index_bsl import index_bsl
@@ -51,11 +52,17 @@ def run_bsl_layer(
     """Run the code_index layer for ``database`` and return a verified result."""
     _ensure_run_revision(conn, run_id, database.name, revision)
     index_bsl(database, conn, run_id, runner=runner)
+    storage_id = dockerutil.volume_identity(
+        database.storage.code_index_volume, runner=runner
+    )
+    indexer_version = dockerutil.image_id(
+        database.services.bsl_container, runner=runner
+    )
     return LayerResult(
         layer="code_index",
         revision=revision,
-        storage_id=database.storage.code_index_volume,
-        indexer_version="bsl-indexer",
+        storage_id=storage_id,
+        indexer_version=indexer_version,
     )
 
 
@@ -68,9 +75,13 @@ def run_graph_layer(
     may_write: Callable[[], str] | None = None,
     **graph_kwargs: Any,
 ) -> LayerResult:
-    """Run the graph layer; preserve exit-code-3 → FULL contract."""
+    """Run the graph layer; preserve exit-code-3 → FULL contract.
+
+    ``may_write`` returns ``\"ok\"`` to allow FULL, or a short reason string
+    that forbids it (same contract as ``may_write_decision``).
+    """
     _ensure_run_revision(conn, run_id, database.name, revision)
-    index_graph(
+    writer_container = index_graph(
         database,
         conn,
         run_id,
@@ -78,11 +89,15 @@ def run_graph_layer(
         may_write_fn=may_write,
         **graph_kwargs,
     )
+    storage_id = dockerutil.volume_identity(
+        database.storage.graph_volume, runner=runner
+    )
+    indexer_version = dockerutil.image_id(writer_container, runner=runner)
     return LayerResult(
         layer="graph",
         revision=revision,
-        storage_id=database.storage.graph_volume,
-        indexer_version="metadata-indexer",
+        storage_id=storage_id,
+        indexer_version=indexer_version,
     )
 
 

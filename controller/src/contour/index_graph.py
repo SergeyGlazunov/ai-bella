@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from contour.db import set_meta
+from contour.db import get_meta, set_meta
 from contour.dockerutil import (
     DockerRunner,
     SubprocessRunner,
@@ -15,6 +15,28 @@ from contour.dockerutil import (
     start,
     wait,
 )
+
+
+def graph_full_needed_key(database: str) -> str:
+    """Meta key for pending Graph FULL.
+
+    UBD keeps the legacy unscoped ``graph_full_needed`` key so existing
+    reconcile recovery keeps working until Task 8 migrates it. Other
+    databases use a scoped key and must not share UBD's flag.
+    """
+    if database == "ubd":
+        return "graph_full_needed"
+    return f"graph_full_needed:{database}"
+
+
+def set_graph_full_needed(
+    conn: sqlite3.Connection, database: str, needed: bool
+) -> None:
+    set_meta(conn, graph_full_needed_key(database), "1" if needed else "")
+
+
+def is_graph_full_needed(conn: sqlite3.Connection, database: str) -> bool:
+    return get_meta(conn, graph_full_needed_key(database)) == "1"
 
 SRV_LOGS = Path("/srv/ai/logs")
 
@@ -248,14 +270,16 @@ def index_graph(
     remaining_budget: float | None = None,
     measure: bool = False,
     full_needed: bool = False,
-) -> None:
+) -> str:
+    """Run graph delta/FULL. Returns the writer container id used last."""
     docker = _runner(runner)
+    database = _database_for_run(cfg, conn, run_id)
     code = 3 if full_needed else _run_graph_job(cfg, conn, run_id, "graph", docker)
     if code == 0:
-        set_meta(conn, "graph_full_needed", "")
-        return
+        set_graph_full_needed(conn, database, False)
+        return _latest_graph_writer(conn, run_id)
     if code == 3:
-        set_meta(conn, "graph_full_needed", "1")
+        set_graph_full_needed(conn, database, True)
         decision = may_write_fn() if callable(may_write_fn) else may_write_decision
         deadline = getattr(getattr(cfg, "schedule", None), "build_deadline_seconds", None)
         if not allow_graph_full(
@@ -270,6 +294,21 @@ def index_graph(
         full_code = _run_graph_job(cfg, conn, run_id, "graph_full", docker)
         if full_code != 0:
             raise RuntimeError(f"graph FULL failed with exit {full_code}")
-        set_meta(conn, "graph_full_needed", "")
-        return
+        set_graph_full_needed(conn, database, False)
+        return _latest_graph_writer(conn, run_id)
     raise RuntimeError(f"graph index failed with exit {code}")
+
+
+def _latest_graph_writer(conn: sqlite3.Connection, run_id: int) -> str:
+    row = conn.execute(
+        """
+        SELECT container_id FROM jobs
+        WHERE run_id = ? AND stage IN ('graph', 'graph_full')
+          AND container_id IS NOT NULL AND container_id != ''
+        ORDER BY id DESC LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"graph writer container missing for run {run_id}")
+    return str(row["container_id"] if hasattr(row, "keys") else row[0])

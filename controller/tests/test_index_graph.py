@@ -82,6 +82,11 @@ class FakeDockerRunner:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout="cid-delta\ncid-from-ps\n", stderr=""
             )
+        if cmd[:3] == ["docker", "volume", "inspect"]:
+            volume = cmd[-1]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{volume}|created-test\n", stderr=""
+            )
         if cmd[:2] == ["docker", "inspect"]:
             fmt = ""
             if "-f" in cmd:
@@ -90,6 +95,10 @@ class FakeDockerRunner:
             if "ExecIDs" in fmt:
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout=json.dumps(self.exec_ids) + "\n", stderr=""
+                )
+            if "{{.Image}}" in fmt:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="sha256:test-image\n", stderr=""
                 )
             return subprocess.CompletedProcess(cmd, 0, stdout=f"cid-{name}\n", stderr="")
         if cmd[:2] == ["docker", "start"]:
