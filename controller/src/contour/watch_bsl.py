@@ -19,15 +19,20 @@ def reload_bsl_daemon(cfg) -> None:
     ``services.bsl_container``. Passes ``BSL_CONTAINER`` to integration scripts
     so multi-db profiles do not reload the default UBD indexer.
     """
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     container = cfg.services.bsl_container
     env = {**os.environ, "BSL_CONTAINER": container}
+    budget = DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds
     candidates = [
         Path("/opt/ai-sync/integrations/reload_bsl_watch.sh"),
         Path(__file__).resolve().parents[3] / "integrations" / "reload_bsl_watch.sh",
     ]
     for script in candidates:
         if script.is_file():
-            subprocess.run([str(script)], check=True, env=env)
+            subprocess.run(
+                [str(script)], check=True, env=env, timeout=budget
+            )
             return
     result = subprocess.run(
         [
@@ -44,6 +49,7 @@ def reload_bsl_daemon(cfg) -> None:
         capture_output=True,
         text=True,
         env=env,
+        timeout=budget,
     )
     text = (result.stdout or "") + (result.stderr or "")
     start, end = text.find("{"), text.rfind("}")

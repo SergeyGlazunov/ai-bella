@@ -106,6 +106,44 @@ def _run_exec(
         raise RuntimeError(f"{stage} failed with exit {exit_code}")
 
 
+def _run_revision(conn: sqlite3.Connection, run_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT target_revision FROM runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    value = row["target_revision"] if hasattr(row, "keys") else row[0]
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _stage_succeeded_for_revision(
+    conn: sqlite3.Connection,
+    database: str,
+    stage: str,
+    revision: str,
+) -> bool:
+    """True when a prior job for the same database/revision finished ok."""
+    row = conn.execute(
+        """
+        SELECT j.id
+        FROM jobs j
+        JOIN runs r ON r.id = j.run_id
+        WHERE j.database = ?
+          AND j.stage = ?
+          AND j.status = 'ok'
+          AND COALESCE(j.exit_code, 1) = 0
+          AND r.target_revision = ?
+        ORDER BY j.id DESC
+        LIMIT 1
+        """,
+        (database, stage, revision),
+    ).fetchone()
+    return row is not None
+
+
 def index_bsl(
     cfg,
     conn: sqlite3.Connection,
@@ -115,15 +153,23 @@ def index_bsl(
     may_write=None,
 ) -> None:
     docker = _runner(runner)
-    _run_exec(
-        cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker
-    )
+    database = _database_for_run(cfg, conn, run_id)
+    revision = _run_revision(conn, run_id)
+    if revision is None or not _stage_succeeded_for_revision(
+        conn, database, "bsl_index", revision
+    ):
+        _run_exec(
+            cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker
+        )
     if may_write is not None:
         decision = may_write()
         if decision != "ok":
             from contour.runtime_policy import WriteWindowClosed
 
             raise WriteWindowClosed(str(decision))
-    _run_exec(
-        cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker
-    )
+    if revision is None or not _stage_succeeded_for_revision(
+        conn, database, "bsl_clean", revision
+    ):
+        _run_exec(
+            cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker
+        )

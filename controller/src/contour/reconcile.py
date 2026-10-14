@@ -226,37 +226,35 @@ def _package_is_stale(
 
 def _live_layer_identities(
     database: DatabaseConfig, layer: str, docker
-) -> tuple[str | None, str | None]:
-    """Return (storage_id, indexer_version) for a required layer from live Docker."""
-    try:
-        if layer == "code_index":
-            storage = dockerutil.volume_identity(
-                database.storage.code_index_volume, runner=docker
-            )
-            version = dockerutil.image_id(
-                database.services.bsl_container, runner=docker
-            )
-            return storage, version
-        if layer == "graph":
-            storage = dockerutil.volume_identity(
-                database.storage.graph_volume, runner=docker
-            )
-            version = dockerutil.image_id(
-                database.services.graph_mcp, runner=docker
-            )
-            return storage, version
-    except Exception:
-        return None, None
-    return None, None
+) -> tuple[str, str]:
+    """Return (storage_id, indexer_version) for a required layer from live Docker.
+
+    Raises on inspect failure — callers must not treat unknown identity as matching.
+    """
+    if layer == "code_index":
+        storage = dockerutil.volume_identity(
+            database.storage.code_index_volume, runner=docker
+        )
+        version = dockerutil.image_id(
+            database.services.bsl_container, runner=docker
+        )
+        return storage, version
+    if layer == "graph":
+        storage = dockerutil.volume_identity(
+            database.storage.graph_volume, runner=docker
+        )
+        version = dockerutil.image_id(
+            database.services.graph_mcp, runner=docker
+        )
+        return storage, version
+    raise ValueError(f"unsupported layer for live identity: {layer}")
 
 
-def _layers_ready_with_live_storage(
+def _layers_sqlite_ready(
     database: DatabaseConfig,
     revision: str,
     conn: sqlite3.Connection,
-    docker,
 ) -> bool:
-    """True when every required layer is ready at revision and matches live storage."""
     for layer in database.required_layers:
         row = conn.execute(
             """
@@ -271,7 +269,25 @@ def _layers_ready_with_live_storage(
             or str(row["applied_revision"] or "") != revision
         ):
             return False
-        live_storage, live_version = _live_layer_identities(database, layer, docker)
+    return True
+
+
+def _live_storage_status(
+    database: DatabaseConfig,
+    revision: str,
+    conn: sqlite3.Connection,
+    docker,
+) -> str:
+    """Return match|changed|unknown|not_ready for required layers at revision."""
+    if not _layers_sqlite_ready(database, revision, conn):
+        return "not_ready"
+    for layer in database.required_layers:
+        try:
+            live_storage, live_version = _live_layer_identities(
+                database, layer, docker
+            )
+        except Exception:
+            return "unknown"
         if storage_identity_changed(
             conn,
             database.name,
@@ -279,8 +295,18 @@ def _layers_ready_with_live_storage(
             current_storage_id=live_storage,
             current_indexer_version=live_version,
         ):
-            return False
-    return True
+            return "changed"
+    return "match"
+
+
+def _layers_ready_with_live_storage(
+    database: DatabaseConfig,
+    revision: str,
+    conn: sqlite3.Connection,
+    docker,
+) -> bool:
+    """True only when SQLite ready and live identity is confirmed to match."""
+    return _live_storage_status(database, revision, conn, docker) == "match"
 
 
 def _published_needs_recovery(
@@ -302,7 +328,9 @@ def _published_needs_recovery(
     revision = read_revision(published)
     if not revision:
         return False
-    return not _layers_ready_with_live_storage(database, revision, conn, docker)
+    status = _live_storage_status(database, revision, conn, docker)
+    # Unknown inspect → defer, do not force rebuild from published tree.
+    return status in {"not_ready", "changed"}
 
 
 def _docker_for_database(database: DatabaseConfig, base_docker):
@@ -311,27 +339,33 @@ def _docker_for_database(database: DatabaseConfig, base_docker):
     idle = getattr(adapters, "idle_probe", None) if adapters is not None else None
     if not idle:
         return base_docker
-    from contour.adapters import CommandEngine
+    from contour.adapters import CommandEngine, profile_adapter_env
 
     underlying = getattr(base_docker, "_runner", base_docker)
-    return CommandEngine(list(idle), runner=underlying)
+    return CommandEngine(
+        list(idle),
+        runner=underlying,
+        env=profile_adapter_env(database),
+    )
 
 
-def _watch_reload_for_database(database: DatabaseConfig, fallback):
-    """Prefer profile-scoped BSL reload; fall back to caller-provided callback."""
+def _watch_reload_for_database(database: DatabaseConfig, fallback=None):
+    """Profile-scoped BSL reload. Never hide failure behind another database."""
+    del fallback
 
     def _reload() -> None:
         from contour.watch_bsl import reload_bsl_daemon
 
-        try:
-            reload_bsl_daemon(database)
-        except Exception:
-            if fallback is not None:
-                fallback()
-            else:
-                raise
+        reload_bsl_daemon(database)
 
     return _reload
+
+
+def _sole_enabled_database_name(cfg) -> str | None:
+    enabled = enabled_databases(cfg)
+    if len(enabled) != 1:
+        return None
+    return next(iter(enabled))
 
 
 def _default_v2_database_runner(
@@ -421,16 +455,30 @@ def _default_v2_database_runner(
         if package is not None:
             published = published_path_for(database)
             current = read_revision(published) if published.is_dir() else None
+            db_state = state.get_database(database.name)
+            fully_published = (
+                str(db_state["published_revision"] or "") == package.revision
+                and not state.required_recovery(database.name)
+            )
             if (
-                current == package.revision
+                fully_published
+                and current == package.revision
                 and not is_graph_full_needed(conn, database.name)
-                and _layers_ready_with_live_storage(
+            ):
+                storage = _live_storage_status(
                     database, package.revision, conn, docker
                 )
-            ):
-                run_id = state.start_run(database.name, package.revision)
-                state.finish_run(run_id, "deferred", "already published")
-                return "deferred"
+                if storage == "match":
+                    run_id = state.start_run(database.name, package.revision)
+                    state.finish_run(run_id, "deferred", "already published")
+                    return "deferred"
+                if storage == "unknown":
+                    run_id = state.start_run(database.name, package.revision)
+                    state.finish_run(
+                        run_id, "deferred", "storage identity unknown"
+                    )
+                    return "deferred"
+                # changed / not_ready → rebuild from this package
             provider = build_source_provider(database, cfg, package=package)
         elif _published_needs_recovery(database, conn, state, docker):
             published = published_path_for(database)
@@ -444,6 +492,17 @@ def _default_v2_database_runner(
                 )
                 return "deferred"
         else:
+            published = published_path_for(database)
+            current = read_revision(published) if published.is_dir() else None
+            if current and _live_storage_status(
+                database, current, conn, docker
+            ) == "unknown":
+                run_id = state.start_run(database.name, current)
+                state.finish_run(run_id, "deferred", "storage identity unknown")
+                state.set_lifecycle(
+                    database.name, "deferred", detail="storage identity unknown"
+                )
+                return "deferred"
             run_id = state.start_run(database.name, "(pending)")
             state.finish_run(run_id, "deferred", "no new package")
             state.set_lifecycle(database.name, "deferred", detail="no new package")
@@ -592,7 +651,8 @@ class WriterStateUnknown(RuntimeError):
 def _container_status(docker, container_id: str) -> str:
     try:
         result = docker.run(
-            ["docker", "inspect", "-f", "{{.State.Status}}", container_id]
+            ["docker", "inspect", "-f", "{{.State.Status}}", container_id],
+            timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
         )
     except Exception as exc:
         raise WriterStateUnknown(
@@ -823,7 +883,10 @@ def _reap_unfinished_rows(
             busy = True
             continue
         try:
-            result = docker.run(["docker", "wait", cid])
+            result = docker.run(
+                ["docker", "wait", cid],
+                timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+            )
             exit_code = _parse_wait_exit(getattr(result, "stdout", "") or "")
         except Exception as exc:
             err = WriterStateUnknown(f"wait failed for writer {cid}: {exc}")
@@ -1238,9 +1301,7 @@ def reopen_reads(
 
     if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
         if database is None:
-            enabled = enabled_databases(cfg)
-            if len(enabled) == 1:
-                database = enabled[0].name
+            database = _sole_enabled_database_name(cfg)
         if database is not None:
             return _reopen_reads_v2_database(
                 cfg,
@@ -1575,11 +1636,8 @@ def _reconcile_v2_locked(
             continue
         try:
             db_docker = _docker_for_database(db, docker)
-            db_reload = (
-                reload_fn
-                if database is not None
-                else _watch_reload_for_database(db, reload_fn)
-            )
+            # Always profile-scoped; never fall back to another database's reload.
+            db_reload = _watch_reload_for_database(db, reload_fn)
             status = runner(
                 db,
                 cfg=cfg,

@@ -55,17 +55,30 @@ _CREATE_FLAGS_WITH_VALUE = frozenset(
 
 @runtime_checkable
 class DockerRunner(Protocol):
-    def run(self, cmd: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]: ...
+    def run(
+        self,
+        cmd: list[str],
+        *,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]: ...
 
 
 class SubprocessRunner:
-    def run(self, cmd: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self,
+        cmd: list[str],
+        *,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=True,
+            env=env,
         )
 
 
@@ -259,9 +272,12 @@ def wait(
 
 
 def list_exec_ids(container: str, *, runner: DockerRunner | None = None) -> list[str]:
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     docker_runner = runner if runner is not None else _get_default_runner()
     result = docker_runner.run(
-        ["docker", "inspect", "-f", "{{json .ExecIDs}}", container]
+        ["docker", "inspect", "-f", "{{json .ExecIDs}}", container],
+        timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
     )
     raw = (result.stdout or "").strip() or "null"
     try:
@@ -276,6 +292,8 @@ def list_exec_ids(container: str, *, runner: DockerRunner | None = None) -> list
 
 
 def _exec_inspect(exec_id: str, runner: DockerRunner) -> dict:
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     inspect_fn = getattr(runner, "inspect_exec", None)
     if callable(inspect_fn):
         payload = inspect_fn(exec_id)
@@ -283,13 +301,15 @@ def _exec_inspect(exec_id: str, runner: DockerRunner) -> dict:
             raise RuntimeError(f"inspect_exec did not return a mapping for {exec_id}")
         return payload
     sock_path = "/var/run/docker.sock"
+    budget = DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds
 
     class UnixHTTPConnection(http.client.HTTPConnection):
         def connect(self) -> None:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(budget)
             self.sock.connect(sock_path)
 
-    conn = UnixHTTPConnection("localhost")
+    conn = UnixHTTPConnection("localhost", timeout=budget)
     try:
         conn.request("GET", f"/v1.44/exec/{exec_id}/json")
         response = conn.getresponse()
@@ -339,9 +359,12 @@ def wait_exec(
 
 
 def volume_identity(volume: str, *, runner: DockerRunner | None = None) -> str:
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     docker_runner = runner if runner is not None else _get_default_runner()
     result = docker_runner.run(
-        ["docker", "volume", "inspect", "-f", "{{.Name}}|{{.CreatedAt}}", volume]
+        ["docker", "volume", "inspect", "-f", "{{.Name}}|{{.CreatedAt}}", volume],
+        timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
     )
     ident = (result.stdout or "").strip()
     if not ident or ident.endswith("|") or "|" not in ident:
@@ -350,9 +373,12 @@ def volume_identity(volume: str, *, runner: DockerRunner | None = None) -> str:
 
 
 def image_id(container: str, *, runner: DockerRunner | None = None) -> str:
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
+
     docker_runner = runner if runner is not None else _get_default_runner()
     result = docker_runner.run(
-        ["docker", "inspect", "-f", "{{.Image}}", container]
+        ["docker", "inspect", "-f", "{{.Image}}", container],
+        timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
     )
     image = (result.stdout or "").strip()
     if not image:

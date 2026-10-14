@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
             if database is None and len(enabled) == 1:
-                database = enabled[0].name
+                database = next(iter(enabled))
             if database is not None:
                 try:
                     open_target = select_databases(cfg, database)[0]
