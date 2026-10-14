@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from contour import dockerutil
+from contour.db import get_meta, set_meta
 from contour.dockerutil import (
     DockerRunner,
     SubprocessRunner,
@@ -31,6 +32,52 @@ def _database_for_run(cfg, conn: sqlite3.Connection, run_id: int) -> str:
     if row is not None:
         return str(row["database"] if hasattr(row, "keys") else row[0])
     return "ubd"
+
+
+def _attempt_keys(database: str) -> tuple[str, str, str]:
+    return (
+        f"bsl_attempt_revision:{database}",
+        f"bsl_attempt_storage:{database}",
+        f"bsl_attempt_image:{database}",
+    )
+
+
+def _record_bsl_attempt(
+    conn: sqlite3.Connection,
+    database: str,
+    revision: str,
+    storage_id: str,
+    indexer_version: str,
+) -> None:
+    """Persist the in-flight BSL attempt (not applied_revision)."""
+    rev_k, stor_k, img_k = _attempt_keys(database)
+    set_meta(conn, rev_k, revision)
+    set_meta(conn, stor_k, storage_id)
+    set_meta(conn, img_k, indexer_version)
+
+
+def _read_bsl_attempt(
+    conn: sqlite3.Connection, database: str
+) -> tuple[str, str, str] | None:
+    rev_k, stor_k, img_k = _attempt_keys(database)
+    revision = get_meta(conn, rev_k)
+    storage = get_meta(conn, stor_k)
+    image = get_meta(conn, img_k)
+    if not revision or not storage or not image:
+        return None
+    return str(revision), str(storage), str(image)
+
+
+def _capture_live_identity(
+    cfg, docker: DockerRunner
+) -> tuple[str, str]:
+    storage = dockerutil.volume_identity(
+        cfg.storage.code_index_volume, runner=docker
+    )
+    image = dockerutil.image_id(cfg.services.bsl_container, runner=docker)
+    if not storage or not image:
+        raise RuntimeError("cannot record BSL attempt identity from live storage")
+    return storage, image
 
 
 def _insert_exec_job(
@@ -152,54 +199,37 @@ def should_resume_bsl_stages(
     revision: str,
     runner: DockerRunner | None = None,
 ) -> bool:
-    """Resume unfinished stages only when live storage still matches the attempt.
+    """Resume unfinished stages using the recorded current attempt, not applied_revision.
 
-    ``applied_revision`` stays on the last successful publish while status is
-    building/failed (Task 3). Resume is allowed when:
-    - layer is building/failed (interrupted attempt), and
-    - applied is empty (never succeeded) or equals this revision, and
-    - recorded storage/image is empty or matches live identity.
-
-    Historical ok jobs on a recreated volume must not suppress rebuild.
+    An attempt records target revision + live storage/image *before* the writer
+    starts. Resume requires that record to match this revision and live identity.
+    Empty identity never counts as a match. applied_revision is unused here.
     """
-    database = getattr(cfg, "name", None) or "ubd"
+    database = str(getattr(cfg, "name", None) or "ubd")
     row = conn.execute(
         """
-        SELECT status, applied_revision, storage_id, indexer_version
-        FROM layer_state
+        SELECT status FROM layer_state
         WHERE database = ? AND layer = 'code_index'
         """,
-        (str(database),),
+        (database,),
     ).fetchone()
     if row is None:
         return False
     status = str(row["status"] or "")
     if status not in {"building", "failed"}:
         return False
-    applied = str(row["applied_revision"] or "")
-    # building r2 while applied is still r1 → new revision, not resume of r1 jobs.
-    if applied and applied != revision:
+    attempt = _read_bsl_attempt(conn, database)
+    if attempt is None:
+        return False
+    attempt_rev, attempt_storage, attempt_image = attempt
+    if attempt_rev != revision:
         return False
     docker = _runner(runner)
     try:
-        # Call through the module so tests can patch dockerutil.volume_identity.
-        live_storage = dockerutil.volume_identity(
-            cfg.storage.code_index_volume, runner=docker
-        )
-        live_image = dockerutil.image_id(
-            cfg.services.bsl_container, runner=docker
-        )
+        live_storage, live_image = _capture_live_identity(cfg, docker)
     except Exception:
-        # Unknown identity → do not skip; rebuild rather than assume resume.
         return False
-    stored = row["storage_id"]
-    stored_image = row["indexer_version"]
-    if stored in (None, ""):
-        # Interrupted before first successful identity — resume stages.
-        return True
-    if str(stored) != live_storage:
-        return False
-    if stored_image not in (None, "") and str(stored_image) != live_image:
+    if live_storage != attempt_storage or live_image != attempt_image:
         return False
     return True
 
@@ -223,11 +253,19 @@ def index_bsl(
                 cfg, conn, revision=revision, runner=docker
             )
         )
-    if not (
+    run_index = not (
         resume
         and revision is not None
         and _stage_succeeded_for_revision(conn, database, "bsl_index", revision)
-    ):
+    )
+    if run_index:
+        # Record attempt identity before the writer when revision is known
+        # (v2). Legacy callers without target_revision still run index once.
+        if revision is not None:
+            live_storage, live_image = _capture_live_identity(cfg, docker)
+            _record_bsl_attempt(
+                conn, database, revision, live_storage, live_image
+            )
         _run_exec(
             cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker
         )

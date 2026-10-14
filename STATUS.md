@@ -36,7 +36,7 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 | Python | 3.12.10 (`controller` venv; needs `tzdata` on Windows for tests) |
 | Docker Engine | via `DOCKER_HOST=tcp://127.0.0.1:2375` |
 | WSL | Ubuntu Running (v2) |
-| pytest | **273 passed, 6 skipped** + Task8 review 13+10+7+3 passed (2026-10-15) |
+| pytest | **273 passed, 6 skipped** + Task8 review 35+2 passed (2026-10-15) |
 
 ## Blockers / open
 
