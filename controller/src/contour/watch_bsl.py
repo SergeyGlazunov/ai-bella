@@ -1,12 +1,57 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 
 SRC_WATCH_PATH = "/repos/SRC"
 _STAMP_SUFFIX = ".contour-pause-hash"
+
+
+def reload_bsl_daemon(cfg) -> None:
+    """Reload bsl-indexer daemon for the database/services in ``cfg``.
+
+    ``cfg`` may be a full Contour config or a ``DatabaseConfig``; both expose
+    ``services.bsl_container``. Passes ``BSL_CONTAINER`` to integration scripts
+    so multi-db profiles do not reload the default UBD indexer.
+    """
+    container = cfg.services.bsl_container
+    env = {**os.environ, "BSL_CONTAINER": container}
+    candidates = [
+        Path("/opt/ai-sync/integrations/reload_bsl_watch.sh"),
+        Path(__file__).resolve().parents[3] / "integrations" / "reload_bsl_watch.sh",
+    ]
+    for script in candidates:
+        if script.is_file():
+            subprocess.run([str(script)], check=True, env=env)
+            return
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            "-e",
+            "CODE_INDEX_HOME=/data/code-index-home",
+            container,
+            "bsl-indexer",
+            "daemon",
+            "reload",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    text = (result.stdout or "") + (result.stderr or "")
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise RuntimeError("daemon reload produced no JSON")
+    data = json.loads(text[start : end + 1])
+    if data.get("reloaded") is not True:
+        raise RuntimeError(f"daemon reload reloaded!=true: {data.get('error')!r}")
 
 
 def _is_src_paths_table(block: str) -> bool:

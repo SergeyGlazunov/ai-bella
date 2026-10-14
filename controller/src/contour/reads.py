@@ -203,12 +203,14 @@ class DatabaseReadController:
         self.required_layers = tuple(
             layer for layer in _LAYER_ORDER if layer in database.required_layers
         )
+        self.close_attempted = False
+        self._watch_backup: str | None = None
+        # Migrate legacy flags before snapshotting entry state so a prior
+        # global reads_closed=1 is not mistaken for "was open".
+        self._migrate_legacy_ubd_flags()
         self._closed_on_entry = {
             layer: self._layer_flag_closed(layer) for layer in self.required_layers
         }
-        self.close_attempted = False
-        self._watch_backup: str | None = None
-        self._migrate_legacy_ubd_flags()
 
     def _migrate_legacy_ubd_flags(self) -> None:
         """Copy legacy UBD global closed flag into per-layer keys once."""

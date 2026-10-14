@@ -22,6 +22,7 @@ from contour.reconcile import (
     resolve_runtime_paths,
     select_databases,
 )
+from contour.watch_bsl import reload_bsl_daemon
 
 
 def _docker():
@@ -165,39 +166,7 @@ def _validate(cfg) -> int:
 
 def _bsl_watch_reload(cfg) -> None:
     """Reload daemon after daemon.toml pause/restore (R03/F03). Require reloaded=true."""
-    candidates = [
-        Path("/opt/ai-sync/integrations/reload_bsl_watch.sh"),
-        Path(__file__).resolve().parents[3] / "integrations" / "reload_bsl_watch.sh",
-    ]
-    for script in candidates:
-        if script.is_file():
-            subprocess.run([str(script)], check=True)
-            return
-    env = "CODE_INDEX_HOME=/data/code-index-home"
-    result = subprocess.run(
-        [
-            "docker",
-            "exec",
-            "-e",
-            env,
-            cfg.services.bsl_container,
-            "bsl-indexer",
-            "daemon",
-            "reload",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    text = (result.stdout or "") + (result.stderr or "")
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise RuntimeError("daemon reload produced no JSON")
-    import json
-
-    data = json.loads(text[start : end + 1])
-    if data.get("reloaded") is not True:
-        raise RuntimeError(f"daemon reload reloaded!=true: {data.get('error')!r}")
+    reload_bsl_daemon(cfg)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -276,7 +245,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         try:
             if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
-                # Per-database idle probe: prefer first enabled (or filtered) profile.
+                # Seed engine from the filtered (or first) profile; v2 reconcile
+                # re-wraps per database so idle_probe stays profile-scoped.
                 profiles = select_databases(cfg, database)
                 idle = profiles[0].adapters.idle_probe if profiles else None
                 if not idle:
@@ -286,11 +256,14 @@ def main(argv: list[str] | None = None) -> int:
                 if cfg.adapters is None:
                     raise MissingAdapters("adapters section is required")
                 docker = CommandEngine(cfg.adapters.idle_probe)
+                profiles = []
         except MissingAdapters:
             return 1
 
+        reload_target = profiles[0] if profiles else cfg
+
         def _reload() -> None:
-            _bsl_watch_reload(cfg)
+            _bsl_watch_reload(reload_target)
 
         result = reconcile(
             cfg,
@@ -305,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "open":
         database = getattr(args, "database", None)
+        open_target = cfg
         if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
             enabled = enabled_databases(cfg)
             if database is None and len(enabled) != 1:
@@ -312,15 +286,17 @@ def main(argv: list[str] | None = None) -> int:
                     "open requires --database when multiple databases are enabled"
                 )
                 return 1
+            if database is None and len(enabled) == 1:
+                database = enabled[0].name
             if database is not None:
                 try:
-                    select_databases(cfg, database)
+                    open_target = select_databases(cfg, database)[0]
                 except ValueError as exc:
                     print(str(exc))
                     return 1
 
         def _reload_open() -> None:
-            _bsl_watch_reload(cfg)
+            _bsl_watch_reload(open_target)
 
         result = reopen_reads(
             cfg,

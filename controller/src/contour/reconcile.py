@@ -182,6 +182,158 @@ def _source_kind(database: DatabaseConfig) -> str:
     return "git" if isinstance(database.source, GitSourceConfig) else "package"
 
 
+def _accepted_root_for(cfg, database: DatabaseConfig) -> Path:
+    return Path(cfg.runtime.root) / "accepted" / database.name
+
+
+def _package_finished_at(package) -> datetime:
+    from contour.packages import _parse_timestamp
+
+    return _parse_timestamp(package.manifest.finished_at, "finished_at")
+
+
+def _published_package_finished_at(
+    accepted_root: Path, database: str, published_revision: str | None
+) -> datetime | None:
+    """Finished_at of the accepted package that matches published_revision."""
+    if not published_revision:
+        return None
+    from contour.packages import PackageError, iter_ready_package_dirs, validate_package
+
+    for path in iter_ready_package_dirs(accepted_root):
+        try:
+            package = validate_package(path, frozenset({database}))
+        except PackageError:
+            continue
+        if package.revision == published_revision:
+            return _package_finished_at(package)
+    return None
+
+
+def _package_is_stale(
+    package,
+    *,
+    published_revision: str | None,
+    published_finished_at: datetime | None,
+) -> bool:
+    """True when package must not become the next update (already applied or older)."""
+    if published_revision and package.revision == published_revision:
+        return True
+    if published_finished_at is not None:
+        return _package_finished_at(package) <= published_finished_at
+    return False
+
+
+def _live_layer_identities(
+    database: DatabaseConfig, layer: str, docker
+) -> tuple[str | None, str | None]:
+    """Return (storage_id, indexer_version) for a required layer from live Docker."""
+    try:
+        if layer == "code_index":
+            storage = dockerutil.volume_identity(
+                database.storage.code_index_volume, runner=docker
+            )
+            version = dockerutil.image_id(
+                database.services.bsl_container, runner=docker
+            )
+            return storage, version
+        if layer == "graph":
+            storage = dockerutil.volume_identity(
+                database.storage.graph_volume, runner=docker
+            )
+            version = dockerutil.image_id(
+                database.services.graph_mcp, runner=docker
+            )
+            return storage, version
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _layers_ready_with_live_storage(
+    database: DatabaseConfig,
+    revision: str,
+    conn: sqlite3.Connection,
+    docker,
+) -> bool:
+    """True when every required layer is ready at revision and matches live storage."""
+    for layer in database.required_layers:
+        row = conn.execute(
+            """
+            SELECT status, applied_revision FROM layer_state
+            WHERE database = ? AND layer = ?
+            """,
+            (database.name, layer),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["status"]) != "ready"
+            or str(row["applied_revision"] or "") != revision
+        ):
+            return False
+        live_storage, live_version = _live_layer_identities(database, layer, docker)
+        if storage_identity_changed(
+            conn,
+            database.name,
+            layer,
+            current_storage_id=live_storage,
+            current_indexer_version=live_version,
+        ):
+            return False
+    return True
+
+
+def _published_needs_recovery(
+    database: DatabaseConfig,
+    conn: sqlite3.Connection,
+    state: StateStore,
+    docker,
+) -> bool:
+    from contour.index_graph import is_graph_full_needed
+    from contour.sources import published_path_for, read_revision
+
+    if state.required_recovery(database.name):
+        return True
+    if is_graph_full_needed(conn, database.name):
+        return True
+    published = published_path_for(database)
+    if not published.is_dir():
+        return False
+    revision = read_revision(published)
+    if not revision:
+        return False
+    return not _layers_ready_with_live_storage(database, revision, conn, docker)
+
+
+def _docker_for_database(database: DatabaseConfig, base_docker):
+    """Wrap ``base_docker`` with this database's idle_probe when configured."""
+    adapters = getattr(database, "adapters", None)
+    idle = getattr(adapters, "idle_probe", None) if adapters is not None else None
+    if not idle:
+        return base_docker
+    from contour.adapters import CommandEngine
+
+    underlying = getattr(base_docker, "_runner", base_docker)
+    return CommandEngine(list(idle), runner=underlying)
+
+
+def _watch_reload_for_database(database: DatabaseConfig, fallback):
+    """Prefer profile-scoped BSL reload; fall back to caller-provided callback."""
+
+    def _reload() -> None:
+        from contour.watch_bsl import reload_bsl_daemon
+
+        try:
+            reload_bsl_daemon(database)
+        except Exception:
+            if fallback is not None:
+                fallback()
+            else:
+                raise
+
+    return _reload
+
+
 def _default_v2_database_runner(
     database: DatabaseConfig,
     *,
@@ -212,57 +364,105 @@ def _default_v2_database_runner(
         read_revision,
     )
 
+    provider = None
     if isinstance(database.source, PackageSourceConfig):
-        chosen, warnings = choose_newest_valid_package(
-            Path(database.source.inbox), database.name
-        )
+        inbox = Path(database.source.inbox)
+        accepted_root = _accepted_root_for(cfg, database)
+        inbox_pkg, warnings = choose_newest_valid_package(inbox, database.name)
         for item in warnings:
             if send is not None:
                 _safe_send(send, cfg, f"{database.name}: package candidate: {item}")
-        if chosen is None:
+        accepted_pkg, accepted_warnings = choose_newest_valid_package(
+            accepted_root, database.name
+        )
+        for item in accepted_warnings:
+            if send is not None:
+                _safe_send(send, cfg, f"{database.name}: accepted candidate: {item}")
+
+        db_row = state.get_database(database.name)
+        published_revision = db_row["published_revision"]
+        published_finished_at = _published_package_finished_at(
+            accepted_root, database.name, published_revision
+        )
+
+        candidates: list[tuple[str, object]] = []
+        if inbox_pkg is not None and not _package_is_stale(
+            inbox_pkg,
+            published_revision=published_revision,
+            published_finished_at=published_finished_at,
+        ):
+            candidates.append(("inbox", inbox_pkg))
+        if accepted_pkg is not None and not _package_is_stale(
+            accepted_pkg,
+            published_revision=published_revision,
+            published_finished_at=published_finished_at,
+        ):
+            candidates.append(("accepted", accepted_pkg))
+        candidates.sort(
+            key=lambda item: (
+                _package_finished_at(item[1]),
+                item[1].manifest.export_id,
+            ),
+            reverse=True,
+        )
+
+        package = None
+        if candidates:
+            origin, chosen = candidates[0]
+            if origin == "inbox":
+                try:
+                    claimed = claim_package(chosen, accepted_root)
+                    package = validate_package(claimed, frozenset({database.name}))
+                except (PackageError, OSError) as exc:
+                    raise RuntimeError(f"package claim failed: {exc}") from exc
+            else:
+                package = chosen
+
+        if package is not None:
+            published = published_path_for(database)
+            current = read_revision(published) if published.is_dir() else None
+            if (
+                current == package.revision
+                and not is_graph_full_needed(conn, database.name)
+                and _layers_ready_with_live_storage(
+                    database, package.revision, conn, docker
+                )
+            ):
+                run_id = state.start_run(database.name, package.revision)
+                state.finish_run(run_id, "deferred", "already published")
+                return "deferred"
+            provider = build_source_provider(database, cfg, package=package)
+        elif _published_needs_recovery(database, conn, state, docker):
+            published = published_path_for(database)
+            if published.is_dir() and read_revision(published):
+                provider = build_source_provider(database, cfg, recovery=True)
+            else:
+                run_id = state.start_run(database.name, "(pending)")
+                state.finish_run(run_id, "deferred", "no new package")
+                state.set_lifecycle(
+                    database.name, "deferred", detail="no new package"
+                )
+                return "deferred"
+        else:
             run_id = state.start_run(database.name, "(pending)")
             state.finish_run(run_id, "deferred", "no new package")
             state.set_lifecycle(database.name, "deferred", detail="no new package")
             return "deferred"
-        accepted_root = Path(cfg.runtime.root) / "accepted" / database.name
-        try:
-            claimed = claim_package(chosen, accepted_root)
-            package = validate_package(
-                claimed, frozenset({database.name})
-            )
-        except (PackageError, OSError) as exc:
-            raise RuntimeError(f"package claim failed: {exc}") from exc
-        published = published_path_for(database)
-        current = read_revision(published) if published.is_dir() else None
-        if (
-            current == package.revision
-            and not is_graph_full_needed(conn, database.name)
-        ):
-            layers_ok = True
-            for layer in database.required_layers:
-                row = conn.execute(
-                    """
-                    SELECT status, applied_revision FROM layer_state
-                    WHERE database = ? AND layer = ?
-                    """,
-                    (database.name, layer),
-                ).fetchone()
-                if (
-                    row is None
-                    or str(row["status"]) != "ready"
-                    or str(row["applied_revision"] or "") != package.revision
-                ):
-                    layers_ok = False
-                    break
-            if layers_ok:
-                run_id = state.start_run(database.name, package.revision)
-                state.finish_run(run_id, "deferred", "already published")
-                return "deferred"
-        provider = build_source_provider(database, cfg, package=package)
     else:
-        provider = build_source_provider(database, cfg)
+        if _published_needs_recovery(database, conn, state, docker):
+            published = published_path_for(database)
+            if published.is_dir() and read_revision(published):
+                provider = build_source_provider(database, cfg, recovery=True)
+            else:
+                provider = build_source_provider(database, cfg)
+        else:
+            provider = build_source_provider(database, cfg)
 
-    reload_fn = watch_reload if watch_reload is not None else (lambda: None)
+    reload_fn = (
+        watch_reload
+        if watch_reload is not None
+        else _watch_reload_for_database(database, None)
+    )
     reads = DatabaseReadController(
         database, conn, docker, watch_reload=reload_fn
     )
@@ -569,6 +769,9 @@ def _reap_unfinished_rows(
                 continue
             try:
                 exit_code = int(dockerutil.wait_exec(cid, exec_id, runner=docker))
+            except WriterStillAlive:
+                busy = True
+                continue
             except Exception as exc:
                 err = WriterStateUnknown(
                     f"wait_exec failed for {exec_id}: {exc}"
@@ -586,6 +789,10 @@ def _reap_unfinished_rows(
                 """,
                 (exit_code, job_status, now, row["id"]),
             )
+            if exit_code == 0 and str(row["stage"] or "") == "graph_full":
+                set_graph_full_needed(conn, job_db, False)
+            elif exit_code == 3 and job_stage_layer(str(row["stage"] or "")) == "graph":
+                set_graph_full_needed(conn, job_db, True)
             conn.commit()
             continue
         if not cid:
@@ -643,7 +850,9 @@ def _reap_unfinished_rows(
             """,
             (exit_code, job_status, now, log_path, row["id"]),
         )
-        if exit_code == 3 and job_stage_layer(str(row["stage"] or "")) == "graph":
+        if exit_code == 0 and str(row["stage"] or "") == "graph_full":
+            set_graph_full_needed(conn, job_db, False)
+        elif exit_code == 3 and job_stage_layer(str(row["stage"] or "")) == "graph":
             set_graph_full_needed(conn, job_db, True)
         conn.commit()
     return "busy" if busy else "idle"
@@ -1027,16 +1236,21 @@ def reopen_reads(
     reload_fn = watch_reload if watch_reload is not None else (lambda: None)
     send = alert_send if alert_send is not None else alert_mod.send
 
-    if int(getattr(cfg, "schema_version", 1) or 1) >= 2 and database is not None:
-        return _reopen_reads_v2_database(
-            cfg,
-            database=database,
-            runtime=runtime,
-            lock_backend=lock_backend,
-            docker=docker,
-            watch_reload=reload_fn,
-            send=send,
-        )
+    if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
+        if database is None:
+            enabled = enabled_databases(cfg)
+            if len(enabled) == 1:
+                database = enabled[0].name
+        if database is not None:
+            return _reopen_reads_v2_database(
+                cfg,
+                database=database,
+                runtime=runtime,
+                lock_backend=lock_backend,
+                docker=docker,
+                watch_reload=reload_fn,
+                send=send,
+            )
 
     held = acquire(runtime.lock_path, backend=lock_backend)
     if held is None:
@@ -1127,6 +1341,26 @@ def _reopen_reads_v2_database(
             if is_graph_full_needed(conn, db.name):
                 _safe_send(send, cfg, f"reopen refused: {db.name} graph FULL still needed")
                 return "failed"
+            all_profiles = list((cfg.databases or {}).values())
+            block = writer_blocks_database(conn, db, all_profiles, docker)
+            if block is not None:
+                _safe_send(send, cfg, f"reopen refused: {block}")
+                return "failed"
+            for layer in db.required_layers:
+                row = conn.execute(
+                    """
+                    SELECT status, applied_revision FROM layer_state
+                    WHERE database = ? AND layer = ?
+                    """,
+                    (db.name, layer),
+                ).fetchone()
+                if row is None or str(row["status"] or "") != "ready":
+                    _safe_send(
+                        send,
+                        cfg,
+                        f"reopen refused: {db.name} layer {layer} not ready",
+                    )
+                    return "failed"
             ctrl = DatabaseReadController(
                 db, conn, docker, watch_reload=watch_reload
             )
@@ -1340,18 +1574,24 @@ def _reconcile_v2_locked(
             outcomes.append((db.name, "deferred"))
             continue
         try:
+            db_docker = _docker_for_database(db, docker)
+            db_reload = (
+                reload_fn
+                if database is not None
+                else _watch_reload_for_database(db, reload_fn)
+            )
             status = runner(
                 db,
                 cfg=cfg,
                 conn=conn,
                 state=state,
-                docker=docker,
+                docker=db_docker,
                 send=send,
                 may_write=_fresh_may_write,
                 timer=timer,
                 measure=measure,
                 clock=clock,
-                watch_reload=reload_fn,
+                watch_reload=db_reload,
             )
             status = _normalize_db_result(str(status))
         except WriterStillAlive as exc:

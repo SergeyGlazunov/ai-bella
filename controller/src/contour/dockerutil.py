@@ -307,21 +307,34 @@ def wait_exec(
     *,
     runner: DockerRunner | None = None,
     poll_interval: float = 1.0,
-    timeout: float = 86400.0,
+    timeout: float | None = None,
 ) -> int:
-    """Wait for a detached `docker exec`. Does not `docker wait` the permanent container."""
+    """Wait for a detached `docker exec`. Does not `docker wait` the permanent container.
+
+    Observation budget matches ``dockerutil.wait`` (default 300s). Exhaustion
+    raises ``WriterStillAlive`` so the caller can defer without killing the writer.
+    """
+    from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriterStillAlive
+
     docker_runner = runner if runner is not None else _get_default_runner()
     wait_fn = getattr(docker_runner, "wait_exec", None)
     if callable(wait_fn):
         return int(wait_fn(container, exec_id))
-    deadline = time.monotonic() + timeout
+    budget = (
+        timeout
+        if timeout is not None
+        else DEFAULT_RUNTIME_POLICY.writer_observation_budget_seconds
+    )
+    deadline = time.monotonic() + budget
     while True:
         payload = _exec_inspect(exec_id, docker_runner)
         running = payload.get("Running")
         if running is False or running in {0, "false", "False"}:
             return int(payload.get("ExitCode") or 0)
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"timed out waiting for exec {exec_id} on {container}")
+            raise WriterStillAlive(
+                f"observation budget exceeded waiting for exec {exec_id} on {container}"
+            )
         time.sleep(poll_interval)
 
 
