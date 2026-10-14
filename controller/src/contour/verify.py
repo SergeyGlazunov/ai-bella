@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -146,6 +148,39 @@ def sample_current_tree(
         deletions=[],
         integrity_unknown=True,
     )
+
+
+def verify_layers_at_revision(
+    conn: sqlite3.Connection,
+    database: str,
+    revision: str,
+    required_layers: Sequence[str],
+) -> None:
+    """Refuse publish when a required layer is missing or not at ``revision``."""
+    rows = {
+        str(row["layer"]): row
+        for row in conn.execute(
+            """
+            SELECT layer, status, applied_revision FROM layer_state
+            WHERE database = ?
+            """,
+            (database,),
+        )
+    }
+    for layer in required_layers:
+        row = rows.get(layer)
+        if row is None:
+            raise RuntimeError(f"required layer missing before publish: {layer}")
+        if str(row["status"] or "") != "ready":
+            raise RuntimeError(
+                f"required layer not ready before publish: {layer} "
+                f"(status={row['status']!r})"
+            )
+        if str(row["applied_revision"] or "") != revision:
+            raise RuntimeError(
+                f"required layer revision mismatch for {layer}: "
+                f"{row['applied_revision']!r} != {revision!r}"
+            )
 
 
 def verify_indexes(samples: Samples, probes: IndexProbes) -> None:

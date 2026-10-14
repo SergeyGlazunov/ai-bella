@@ -124,6 +124,25 @@ class StateStore:
 
         self._tx(work)
 
+    def set_lifecycle(
+        self, database: str, status: str, *, detail: str | None = None
+    ) -> None:
+        """Record an operational lifecycle stage for dashboards and recovery."""
+
+        def work() -> None:
+            self._require(database)
+            now = _utc_now()
+            self._conn.execute(
+                """
+                UPDATE database_state
+                SET lifecycle_status = ?, detail = ?, updated_at = ?
+                WHERE database = ?
+                """,
+                (status, detail, now, database),
+            )
+
+        self._tx(work)
+
     def mark_layer(
         self,
         database: str,

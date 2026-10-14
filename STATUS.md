@@ -48,5 +48,5 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 ## Next action
 
 1. Observe PS/ai2 nightly LastResult on the stand (operator).
-2. Linux-first kit: Tasks 2–6 done for operational subset; deferred exotic FS hardening documented in the plan.
-3. Next kit work: **Task 7** (per-database lifecycle pipeline) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
+2. Linux-first kit: Tasks 2–7 done for operational subset; deferred exotic FS hardening documented in the plan.
+3. Next kit work: **Task 8** (multi-db reconcile + unfinished job recovery) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.

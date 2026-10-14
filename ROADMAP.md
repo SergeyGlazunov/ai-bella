@@ -26,7 +26,7 @@ Plan: `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`
 | 0 Design accepted | — | accepted with operational priority §1.1 |
 | 1 Repo baseline | Task 1 | done |
 | 2 Config + SQLite + inbox + sources | Tasks 2–5 | **done in kit** (ops subset; exotic FS deferred) |
-| 3 Contour pipeline | Tasks 6–8 | Task 6 done; **next: Task 7** |
+| 3 Contour pipeline | Tasks 6–8 | Tasks 6–7 done; **next: Task 8** |
 | 4 Windows = exporter only | Task 9 | pending |
 | 5 Host install (`/srv/ai-contour`, systemd) | Task 10 | pending |
 | 6 Dry-run acceptance | Task 11 | pending |

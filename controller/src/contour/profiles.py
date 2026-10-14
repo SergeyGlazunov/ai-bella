@@ -73,12 +73,15 @@ def run_graph_layer(
     conn: sqlite3.Connection,
     runner: DockerRunner | None = None,
     may_write: Callable[[], str] | None = None,
+    *,
+    full_needed: bool = False,
     **graph_kwargs: Any,
 ) -> LayerResult:
     """Run the graph layer; preserve exit-code-3 → FULL contract.
 
     ``may_write`` returns ``\"ok\"`` to allow FULL, or a short reason string
     that forbids it (same contract as ``may_write_decision``).
+    ``full_needed`` applies a previously saved FULL requirement (recovery).
     """
     _ensure_run_revision(conn, run_id, database.name, revision)
     writer_container = index_graph(
@@ -87,6 +90,7 @@ def run_graph_layer(
         run_id,
         runner=runner,
         may_write_fn=may_write,
+        full_needed=full_needed,
         **graph_kwargs,
     )
     storage_id = dockerutil.volume_identity(
@@ -110,6 +114,7 @@ def run_required_layers(
     runner: DockerRunner | None = None,
     only_layers: Sequence[str] | None = None,
     may_write: Callable[[], str] | None = None,
+    full_needed: bool = False,
 ) -> list[LayerResult]:
     """Run required layers in order, or fail if a required layer is skipped."""
     profile = profile_from_config(database)
@@ -140,6 +145,7 @@ def run_required_layers(
                     conn,
                     runner=runner,
                     may_write=may_write,
+                    full_needed=full_needed,
                 )
             )
         else:  # pragma: no cover - guarded by profile_from_config

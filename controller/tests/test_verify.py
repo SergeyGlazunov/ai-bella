@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from contour.verify import Samples, sample_current_tree, sample_paths, verify_indexes
+from contour.db import init_db
+from contour.verify import (
+    Samples,
+    sample_current_tree,
+    sample_paths,
+    verify_indexes,
+    verify_layers_at_revision,
+)
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -183,3 +190,28 @@ def test_sample_current_tree_empty_unknown_fails(tmp_path: Path):
     )
     with pytest.raises(RuntimeError, match="(?i)integrity|unknown|empty"):
         verify_indexes(samples, probes)
+
+
+def test_verify_layers_at_revision_requires_ready_layers(tmp_path: Path):
+    conn = init_db(str(tmp_path / "state.db"))
+    conn.execute(
+        """
+        INSERT INTO layer_state (
+          database, layer, status, applied_revision, storage_id,
+          indexer_version, updated_at
+        ) VALUES ('ubd', 'code_index', 'ready', 'r1', 's', 'i', 't')
+        """
+    )
+    conn.commit()
+    with pytest.raises(RuntimeError, match="graph"):
+        verify_layers_at_revision(conn, "ubd", "r1", ("code_index", "graph"))
+    conn.execute(
+        """
+        INSERT INTO layer_state (
+          database, layer, status, applied_revision, storage_id,
+          indexer_version, updated_at
+        ) VALUES ('ubd', 'graph', 'ready', 'r1', 's', 'i', 't')
+        """
+    )
+    conn.commit()
+    verify_layers_at_revision(conn, "ubd", "r1", ("code_index", "graph"))

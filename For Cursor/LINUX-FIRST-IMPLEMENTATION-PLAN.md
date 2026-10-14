@@ -507,6 +507,8 @@ git commit -m "refactor: add database-specific index profiles"
 
 ### Task 7: Build the per-database lifecycle pipeline
 
+**Status:** done in kit. Graph recovery must pass saved FULL via `is_graph_full_needed` → `full_needed` (not only an explicit caller flag).
+
 **Files:**
 - Create: `controller/src/contour/pipeline.py`
 - Create: `controller/tests/test_pipeline.py`
@@ -517,7 +519,7 @@ git commit -m "refactor: add database-specific index profiles"
 - Consumes: database config, source provider, state store, read controller, layer runners and probes.
 - Produces: `PipelineResult` and `run_database_pipeline()`.
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 Test the exact transition order:
 
@@ -535,11 +537,11 @@ Also test:
 - probes run before reads reopen;
 - publishing updates SQLite only after verification.
 
-- [ ] **Step 2: Run focused tests and verify failure**
+- [x] **Step 2: Run focused tests and verify failure**
 
 Run: `python -m pytest tests/test_pipeline.py tests/test_verify.py -v`.
 
-- [ ] **Step 3: Implement the pipeline interface**
+- [x] **Step 3: Implement the pipeline interface**
 
 ```python
 @dataclass(frozen=True)
@@ -559,13 +561,13 @@ def run_database_pipeline(
 ) -> PipelineResult: ...
 ```
 
-Keep scheduling and global locking outside this function. It owns one database lifecycle only.
+Keep scheduling and global locking outside this function. It owns one database lifecycle only. When indexing Graph, read the saved per-database FULL flag (`is_graph_full_needed`) and pass it as `full_needed`.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `python -m pytest tests/test_pipeline.py tests/test_verify.py -v`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add controller/src/contour/pipeline.py controller/src/contour/verify.py controller/tests/test_pipeline.py controller/tests/test_verify.py
