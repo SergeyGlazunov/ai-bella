@@ -11,13 +11,11 @@ from contour.packages import compute_source_checksum, validate_package
 from contour.sources import (
     GitSourceProvider,
     PackageSourceProvider,
+    PreparedSource,
     SourceError,
     activate_source,
     rollback_source,
 )
-
-
-SOURCES = Path("/srv/ai-contour/sources")
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -47,7 +45,6 @@ def _init_repo(tmp_path: Path) -> tuple[Path, Path, str]:
 
 
 def _layout(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """sources_root / staging_root / published under a fake /srv tree."""
     sources_root = tmp_path / "srv" / "ai-contour" / "sources"
     sources_root.mkdir(parents=True)
     staging = sources_root / ".staging"
@@ -84,7 +81,6 @@ def test_git_prepare_rejects_non_fast_forward(tmp_path: Path):
     remote, work, branch = _init_repo(tmp_path)
     sources_root, staging, published = _layout(tmp_path)
 
-    # Diverging history on remote vs local commit.
     other = tmp_path / "other"
     _git(tmp_path, "clone", str(remote), str(other))
     _git(other, "config", "user.email", "t@example.com")
@@ -97,7 +93,6 @@ def test_git_prepare_rejects_non_fast_forward(tmp_path: Path):
     (work / "file.txt").write_text("local-only", encoding="utf-8")
     _git(work, "add", "file.txt")
     _git(work, "commit", "-m", "local")
-    # Do not push — fetch will make origin diverge from local.
 
     provider = GitSourceProvider(
         _git_config(work, str(remote), branch),
@@ -164,13 +159,13 @@ def test_activate_uses_replace_and_preserves_previous_on_failure(
     (staged / ".contour-revision").write_text("new", encoding="utf-8")
     (staged / "new.txt").write_text("new", encoding="utf-8")
 
-    from contour.sources import PreparedSource
-
     prepared = PreparedSource(
         database="ubd",
         revision="new",
         staged_path=staged,
         previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
     )
 
     real_replace = Path.replace
@@ -186,7 +181,6 @@ def test_activate_uses_replace_and_preserves_previous_on_failure(
     with pytest.raises(OSError, match="injected"):
         activate_source(prepared, published)
 
-    # Previous live content must still be recoverable / present as published.
     assert published.exists()
     assert (published / "old.txt").read_text(encoding="utf-8") == "old"
     assert calls, "activation must use Path.replace"
@@ -203,18 +197,18 @@ def test_activate_same_revision_is_idempotent(tmp_path: Path):
     (staged / ".contour-revision").write_text("rev-a", encoding="utf-8")
     (staged / "file.txt").write_text("a", encoding="utf-8")
 
-    from contour.sources import PreparedSource
-
     prepared = PreparedSource(
         database="ubd",
         revision="rev-a",
         staged_path=staged,
         previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
     )
     prev = activate_source(prepared, published)
     assert prev is None
     assert (published / "file.txt").read_text(encoding="utf-8") == "a"
-    assert staged.exists()  # unused staging left; published untouched
+    assert staged.exists()
 
 
 def test_rollback_restores_previous(tmp_path: Path):
@@ -228,7 +222,7 @@ def test_rollback_restores_previous(tmp_path: Path):
     (previous / ".contour-revision").write_text("old", encoding="utf-8")
     (previous / "old.txt").write_text("old", encoding="utf-8")
 
-    rollback_source(published, previous)
+    rollback_source(published, previous, sources_root=sources_root)
     assert (published / "old.txt").read_text(encoding="utf-8") == "old"
     assert not previous.exists()
 
