@@ -214,6 +214,48 @@ function Test-PackageContentComplete {
     )
 }
 
+function Get-ManifestChecksumValue {
+    param($Manifest)
+    if ($Manifest -is [hashtable] -or $Manifest -is [System.Collections.Specialized.OrderedDictionary]) {
+        return [string]$Manifest['checksum']
+    }
+    return [string]$Manifest.checksum
+}
+
+function Get-ManifestFileCountValue {
+    param($Manifest)
+    if ($Manifest -is [hashtable] -or $Manifest -is [System.Collections.Specialized.OrderedDictionary]) {
+        return [int]$Manifest['file_count']
+    }
+    return [int]$Manifest.file_count
+}
+
+function Test-PackageTreeMatchesManifest {
+    <#
+    .SYNOPSIS
+      True when on-disk src tree matches manifest file_count and checksum.
+      Structural presence alone is not enough (interrupted copy may drop files).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)]$Manifest
+    )
+    if (-not (Test-PackageContentComplete -PackagePath $PackagePath)) {
+        return $false
+    }
+    if (-not (Test-PackageIdentityMatch -ReadyPath $PackagePath -Manifest $Manifest)) {
+        return $false
+    }
+    $actualChecksum = New-SourceChecksum -SourcePath $PackagePath
+    $actualCount = Get-SourceFileCount -PackageRoot $PackagePath
+    $expectedChecksum = Get-ManifestChecksumValue -Manifest $Manifest
+    $expectedCount = Get-ManifestFileCountValue -Manifest $Manifest
+    return (
+        $actualChecksum -eq $expectedChecksum -and
+        $actualCount -eq $expectedCount
+    )
+}
+
 <#
 .SYNOPSIS
   Copy dump tree into inbox as .incoming-<id>, write manifest, publish ready-<id>, create READY last.
@@ -256,16 +298,12 @@ function Publish-ExportPackage {
             }
             throw "claim collision for export_id=$exportId"
         }
-        # Renamed but READY missing (interrupted publish). Finish only when
-        # content matches this delivery; otherwise remove and rebuild.
-        if (
-            (Test-PackageContentComplete -PackagePath $readyPath) -and
-            (Test-PackageIdentityMatch -ReadyPath $readyPath -Manifest $Manifest)
-        ) {
+        # Renamed but READY missing (interrupted publish). Finish only when the
+        # on-disk tree matches this delivery's checksum/file_count; otherwise
+        # remove and rebuild from the dump. After writing READY the consumer may
+        # claim immediately — do not re-check inbox paths.
+        if (Test-PackageTreeMatchesManifest -PackagePath $readyPath -Manifest $Manifest) {
             [IO.File]::WriteAllBytes($readyMarker, [byte[]]@())
-            if (-not (Test-Path -LiteralPath $readyMarker -PathType Leaf)) {
-                throw "READY missing after completing interrupted publish"
-            }
             Write-Host "completed interrupted publish (READY written): $readyName"
             return $readyPath
         }
