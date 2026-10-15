@@ -154,10 +154,15 @@ def _logs_dir_from_cfg(cfg) -> Path | None:
 
 
 def _log_directory(logs_dir: str | Path | None = None) -> Path:
+    """Resolve a writable log directory; never raises for bad configured paths."""
     if logs_dir is not None:
         path = Path(logs_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            if path.is_dir():
+                return path
+        except OSError:
+            pass
     for candidate in _DEFAULT_LOG_DIRS:
         if candidate.is_dir():
             return candidate
@@ -174,7 +179,7 @@ def copy_job_logs(
     """Write container logs under runtime.logs_path (or host fallback), else tempfile.
 
     Bounded by the docker command timeout. Failure returns None without
-    affecting the caller's job exit_code.
+    affecting the caller's job exit_code — including mkdir/path errors.
     """
     from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
 
@@ -187,30 +192,35 @@ def copy_job_logs(
         return None
     resolved = logs_dir if logs_dir is not None else _logs_dir_from_cfg(cfg)
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in container_id)
-    path = _log_directory(resolved) / f"contour-graph-{safe}.log"
+    body = (result.stdout or "") + (result.stderr or "")
     try:
-        path.write_text(
-            (result.stdout or "") + (result.stderr or ""),
-            encoding="utf-8",
-        )
+        path = _log_directory(resolved) / f"contour-graph-{safe}.log"
+        path.write_text(body, encoding="utf-8")
         return str(path)
     except OSError:
-        handle = tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".log",
-            prefix="contour-graph-log-",
-            delete=False,
-            encoding="utf-8",
-        )
-        with handle:
-            handle.write(result.stdout or "")
-            if result.stderr:
-                handle.write(result.stderr)
-        return handle.name
+        try:
+            handle = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".log",
+                prefix="contour-graph-log-",
+                delete=False,
+                encoding="utf-8",
+            )
+            with handle:
+                handle.write(body)
+            return handle.name
+        except OSError:
+            return None
 
 
-def _copy_logs(docker: DockerRunner, container_id: str, *, cfg=None) -> str | None:
-    return copy_job_logs(docker, container_id, cfg=cfg)
+def _copy_logs(
+    docker: DockerRunner,
+    container_id: str,
+    *,
+    cfg=None,
+    logs_dir: str | Path | None = None,
+) -> str | None:
+    return copy_job_logs(docker, container_id, cfg=cfg, logs_dir=logs_dir)
 
 
 def allow_graph_full(
@@ -258,12 +268,20 @@ def _build_override(
     )
 
 
+def _resolve_logs_path(cfg, logs_path: str | Path | None) -> Path | None:
+    if logs_path is not None:
+        return Path(logs_path)
+    return _logs_dir_from_cfg(cfg)
+
+
 def _run_graph_job(
     cfg,
     conn: sqlite3.Connection,
     run_id: int,
     stage: str,
     docker: DockerRunner,
+    *,
+    logs_path: str | Path | None = None,
 ) -> int:
     job_service, container_name = _job_identity(stage)
     existing = _existing_compose_files(cfg.services.graph_compose_dir)
@@ -289,7 +307,14 @@ def _run_graph_job(
     job_id = _insert_job(conn, run_id, stage, container_id, database=database)
     start(container_id, runner=docker)
     exit_code = wait(container_id, runner=docker)
-    log_path = _copy_logs(docker, container_id, cfg=cfg)
+    # Logging must never block recording the real indexer exit code.
+    log_path = None
+    try:
+        log_path = _copy_logs(
+            docker, container_id, cfg=cfg, logs_dir=logs_path
+        )
+    except Exception:
+        log_path = None
     _finish_job(conn, job_id, exit_code, log_path)
     return exit_code
 
@@ -305,11 +330,24 @@ def index_graph(
     remaining_budget: float | None = None,
     measure: bool = False,
     full_needed: bool = False,
+    logs_path: str | Path | None = None,
 ) -> str:
-    """Run graph delta/FULL. Returns the writer container id used last."""
+    """Run graph delta/FULL. Returns the writer container id used last.
+
+    ``logs_path`` is the host directory for diagnostic files (typically
+    ``cfg.runtime.logs_path``). Pass it explicitly when ``cfg`` is a
+    ``DatabaseConfig`` without ``runtime``.
+    """
     docker = _runner(runner)
     database = _database_for_run(cfg, conn, run_id)
-    code = 3 if full_needed else _run_graph_job(cfg, conn, run_id, "graph", docker)
+    resolved_logs = _resolve_logs_path(cfg, logs_path)
+    code = (
+        3
+        if full_needed
+        else _run_graph_job(
+            cfg, conn, run_id, "graph", docker, logs_path=resolved_logs
+        )
+    )
     if code == 0:
         set_graph_full_needed(conn, database, False)
         return _latest_graph_writer(conn, run_id)
@@ -326,7 +364,9 @@ def index_graph(
             raise RuntimeError(
                 "graph FULL skipped: may_write deferred or window remaining is 0"
             )
-        full_code = _run_graph_job(cfg, conn, run_id, "graph_full", docker)
+        full_code = _run_graph_job(
+            cfg, conn, run_id, "graph_full", docker, logs_path=resolved_logs
+        )
         if full_code != 0:
             raise RuntimeError(f"graph FULL failed with exit {full_code}")
         set_graph_full_needed(conn, database, False)

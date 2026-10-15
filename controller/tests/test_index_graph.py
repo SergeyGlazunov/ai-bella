@@ -396,3 +396,81 @@ def test_index_graph_persists_log_under_runtime_logs_path(tmp_path: Path):
         assert log_path.is_file()
     finally:
         conn.close()
+
+
+def test_profile_graph_uses_configured_logs(tmp_path: Path, monkeypatch):
+    """Production multi-db path: DatabaseConfig alone; logs_path via runner."""
+    from dataclasses import replace
+
+    from contour.pipeline import ProfilesLayerRunner
+    from contour.profiles import run_graph_layer
+
+    cfg = _make_config(tmp_path)
+    logs = tmp_path / "configured-runs"
+    cfg = replace(cfg, runtime=replace(cfg.runtime, logs_path=str(logs)))
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    monkeypatch.setattr("contour.index_graph._DEFAULT_LOG_DIRS", (fallback,))
+    ubd = replace(cfg.databases["ubd"], required_layers=frozenset({"graph"}))
+    conn, run_id = _init_run(tmp_path)
+    try:
+        # Boundary the review reported: run_graph_layer with DatabaseConfig.
+        run_graph_layer(
+            ubd,
+            "deadbeef",
+            run_id,
+            conn,
+            runner=FakeDockerRunner(conn=conn, log_text="ok"),
+            logs_path=str(logs),
+        )
+        row = conn.execute(
+            "SELECT log_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert Path(row["log_path"]).parent == logs
+
+        # Same wiring through ProfilesLayerRunner (production reconcile path).
+        conn.execute("DELETE FROM jobs")
+        conn.commit()
+        run_id2 = int(
+            conn.execute(
+                "INSERT INTO runs (database, target_revision, started_at) "
+                "VALUES (?, ?, ?)",
+                ("ubd", "deadbeef2", "2026-09-20T00:00:00Z"),
+            ).lastrowid
+        )
+        conn.commit()
+        layers = ProfilesLayerRunner(
+            conn=conn,
+            docker_runner=FakeDockerRunner(conn=conn, log_text="ok2"),
+            logs_path=str(logs),
+        )
+        layers.run(ubd, "deadbeef2", run_id2)
+        row2 = conn.execute(
+            "SELECT log_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert Path(row2["log_path"]).parent == logs
+    finally:
+        conn.close()
+
+
+def test_log_directory_failure_preserves_successful_job(tmp_path: Path):
+    from dataclasses import replace
+
+    cfg = _make_config(tmp_path)
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("occupied", encoding="utf-8")
+    cfg = replace(cfg, runtime=replace(cfg.runtime, logs_path=str(blocked / "runs")))
+    conn, run_id = _init_run(tmp_path)
+    try:
+        index_graph(
+            cfg,
+            conn,
+            run_id,
+            runner=FakeDockerRunner(conn=conn, wait_codes=[0]),
+        )
+        row = conn.execute(
+            "SELECT status, exit_code FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["status"] == "ok" and row["exit_code"] == 0
+    finally:
+        conn.close()

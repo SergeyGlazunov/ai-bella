@@ -66,6 +66,7 @@ class ProfilesLayerRunner:
     conn: sqlite3.Connection
     docker_runner: object | None = None
     may_write: Callable[[], str] | None = None
+    logs_path: str | None = None
 
     def run(
         self,
@@ -87,6 +88,7 @@ class ProfilesLayerRunner:
             runner=self.docker_runner,  # type: ignore[arg-type]
             may_write=may_write or self.may_write,
             full_needed=full_needed,
+            logs_path=self.logs_path,
             on_layer_start=on_layer_start,
             on_layer_result=on_layer_result,
             on_layer_error=on_layer_error,

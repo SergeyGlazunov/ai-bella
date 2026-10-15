@@ -86,6 +86,7 @@ def run_graph_layer(
     may_write: Callable[[], str] | None = None,
     *,
     full_needed: bool = False,
+    logs_path: str | None = None,
     **graph_kwargs: Any,
 ) -> LayerResult:
     """Run the graph layer; preserve exit-code-3 → FULL contract.
@@ -93,6 +94,7 @@ def run_graph_layer(
     ``may_write`` returns ``\"ok\"`` to allow FULL, or a short reason string
     that forbids it (same contract as ``may_write_decision``).
     ``full_needed`` applies a previously saved FULL requirement (recovery).
+    ``logs_path`` is host ``runtime.logs_path`` (DatabaseConfig has no runtime).
     """
     _ensure_run_revision(conn, run_id, database.name, revision)
     writer_container = index_graph(
@@ -102,6 +104,7 @@ def run_graph_layer(
         runner=runner,
         may_write_fn=may_write,
         full_needed=full_needed,
+        logs_path=logs_path,
         **graph_kwargs,
     )
     storage_id = dockerutil.volume_identity(
@@ -126,6 +129,7 @@ def run_required_layers(
     only_layers: Sequence[str] | None = None,
     may_write: Callable[[], str] | None = None,
     full_needed: bool = False,
+    logs_path: str | None = None,
     on_layer_start: Callable[[str], None] | None = None,
     on_layer_result: Callable[[LayerResult], None] | None = None,
     on_layer_error: Callable[[str, BaseException], None] | None = None,
@@ -176,6 +180,7 @@ def run_required_layers(
                     runner=runner,
                     may_write=may_write,
                     full_needed=full_needed,
+                    logs_path=logs_path,
                 )
             else:  # pragma: no cover - guarded by profile_from_config
                 raise ValueError(f"unsupported layer: {layer}")

@@ -528,7 +528,14 @@ def _default_v2_database_runner(
     probes = build_probes(
         database, docker, required_layers=frozenset(database.required_layers)
     )
-    layers = ProfilesLayerRunner(conn=conn, docker_runner=docker, may_write=may_write)
+    runtime = getattr(cfg, "runtime", None)
+    logs_path = runtime.logs_path if runtime is not None else None
+    layers = ProfilesLayerRunner(
+        conn=conn,
+        docker_runner=docker,
+        may_write=may_write,
+        logs_path=logs_path,
+    )
     result = run_database_pipeline(
         database,
         provider,
