@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from contour.adapters import CommandEngine, MissingAdapters, build_probes
 from contour.alert import command_is_runnable
-from contour.config import enabled_databases, load_config
+from contour.config import (
+    GitSourceConfig,
+    PackageSourceConfig,
+    enabled_databases,
+    load_config,
+)
 from contour.db import get_component, get_meta, init_db
 from contour.dockerutil import SubprocessRunner
 from contour.gitutil import safe_remote
@@ -23,6 +29,9 @@ from contour.reconcile import (
     select_databases,
 )
 from contour.watch_bsl import reload_bsl_daemon
+
+DEFAULT_CONFIG = "/etc/ai-contour/contour.yaml"
+STATE_BACKUP_RETAIN_DAYS = 14
 
 
 def _docker():
@@ -60,12 +69,83 @@ def _job_duration(started_at: str | None) -> str:
     return f" duration={seconds}s"
 
 
-def _print_status(cfg, paths: RuntimePaths) -> None:
-    print(f"remote: {safe_remote(cfg.repo.remote)}")
-    print(f"branch: {cfg.repo.branch}")
-    print(f"repo: {cfg.repo.path}")
+def _source_kind(database) -> str:
+    if isinstance(database.source, PackageSourceConfig):
+        return "package"
+    if isinstance(database.source, GitSourceConfig):
+        return "git"
+    return "unknown"
+
+
+def _print_database_status(conn: sqlite3.Connection, cfg, db_name: str) -> None:
+    db = (cfg.databases or {}).get(db_name)
+    if db is None:
+        print(f"database: {db_name} (not in config)")
+        return
+    kind = _source_kind(db)
+    print(f"database: {db_name}")
+    print(f"  enabled: {str(bool(db.enabled)).lower()}")
+    print(f"  source: {kind}")
+    if isinstance(db.source, GitSourceConfig):
+        print(f"  git_path: {db.source.path}")
+        print(f"  git_remote: {safe_remote(db.source.remote)}")
+        print(f"  git_branch: {db.source.branch}")
+    elif isinstance(db.source, PackageSourceConfig):
+        print(f"  inbox: {db.source.inbox}")
+        print(f"  source_path: {db.source.source_path}")
+    print(f"  required_layers: {','.join(sorted(db.required_layers))}")
+    row = conn.execute(
+        """
+        SELECT lifecycle_status, published_revision, staged_revision, detail
+        FROM database_state WHERE database = ?
+        """,
+        (db_name,),
+    ).fetchone()
+    if row is None:
+        print("  state: (none)")
+    else:
+        print(
+            f"  lifecycle: {row['lifecycle_status']} "
+            f"published={row['published_revision'] or '-'} "
+            f"staged={row['staged_revision'] or '-'} "
+            f"detail={row['detail'] or '-'}"
+        )
+    layers = conn.execute(
+        """
+        SELECT layer, status, applied_revision, storage_id, indexer_version
+        FROM layer_state WHERE database = ? ORDER BY layer
+        """,
+        (db_name,),
+    ).fetchall()
+    if not layers:
+        print("  layers: (none)")
+        return
+    for layer in layers:
+        print(
+            f"  {layer['layer']}: status={layer['status']} "
+            f"rev={layer['applied_revision'] or '-'} "
+            f"storage={layer['storage_id'] or '-'} "
+            f"indexer={layer['indexer_version'] or '-'}"
+        )
+
+
+def _print_status(cfg, paths: RuntimePaths, *, database: str | None = None) -> int:
+    if int(getattr(cfg, "schema_version", 1) or 1) < 2 or database is None:
+        # Legacy / full status: never print remote userinfo.
+        print(f"remote: {safe_remote(cfg.repo.remote)}")
+        print(f"branch: {cfg.repo.branch}")
+        print(f"repo: {cfg.repo.path}")
     conn = init_db(paths.db_path)
     try:
+        if database is not None:
+            try:
+                select_databases(cfg, database)
+            except ValueError as exc:
+                print(str(exc))
+                return 1
+            _print_database_status(conn, cfg, database)
+            return 0
+
         close_req = get_meta(conn, "reads_close_requested")
         closed = get_meta(conn, "reads_closed")
         print(f"reads_close_requested: {close_req}")
@@ -112,36 +192,11 @@ def _print_status(cfg, paths: RuntimePaths) -> None:
             )
         if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
             print("databases:")
-            for db_name in enabled_databases(cfg):
-                row = conn.execute(
-                    """
-                    SELECT lifecycle_status, published_revision, detail, updated_at
-                    FROM database_state WHERE database = ?
-                    """,
-                    (db_name,),
-                ).fetchone()
-                if row is None:
-                    print(f"  {db_name}: (no state)")
-                    continue
-                print(
-                    f"  {db_name}: status={row['lifecycle_status']} "
-                    f"published={row['published_revision'] or '-'} "
-                    f"detail={row['detail'] or '-'}"
-                )
-                layers = conn.execute(
-                    """
-                    SELECT layer, status, applied_revision FROM layer_state
-                    WHERE database = ? ORDER BY layer
-                    """,
-                    (db_name,),
-                ).fetchall()
-                for layer in layers:
-                    print(
-                        f"    {layer['layer']}: {layer['status']} "
-                        f"rev={layer['applied_revision'] or '-'}"
-                    )
+            for db_name in (cfg.databases or {}):
+                _print_database_status(conn, cfg, db_name)
     finally:
         conn.close()
+    return 0
 
 
 def _validate(cfg) -> int:
@@ -155,12 +210,133 @@ def _validate(cfg) -> int:
             text = ""
         if "alert.sh.example is a stub" in text or "NOT production-ready" in text:
             return 1
+
+    if int(getattr(cfg, "schema_version", 1) or 1) >= 2:
+        databases = cfg.databases or {}
+        if not databases:
+            print("validate failed: no databases in schema_version 2 config")
+            return 1
+        for name, db in databases.items():
+            kind = _source_kind(db)
+            print(
+                f"database: {name} enabled={str(bool(db.enabled)).lower()} "
+                f"source={kind} layers={','.join(sorted(db.required_layers))}"
+            )
+            if not db.enabled:
+                continue
+            try:
+                build_probes(
+                    db,
+                    _docker(),
+                    required_layers=frozenset(db.required_layers),
+                )
+                if not db.adapters.idle_probe:
+                    raise MissingAdapters(
+                        f"database {name}: adapters.idle_probe is required"
+                    )
+            except MissingAdapters as exc:
+                print(str(exc))
+                return 1
+        return 0
+
     try:
         build_probes(cfg, _docker())
         if cfg.adapters is None or not cfg.adapters.idle_probe:
             raise MissingAdapters("adapters.idle_probe is required")
     except MissingAdapters:
         return 1
+    return 0
+
+
+def _intake(cfg, database: str) -> int:
+    """Validate and claim the newest inbox package; do not index."""
+    from contour.packages import (
+        PackageError,
+        choose_newest_valid_package,
+        claim_package,
+        validate_package,
+    )
+
+    try:
+        selected = select_databases(cfg, database)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    db = selected[0]
+    if not isinstance(db.source, PackageSourceConfig):
+        print(f"intake requires a package source database, got {_source_kind(db)}")
+        return 1
+    if cfg.runtime is None or not cfg.runtime.root:
+        print("intake requires runtime.root for accepted packages")
+        return 1
+
+    chosen, warnings = choose_newest_valid_package(
+        Path(db.source.inbox), db.name
+    )
+    for item in warnings:
+        print(f"warning: {item}")
+    if chosen is None:
+        print(f"no valid package in inbox for {db.name}")
+        return 1
+
+    accepted_root = Path(cfg.runtime.root) / "accepted" / db.name
+    try:
+        claimed = claim_package(chosen, accepted_root)
+        package = validate_package(claimed, frozenset({db.name}))
+    except (PackageError, OSError) as exc:
+        print(f"intake failed: {exc}")
+        return 1
+
+    print(
+        f"intake ok: database={db.name} revision={package.revision} "
+        f"path={claimed}"
+    )
+    print("note: indexing runs only via contour update")
+    return 0
+
+
+def _backup_state(cfg, paths: RuntimePaths, *, retain_days: int = STATE_BACKUP_RETAIN_DAYS) -> int:
+    """SQLite online backup into runtime.backups_path; prune older copies."""
+    runtime = getattr(cfg, "runtime", None)
+    if runtime is not None and runtime.backups_path:
+        backup_dir = Path(runtime.backups_path)
+    else:
+        backup_dir = Path("/srv/ai-contour/backups/state")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = backup_dir / f"state-{stamp}.db"
+    src_path = paths.db_path
+    if not Path(src_path).is_file():
+        # Ensure schema exists so first backup still works.
+        conn = init_db(src_path)
+        conn.close()
+
+    src = sqlite3.connect(src_path)
+    try:
+        dst = sqlite3.connect(str(dest))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    print(f"backup-state ok: {dest}")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, retain_days))
+    for path in backup_dir.glob("state-*.db"):
+        try:
+            # state-YYYYMMDDTHHMMSSZ.db
+            token = path.stem.removeprefix("state-")
+            stamped = datetime.strptime(token, "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if stamped < cutoff:
+            path.unlink(missing_ok=True)
+            print(f"backup-state pruned: {path.name}")
     return 0
 
 
@@ -174,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     # R01: pull --config/--db/--lock from anywhere so both
     # `contour --config X validate` and `contour validate --config X` work.
     global_parser = argparse.ArgumentParser(add_help=False)
-    global_parser.add_argument("--config", default="/opt/ai-sync/config.yaml")
+    global_parser.add_argument("--config", default=DEFAULT_CONFIG)
     # None defaults so v2 cfg.runtime is not silently overridden by legacy paths.
     global_parser.add_argument("--db", default=None)
     global_parser.add_argument("--lock", default=None)
@@ -184,7 +360,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("validate")
-    sub.add_parser("status")
+    status = sub.add_parser("status")
+    status.add_argument(
+        "--database",
+        default=None,
+        help="show one v2 database profile (source + layer revisions)",
+    )
     update = sub.add_parser("update")
     update.add_argument(
         "--measure",
@@ -195,6 +376,25 @@ def main(argv: list[str] | None = None) -> int:
         "--database",
         default=None,
         help="run a single database profile (schema_version 2)",
+    )
+    intake = sub.add_parser(
+        "intake",
+        help="validate and claim the newest inbox package without indexing",
+    )
+    intake.add_argument(
+        "--database",
+        required=True,
+        help="package-source database to intake",
+    )
+    backup = sub.add_parser(
+        "backup-state",
+        help="SQLite online backup of state.db into runtime.backups_path",
+    )
+    backup.add_argument(
+        "--retain-days",
+        type=int,
+        default=STATE_BACKUP_RETAIN_DAYS,
+        help=f"delete backups older than N days (default {STATE_BACKUP_RETAIN_DAYS})",
     )
     open_parser = sub.add_parser(
         "open",
@@ -232,8 +432,17 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.command == "status":
-        _print_status(cfg, paths)
-        return 0
+        return _print_status(
+            cfg, paths, database=getattr(args, "database", None)
+        )
+
+    if args.command == "intake":
+        return _intake(cfg, args.database)
+
+    if args.command == "backup-state":
+        return _backup_state(
+            cfg, paths, retain_days=int(args.retain_days)
+        )
 
     if args.command == "update":
         database = getattr(args, "database", None)

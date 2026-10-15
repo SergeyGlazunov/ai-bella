@@ -28,7 +28,7 @@ Plan: `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`
 | 2 Config + SQLite + inbox + sources | Tasks 2–5 | **done in kit** (ops subset; exotic FS deferred) |
 | 3 Contour pipeline | Tasks 6–8 | Tasks 6–8 **kit code done** (not stand cutover); next: Task 9 |
 | 4 Windows = exporter only | Task 9 | pending |
-| 5 Host install (`/srv/ai-contour`, systemd) | Task 10 | pending |
+| 5 Host install (`/srv/ai-contour`, systemd) | Task 10 | done |
 | 6 Dry-run acceptance | Task 11 | pending |
 | 7 Stand catch-up + schedule cutover | Task 12 | **STAND ONLY** |
 

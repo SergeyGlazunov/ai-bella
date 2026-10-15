@@ -5,8 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/ai-sync
-ExecStart=/opt/ai-sync/venv/bin/contour update
+User=ai-contour
+Group=ai-contour
+WorkingDirectory=/opt/ai-contour
+Environment=CONTOUR_CONFIG=/etc/ai-contour/contour.yaml
+ExecStart=/opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml update
 
 [Install]
 WantedBy=multi-user.target

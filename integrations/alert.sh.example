@@ -8,5 +8,5 @@ if [ "${CONTOUR_ALERT_ALLOW_LOG:-}" != "1" ]; then
   exit 1
 fi
 umask 077
-mkdir -p /srv/ai/logs
-cat >> /srv/ai/logs/contour-alert.log
+mkdir -p /srv/ai-contour/logs
+cat >> /srv/ai-contour/logs/contour-alert.log

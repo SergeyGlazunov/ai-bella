@@ -48,6 +48,6 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 ## Next action
 
 1. Observe PS/ai2 nightly LastResult on the stand (operator). Note: Task 9 kit exporters no longer index — until cutover, either keep legacy nightly paths or temporarily dual-run; **do not switch live Task Scheduler to package-only without inbox+contour intake**.
-2. Linux-first kit: Tasks 2–9 done in kit code. Task 9: package exporters with ordinal checksum (matches Python), interrupted-READY recovery, post-READY claim-safe publish, robocopy `/R:2 /W:2`. **Do not switch live Scheduler to package-only without inbox+contour intake.** **No stand cutover**.
-3. Next kit work: **Task 10** (CLI / systemd / bootstrap for `/srv/ai-contour`) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
-4. Before stand dry-run: Linux/WSL lock/path checks on a WSL host; Tasks 11–12 for dry-run/cutover.
+2. Linux-first kit: Tasks 2–10 done in kit code. Task 10: CLI `status --database` / `intake` / `backup-state`, bootstrap → `/opt/ai-contour` + `/etc/ai-contour` + `/srv/ai-contour`, systemd tmpfiles/logrotate, timer **not** auto-enabled. **Do not switch live Scheduler to package-only without inbox+contour intake.** **No stand cutover**.
+3. Next kit work: **Task 11** (integration fixtures / dry-run acceptance) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
+4. Before stand dry-run: Linux/WSL lock/path checks on a WSL host; Task 12 for cutover.

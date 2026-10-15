@@ -21,6 +21,13 @@ def _write_cfg(tmp_path: Path, *, remote: str | None = None, **schedule) -> Path
         raw["databases"]["ubd"]["source"]["remote"] = remote
     raw["schedule"].update(schedule)
     raw["alert"]["command"] = [sys.executable]
+    root = tmp_path / "root"
+    root.mkdir(exist_ok=True)
+    raw["runtime"]["root"] = str(root)
+    raw["runtime"]["db_path"] = str(tmp_path / "state.db")
+    raw["runtime"]["lock_path"] = str(tmp_path / "sync.lock")
+    raw["runtime"]["logs_path"] = str(tmp_path / "logs")
+    raw["runtime"]["backups_path"] = str(tmp_path / "backups")
     path = tmp_path / "contour.yaml"
     path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
     return path
@@ -296,3 +303,129 @@ def test_cli_update_missing_adapters_does_not_close(tmp_path: Path, monkeypatch)
     assert rc != 0
     assert git.writes == []
     assert not any(c[:2] == ["docker", "stop"] for c in docker.calls)
+
+
+def test_validate_reports_all_database_profiles(tmp_path: Path, capsys):
+    cfg = _write_cfg(tmp_path)
+    rc = main(_argv(cfg, tmp_path / "db", tmp_path / "lock", "validate"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "database: ubd" in out
+    assert "database: kb" in out
+    assert "database: klon_opl" in out
+
+
+def test_status_database_filter_shows_layers(tmp_path: Path, capsys):
+    cfg = _write_cfg(
+        tmp_path,
+        remote="https://user:supersecret@example.invalid/ubd.git",
+    )
+    db = tmp_path / "state.db"
+    conn = init_db(str(db))
+    try:
+        from contour.state import StateStore
+
+        state = StateStore(conn)
+        state.register_database("kb", "package")
+        state.mark_layer("kb", "code_index", "r1", "ready", "vol|1", "img")
+        state.mark_layer("kb", "graph", "r1", "ready", "vol|g", "img")
+        state.mark_published("kb", "r1")
+    finally:
+        conn.close()
+    rc = main(_argv(cfg, db, tmp_path / "lock", "status", "--database", "kb"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "database: kb" in out
+    assert "code_index:" in out
+    assert "graph:" in out
+    assert "published=r1" in out
+    assert "supersecret" not in out
+
+    rc_ubd = main(_argv(cfg, db, tmp_path / "lock", "status", "--database", "ubd"))
+    assert rc_ubd == 0
+    out_ubd = capsys.readouterr().out
+    assert "git_remote: https://example.invalid/ubd.git" in out_ubd
+    assert "supersecret" not in out_ubd
+    assert "user:supersecret" not in out_ubd
+
+
+def test_status_unknown_database_fails(tmp_path: Path):
+    cfg = _write_cfg(tmp_path)
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "status", "--database", "nope")
+    )
+    assert rc != 0
+
+
+def test_update_unknown_database_fails(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("contour.cli.reconcile", lambda *a, **k: "success")
+    cfg = _write_cfg(tmp_path)
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--database", "nope")
+    )
+    assert rc != 0
+
+
+def test_update_database_filter_is_passed(tmp_path: Path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_reconcile(cfg, **kwargs):
+        seen["database"] = kwargs.get("database")
+        return "success"
+
+    monkeypatch.setattr("contour.cli.reconcile", fake_reconcile)
+    cfg = _write_cfg(tmp_path)
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--database", "kb")
+    )
+    assert rc == 0
+    assert seen["database"] == "kb"
+
+
+def test_intake_validates_without_reconcile(tmp_path: Path, monkeypatch):
+    from test_packages import _make_package
+
+    cfg_path = _write_cfg(tmp_path)
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    inbox = tmp_path / "inbox" / "kb"
+    inbox.mkdir(parents=True)
+    raw["databases"]["kb"]["source"]["inbox"] = str(inbox)
+    raw["databases"]["kb"]["source"]["source_path"] = str(tmp_path / "sources" / "kb")
+    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    _make_package(inbox, name="ready-kb1", database="kb", export_id="kb1")
+
+    called = {"reconcile": False}
+    monkeypatch.setattr(
+        "contour.cli.reconcile",
+        lambda *a, **k: called.__setitem__("reconcile", True) or "success",
+    )
+    rc = main(_argv(cfg_path, tmp_path / "db", tmp_path / "lock", "intake", "--database", "kb"))
+    assert rc == 0
+    assert called["reconcile"] is False
+    accepted = list((tmp_path / "root" / "accepted" / "kb").glob("ready-*"))
+    assert len(accepted) == 1
+
+
+def test_intake_rejects_git_database(tmp_path: Path):
+    cfg = _write_cfg(tmp_path)
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "intake", "--database", "ubd")
+    )
+    assert rc != 0
+
+
+def test_backup_state_uses_sqlite_api(tmp_path: Path):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    init_db(str(db))
+    rc = main(_argv(cfg, db, tmp_path / "lock", "backup-state"))
+    assert rc == 0
+    backups = list((tmp_path / "backups").glob("state-*.db"))
+    assert len(backups) == 1
+    # Ensure backup is a readable SQLite DB, not a byte-identical live lock race.
+    conn = init_db(str(backups[0]))
+    try:
+        row = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchone()
+        assert row is not None
+    finally:
+        conn.close()

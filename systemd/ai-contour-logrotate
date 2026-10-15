@@ -1,0 +1,11 @@
+/srv/ai-contour/logs/*.log
+/srv/ai-contour/logs/runs/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su ai-contour ai-contour
+}

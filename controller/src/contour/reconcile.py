@@ -45,8 +45,8 @@ from contour.verify import (
 )
 from contour.watch_bsl import pause_watch, restore_watch, watch_is_paused
 
-DEFAULT_DB = "/srv/ai/state.db"
-DEFAULT_LOCK = "/srv/ai/sync.lock"
+DEFAULT_DB = "/srv/ai-contour/state/state.db"
+DEFAULT_LOCK = "/srv/ai-contour/locks/sync.lock"
 
 DatabaseRunner = Callable[..., str]
 

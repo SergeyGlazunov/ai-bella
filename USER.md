@@ -1,6 +1,6 @@
 # AI-Contour — для пользователя
 
-Комплект оркестратора УБД (граф + code-index) и поставки на Windows 11 + WSL2.
+Комплект оркестратора УБД / КБ / `klon_opl` (граф + code-index) и поставки на Windows 11 + WSL2.
 
 **Оркестратор в комплекте есть; на живой стенд ADM-SAPHX-TECH не переключён**, пока не сделаны drill бэкапа чат-слоя и явное разрешение. Ночной sync на стенде пока PowerShell + задача `UBD Config Sync`.
 
@@ -12,7 +12,19 @@
 
 ## Эксплуатация (после bootstrap)
 
-Пути по умолчанию: конфиг `/opt/ai-sync/config.yaml`, SQLite `/srv/ai/state.db`, lock `/srv/ai/sync.lock`, CLI `/opt/ai-sync/venv/bin/contour`.
+Пути по умолчанию:
+
+| Что | Путь |
+| --- | --- |
+| Пакет / CLI | `/opt/ai-contour/`, `/opt/ai-contour/venv/bin/contour` |
+| Конфиг | `/etc/ai-contour/contour.yaml` |
+| Данные | `/srv/ai-contour/` |
+| SQLite | `/srv/ai-contour/state/state.db` |
+| Lock | `/srv/ai-contour/locks/sync.lock` |
+| Логи прогонов | `/srv/ai-contour/logs/runs` |
+| Бэкапы state | `/srv/ai-contour/backups/state` |
+| Inbox пакетов | `/srv/ai-contour/inbox/{kb,klon_opl}` |
+| Пользователь сервиса | `ai-contour` |
 
 ### Окно записи
 
@@ -29,27 +41,33 @@
 
 ### Алерт
 
-- `alert.command` в конфиге (пример: `["/opt/ai-sync/alert.sh"]`).
+- `alert.command` в конфиге (пример: `["/opt/ai-contour/alert.sh"]`).
 - Текст на **stdin**; таймаут 30 с. Stub из комплекта `validate` отвергает — замените канал.
 
 ### Команды
 
 ```bash
-contour validate          # config + adapters + alert
+contour --config /etc/ai-contour/contour.yaml validate
 contour status
-contour update            # reconcile (timer — то же без --measure)
+contour status --database kb          # один профиль schema v2
+contour update                        # все enabled databases по порядку
+contour update --database ubd         # один профиль
 contour update --measure
-contour open              # только если индексы согласованы и нет writer
+contour intake --database kb          # claim пакета из inbox; без индексации
+contour backup-state                  # SQLite online backup + prune 14d
+contour open --database ubd           # только если индексы согласованы и нет writer
 contour cleanup --dry-run
 ```
+
+`intake` только валидирует и переносит пакет в `accepted/`; индексация — через `contour update`.
 
 Если `reads_closed=1`, MCP остаётся закрытым до успешной проверки / `contour open`. Ручное восстановление сети: [checks/stand_close_reads.md](checks/stand_close_reads.md) §6.
 
 ### systemd
 
-- `ai-sync.service` — `contour update` (oneshot).
+- `ai-sync.service` — `contour update` (oneshot, `User=ai-contour`).
 - `ai-sync.timer` — `OnCalendar=*-*-* 01:30:00 Asia/Vladivostok`, `Persistent=true`.
-- `bootstrap.sh` ставит unit-файлы **без** `systemctl enable --now`.
+- `bootstrap.sh` ставит unit-файлы, tmpfiles и logrotate **без** `systemctl enable --now`.
 
 ```bash
 sudo ./bootstrap.sh   # внутри WSL Ubuntu
@@ -81,41 +99,41 @@ sudo ./bootstrap.sh   # внутри WSL Ubuntu
 ### Windows / WSL
 
 1. Windows 11, WSL2 Ubuntu, Docker Engine в Linux.
-2. УБД на **ext4** (`/srv/ai/ubd`), не `/mnt/c`.
+2. УБД и прочие mutable данные на **ext4** (`/srv/ai-contour/...`), не `/mnt/c`.
 3. `systemd` включён. Sharing violation на `ext4.vhdx` — блокер; nsenter не использовать.
 
 ### Секреты
 
 ```bash
-sudo mkdir -p /srv/ai/secrets /srv/ai/logs /srv/ai/compose
-sudo chmod 700 /srv/ai/secrets
+sudo mkdir -p /srv/ai-contour/secrets /srv/ai-contour/logs /srv/ai-contour/compose
+sudo chmod 700 /srv/ai-contour/secrets
 ```
 
-Скопируйте [secrets.example.yaml](secrets.example.yaml) и `compose/*/.env.example`. Не вставляйте token в URL `repo.remote`.
+Скопируйте [secrets.example.yaml](secrets.example.yaml) и `compose/*/.env.example`. Не вставляйте token в URL `repo.remote` / `databases.*.source.remote`.
 
-В `.env` графа: `MCP_SHARED_SECRET`, `NEO4J_PASSWORD`. `WORKSPACE_DIR=/srv/ai/ubd/src` после клона.
+В `.env` графа: `MCP_SHARED_SECRET`, `NEO4J_PASSWORD`. `WORKSPACE_DIR` — путь к `src` выбранной базы после клона/intake.
 
 ### Новая установка стека
 
 ```bash
-sudo cp -r compose/ai-stack /srv/ai/compose/ai-stack
-sudo cp -r compose/mcp_for_1c /srv/ai/compose/mcp_for_1c
-sudo cp -r compose/bsl-indexer /srv/ai/compose/bsl-indexer
+sudo cp -r compose/ai-stack /srv/ai-contour/compose/ai-stack
+sudo cp -r compose/mcp_for_1c /srv/ai-contour/compose/mcp_for_1c
+sudo cp -r compose/bsl-indexer /srv/ai-contour/compose/bsl-indexer
 
-sudo mkdir -p /srv/ai/ubd
-sudo git clone <ваш-remote> /srv/ai/ubd
+sudo mkdir -p /srv/ai-contour/sources/ubd
+sudo git clone <ваш-remote> /srv/ai-contour/sources/ubd
 ```
 
 ```bash
-cd /srv/ai/compose/ai-stack && cp .env.example .env   # заполнить
+cd /srv/ai-contour/compose/ai-stack && cp .env.example .env   # заполнить
 docker compose -p ai-stack up -d
 
-cd /srv/ai/compose/mcp_for_1c && cp .env.example .env
-# WORKSPACE_DIR=/srv/ai/ubd/src
+cd /srv/ai-contour/compose/mcp_for_1c && cp .env.example .env
+# WORKSPACE_DIR=/srv/ai-contour/sources/ubd/src
 docker compose -p mcp_for_1c build
 docker compose -p mcp_for_1c up -d neo4j mcp-metadata-graph
 
-cd /srv/ai/compose/bsl-indexer
+cd /srv/ai-contour/compose/bsl-indexer
 docker compose -p bsl-indexer build && docker compose -p bsl-indexer up -d
 ```
 
@@ -130,20 +148,26 @@ docker compose -p bsl-indexer build && docker compose -p bsl-indexer up -d
 Сначала замените канал алерта (kit stub отвергается `validate`), затем bootstrap:
 
 ```bash
-# 1) Скопировать пакет / подготовить alert.sh (не stub)
-sudo mkdir -p /opt/ai-sync
-sudo cp integrations/alert.sh.example /opt/ai-sync/alert.sh   # затем заменить на реальный канал
-sudo chmod +x /opt/ai-sync/alert.sh
+# 1) Подготовить alert.sh (не stub)
+sudo mkdir -p /opt/ai-contour
+sudo cp integrations/alert.sh.example /opt/ai-contour/alert.sh   # затем заменить на реальный канал
+sudo chmod 700 /opt/ai-contour/alert.sh
 
-# 2) Bootstrap (validate внутри; units без enable)
+# 2) Bootstrap (validate внутри; units/tmpfiles/logrotate без enable timer)
 sudo ./bootstrap.sh
 
-# 3) config.yaml: remote УБД, alert.command
-sudo chmod 600 /opt/ai-sync/config.yaml
-sudo /opt/ai-sync/venv/bin/contour --config /opt/ai-sync/config.yaml validate
+# 3) contour.yaml: remotes / inbox / adapters; alert.command
+sudo chmod 640 /etc/ai-contour/contour.yaml
+sudo /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml validate
 ```
 
-Если bootstrap остановился на stub alert — замените `/opt/ai-sync/alert.sh` и **повторите** `bootstrap.sh`, не только отдельный `validate`.
+Если bootstrap остановился на stub alert — замените `/opt/ai-contour/alert.sh` и **повторите** `bootstrap.sh`, не только отдельный `validate`.
+
+Периодический бэкап state (вне nightly, по желанию):
+
+```bash
+sudo -u ai-contour /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml backup-state
+```
 
 Timer включайте после первого успешного `contour update` в окне.
 
@@ -151,7 +175,7 @@ Timer включайте после первого успешного `contour u
 
 1. Не `docker compose pull` Open WebUI / OmniRoute.
 2. Не создавать project `ai-contour`.
-3. В `config.yaml` — live-пути, если ходите в уже поднятый стенд.
+3. В `contour.yaml` — live-пути, если ходите в уже поднятый стенд.
 4. Stand proof: [checks/README.md](checks/README.md).
 5. Cutover — раздел ниже, только после явного разрешения.
 
@@ -187,31 +211,28 @@ Overlays и name map: [deploy-ai2/README.md](deploy-ai2/README.md).
 
 Скрипт (Windows PowerShell): [`tools/kb/Update-And-Export-Kb.ps1`](tools/kb/Update-And-Export-Kb.ps1), конфиг рядом: [`tools/kb/kb-connection.json`](tools/kb/kb-connection.json).
 
-Порядок: store update → `/UpdateDBCfg` → dump XML → копия в `/srv/ai2/kb/src`.  
+Порядок: store update → `/UpdateDBCfg` → dump XML → пакет в inbox Linux (`/srv/ai-contour/inbox/kb`), затем `contour intake` / nightly `update`.  
 Опционально Task Scheduler: задача `AI-contour KB nightly export` в **01:00**.
 
-После появления `Configuration.xml` в kb/src — indexer графа КБ и старт `ai2-bsl-kb`.
-
-УБД по-прежнему только git→`ubd/src` (не путать с пайплайном КБ).
+УБД по-прежнему только git→`sources/ubd` (не путать с пайплайном КБ).
 
 ### klon_opl: выгрузка (без хранилища)
 
 Скрипт: [`tools/klon_opl/Export-KlonOpl.ps1`](tools/klon_opl/Export-KlonOpl.ps1), конфиг: [`tools/klon_opl/klon_opl-connection.json`](tools/klon_opl/klon_opl-connection.json).
 
-Порядок: `/DumpConfigToFiles` → копия в `/srv/ai2/klon_opl/src`. Хранилища нет.  
-Task Scheduler: `AI-contour klon_opl nightly export` в **02:00**. После dump — `ai2-bsl-klon-opl` (`:8311`).
+Порядок: `/DumpConfigToFiles` → пакет в inbox. Хранилища нет.  
+Task Scheduler: `AI-contour klon_opl nightly export` в **02:00**.
 
 ### Чеклист чистой установки УБД+КБ
 
 1. WSL/Docker, memory≥16 ГБ в `.wslconfig`, перезапуск WSL.
-2. `mkdir -p /srv/ai2/{ubd/src,kb/src,logs,compose}`.
-3. Скопировать `compose/mcp_for_1c`, `compose/bsl-indexer` и overlays из `deploy-ai2/mcp_for_1c-ubd|kb`, `deploy-ai2/bsl-ubd|kb`; заполнить `.env` из `.env.example`.
-4. Up `ai2-mcp-ubd` (neo4j + graph + query-builder; + indexer при наличии XML УБД).
-5. Up `ai2-bsl-ubd`.
-6. Настроить КБ dump → `/srv/ai2/kb/src`; up `ai2-mcp-kb` (graph + query) + indexer; up `ai2-bsl-kb`.
-7. Подключить MCP к сети чата (`ai2-stack`); health MCP; smoke tool-call.
-8. (Опц.) WebUI + карточки MCP (graph/query/BSL × базы) + Vision Bridge — `deploy-ai2/ai-stack/README.md`.
-9. Nightly: KB script 01:00; УБД sync по своему окну / contour.
+2. `sudo ./bootstrap.sh` (создаёт `/srv/ai-contour`, `/opt/ai-contour`, `/etc/ai-contour`).
+3. Скопировать compose overlays; заполнить `.env` из `.env.example`.
+4. Up graph/BSL стеков по профилям баз.
+5. Настроить KB/`klon_opl` package export → inbox; git УБД → `sources/ubd`.
+6. Подключить MCP к сети чата; health MCP; smoke tool-call.
+7. (Опц.) WebUI + карточки MCP — `deploy-ai2/ai-stack/README.md`.
+8. Nightly: package exporters + `ai-sync.timer` после proof.
 
 ### Архив комплекта
 
@@ -240,7 +261,7 @@ sha256sum ai-contour-kit.tgz
 2. Закрыть чтение: graph stop + BSL network disconnect (+ optional host firewall) + IdleProbe. См. close-reads check.
 3. Pause BSL watcher (`daemon.toml` без `/repos/SRC` + reload).
 4. Зафиксировать SHA HEAD УБД.
-5. Клон/копия SHA в `/srv/ai/ubd` (ext4); remount binds; compose up **только** remounted сервисов УБД (не `ai-stack`).
+5. Клон/копия SHA в `/srv/ai-contour/sources/ubd` (ext4); remount binds; compose up **только** remounted сервисов УБД (не `ai-stack`).
 6. После recreate `bsl-indexer` — снова убедиться, что watcher paused.
 7. Verify индексов; открыть чтение.
 8. Включить `ai-sync.timer` только после шага 7.

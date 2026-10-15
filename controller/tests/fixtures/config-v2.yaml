@@ -15,7 +15,7 @@ schedule:
   measure_max_seconds: 43200
 
 alert:
-  command: ["/opt/ai-sync/alert.sh"]
+  command: ["/opt/ai-contour/alert.sh"]
 
 databases:
   ubd:
@@ -42,14 +42,14 @@ databases:
       graph_volume: ai2-neo4j-ubd-data
       code_index_volume: ai2-bsl-ubd-home
     adapters:
-      idle_probe: ["/opt/ai-sync/integrations/idle_bsl.sh"]
+      idle_probe: ["/opt/ai-contour/integrations/idle_bsl.sh"]
       code_index:
-        check_bsl: ["/opt/ai-sync/integrations/probe_code_index.sh", "present", "{path}"]
-        check_deletion: ["/opt/ai-sync/integrations/probe_code_index.sh", "absent", "{path}"]
+        check_bsl: ["/opt/ai-contour/integrations/probe_code_index.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-contour/integrations/probe_code_index.sh", "absent", "{path}"]
       graph:
-        check_bsl: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
-        check_xml: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
-        check_deletion: ["/opt/ai-sync/integrations/probe_graph.sh", "absent", "{path}"]
+        check_bsl: ["/opt/ai-contour/integrations/probe_graph.sh", "present", "{path}"]
+        check_xml: ["/opt/ai-contour/integrations/probe_graph.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-contour/integrations/probe_graph.sh", "absent", "{path}"]
 
   kb:
     enabled: true
@@ -73,14 +73,14 @@ databases:
       graph_volume: ai2-neo4j-kb-data
       code_index_volume: ai2-bsl-kb-home
     adapters:
-      idle_probe: ["/opt/ai-sync/integrations/idle_bsl.sh"]
+      idle_probe: ["/opt/ai-contour/integrations/idle_bsl.sh"]
       code_index:
-        check_bsl: ["/opt/ai-sync/integrations/probe_code_index.sh", "present", "{path}"]
-        check_deletion: ["/opt/ai-sync/integrations/probe_code_index.sh", "absent", "{path}"]
+        check_bsl: ["/opt/ai-contour/integrations/probe_code_index.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-contour/integrations/probe_code_index.sh", "absent", "{path}"]
       graph:
-        check_bsl: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
-        check_xml: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
-        check_deletion: ["/opt/ai-sync/integrations/probe_graph.sh", "absent", "{path}"]
+        check_bsl: ["/opt/ai-contour/integrations/probe_graph.sh", "present", "{path}"]
+        check_xml: ["/opt/ai-contour/integrations/probe_graph.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-contour/integrations/probe_graph.sh", "absent", "{path}"]
 
   klon_opl:
     enabled: true
@@ -104,9 +104,9 @@ databases:
       graph_volume: ""
       code_index_volume: ai2-bsl-klon-opl-home
     adapters:
-      idle_probe: ["/opt/ai-sync/integrations/idle_bsl.sh"]
+      idle_probe: ["/opt/ai-contour/integrations/idle_bsl.sh"]
       code_index:
-        check_bsl: ["/opt/ai-sync/integrations/probe_code_index.sh", "present", "{path}"]
-        check_deletion: ["/opt/ai-sync/integrations/probe_code_index.sh", "absent", "{path}"]
+        check_bsl: ["/opt/ai-contour/integrations/probe_code_index.sh", "present", "{path}"]
+        check_deletion: ["/opt/ai-contour/integrations/probe_code_index.sh", "absent", "{path}"]
       graph:
-        check_bsl: ["/opt/ai-sync/integrations/probe_graph.sh", "present", "{path}"]
+        check_bsl: ["/opt/ai-contour/integrations/probe_graph.sh", "present", "{path}"]
