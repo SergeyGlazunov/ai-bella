@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -34,12 +35,19 @@ def _database_for_run(cfg, conn: sqlite3.Connection, run_id: int) -> str:
     return "ubd"
 
 
-def _attempt_keys(database: str) -> tuple[str, str, str]:
-    return (
-        f"bsl_attempt_revision:{database}",
-        f"bsl_attempt_storage:{database}",
-        f"bsl_attempt_image:{database}",
-    )
+def _attempt_meta_key(database: str) -> str:
+    return f"bsl_attempt:{database}"
+
+
+def _max_job_id(conn: sqlite3.Connection, database: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS m FROM jobs WHERE database = ?",
+        (database,),
+    ).fetchone()
+    if row is None:
+        return 0
+    value = row["m"] if hasattr(row, "keys") else row[0]
+    return int(value or 0)
 
 
 def _record_bsl_attempt(
@@ -49,23 +57,54 @@ def _record_bsl_attempt(
     storage_id: str,
     indexer_version: str,
 ) -> None:
-    """Persist the in-flight BSL attempt (not applied_revision)."""
-    rev_k, stor_k, img_k = _attempt_keys(database)
-    set_meta(conn, rev_k, revision)
-    set_meta(conn, stor_k, storage_id)
-    set_meta(conn, img_k, indexer_version)
+    """Persist the in-flight BSL attempt (not applied_revision) as one meta blob.
+
+    A new revision/storage/image starts a new attempt and sets job_floor to the
+    current max job id so earlier successes cannot satisfy stage checks.
+    Retrying the same attempt keeps the same floor so a completed background
+    index from this attempt remains usable.
+    """
+    prev = _read_bsl_attempt(conn, database)
+    if (
+        prev is not None
+        and prev[0] == revision
+        and prev[1] == storage_id
+        and prev[2] == indexer_version
+    ):
+        job_floor = prev[3]
+    else:
+        job_floor = _max_job_id(conn, database)
+    payload = {
+        "revision": revision,
+        "storage": storage_id,
+        "image": indexer_version,
+        "job_floor": job_floor,
+    }
+    set_meta(conn, _attempt_meta_key(database), json.dumps(payload, sort_keys=True))
 
 
 def _read_bsl_attempt(
     conn: sqlite3.Connection, database: str
-) -> tuple[str, str, str] | None:
-    rev_k, stor_k, img_k = _attempt_keys(database)
-    revision = get_meta(conn, rev_k)
-    storage = get_meta(conn, stor_k)
-    image = get_meta(conn, img_k)
-    if not revision or not storage or not image:
+) -> tuple[str, str, str, int] | None:
+    raw = get_meta(conn, _attempt_meta_key(database))
+    if not raw:
         return None
-    return str(revision), str(storage), str(image)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    revision = str(data.get("revision") or "")
+    storage = str(data.get("storage") or "")
+    image = str(data.get("image") or "")
+    try:
+        job_floor = int(data.get("job_floor", -1))
+    except (TypeError, ValueError):
+        return None
+    if not revision or not storage or not image or job_floor < 0:
+        return None
+    return revision, storage, image, job_floor
 
 
 def _capture_live_identity(
@@ -167,29 +206,41 @@ def _run_revision(conn: sqlite3.Connection, run_id: int) -> str | None:
     return str(value)
 
 
-def _stage_succeeded_for_revision(
+def _stage_succeeded_for_attempt(
     conn: sqlite3.Connection,
     database: str,
     stage: str,
     revision: str,
+    job_floor: int,
 ) -> bool:
-    """True when a prior job for the same database/revision finished ok."""
+    """True when the latest job for this stage within the attempt finished ok.
+
+    Jobs at or below ``job_floor`` belong to earlier attempts (other volumes /
+    revisions) and must not satisfy resume.
+    """
     row = conn.execute(
         """
-        SELECT j.id
+        SELECT j.status, j.exit_code
         FROM jobs j
         JOIN runs r ON r.id = j.run_id
         WHERE j.database = ?
           AND j.stage = ?
-          AND j.status = 'ok'
-          AND COALESCE(j.exit_code, 1) = 0
           AND r.target_revision = ?
+          AND j.id > ?
         ORDER BY j.id DESC
         LIMIT 1
         """,
-        (database, stage, revision),
+        (database, stage, revision, job_floor),
     ).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    status = str(row["status"] if hasattr(row, "keys") else row[0] or "")
+    exit_code = row["exit_code"] if hasattr(row, "keys") else row[1]
+    try:
+        code = int(exit_code) if exit_code is not None else 1
+    except (TypeError, ValueError):
+        return False
+    return status == "ok" and code == 0
 
 
 def should_resume_bsl_stages(
@@ -221,7 +272,7 @@ def should_resume_bsl_stages(
     attempt = _read_bsl_attempt(conn, database)
     if attempt is None:
         return False
-    attempt_rev, attempt_storage, attempt_image = attempt
+    attempt_rev, attempt_storage, attempt_image, _job_floor = attempt
     if attempt_rev != revision:
         return False
     docker = _runner(runner)
@@ -253,11 +304,20 @@ def index_bsl(
                 cfg, conn, revision=revision, runner=docker
             )
         )
-    run_index = not (
-        resume
-        and revision is not None
-        and _stage_succeeded_for_revision(conn, database, "bsl_index", revision)
-    )
+    attempt = _read_bsl_attempt(conn, database) if resume else None
+    job_floor = attempt[3] if attempt is not None else -1
+
+    def stage_ok(stage: str) -> bool:
+        return bool(
+            resume
+            and revision is not None
+            and attempt is not None
+            and _stage_succeeded_for_attempt(
+                conn, database, stage, revision, job_floor
+            )
+        )
+
+    run_index = not stage_ok("bsl_index")
     if run_index:
         # Record attempt identity before the writer when revision is known
         # (v2). Legacy callers without target_revision still run index once.
@@ -275,11 +335,22 @@ def index_bsl(
             from contour.runtime_policy import WriteWindowClosed
 
             raise WriteWindowClosed(str(decision))
-    if not (
-        resume
-        and revision is not None
-        and _stage_succeeded_for_revision(conn, database, "bsl_clean", revision)
-    ):
+    # Clean: attempt-scoped latest status (not historical jobs from other volumes).
+    if revision is None:
         _run_exec(
             cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker
         )
+    else:
+        recorded = _read_bsl_attempt(conn, database)
+        floor = recorded[3] if recorded is not None else -1
+        if recorded is None or not _stage_succeeded_for_attempt(
+            conn, database, "bsl_clean", revision, floor
+        ):
+            _run_exec(
+                cfg,
+                conn,
+                run_id,
+                "bsl_clean",
+                ["clean", "--path", SRC_PATH],
+                docker,
+            )
