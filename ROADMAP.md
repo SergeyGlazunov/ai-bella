@@ -26,10 +26,10 @@ Plan: `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`
 | 0 Design accepted | — | accepted with operational priority §1.1 |
 | 1 Repo baseline | Task 1 | done |
 | 2 Config + SQLite + inbox + sources | Tasks 2–5 | **done in kit** (ops subset; exotic FS deferred) |
-| 3 Contour pipeline | Tasks 6–8 | Tasks 6–8 **kit code done** (not stand cutover); next: Task 9 |
-| 4 Windows = exporter only | Task 9 | pending |
+| 3 Contour pipeline | Tasks 6–8 | kit code done (not stand cutover) |
+| 4 Windows = exporter only | Task 9 | done in kit |
 | 5 Host install (`/srv/ai-contour`, systemd) | Task 10 | done |
-| 6 Dry-run acceptance | Task 11 | pending |
+| 6 Dry-run acceptance | Task 11 | done (pytest integration + runbooks; WSL host install deferred to Task 12) |
 | 7 Stand catch-up + schedule cutover | Task 12 | **STAND ONLY** |
 
 ### Optional (plan stages 6–7 in design numbering)

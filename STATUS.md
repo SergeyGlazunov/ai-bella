@@ -1,7 +1,7 @@
 # STATUS
 
-**Updated:** 2026-10-15  
-**Horizon:** PS/ai2 stable (short) → linux-first / `contour` (next)  
+**Updated:** 2026-10-16  
+**Horizon:** PS/ai2 stable (short) → linux-first / `contour` (kit Tasks 1–11)  
 **Repo:** https://github.com/SergeyGlazunov/ai-bella  
 **Priority:** operational nights + recovery (`For Cursor/LINUX-FIRST-DESIGN.md` §1.1)
 
@@ -36,18 +36,30 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 | Python | 3.12.10 (`controller` venv; needs `tzdata` on Windows for tests) |
 | Docker Engine | via `DOCKER_HOST=tcp://127.0.0.1:2375` |
 | WSL | Ubuntu Running (v2) |
-| pytest | **273 passed, 6 skipped** + Task8 review 36 passed (2026-10-15) |
+| pytest | **289+ unit** + **13 integration** (Task 11 local proof, 2026-10-16) |
+
+## Linux-first kit proof (local — not stand)
+
+| Item | Result |
+|------|--------|
+| Tasks 1–10 | done in kit (`c19dedd` latest graph logs_path fix) |
+| Task 11 integration | `controller/tests/integration/` — nightly cycle UBD/KB/klon_opl + recovery scenarios; fake Docker / temp SQLite |
+| Runbooks | `checks/linux-first-{preflight,catchup,cutover}.md` |
+| WSL bootstrap dry-run on host | **not executed** (no `/opt` install, no timer); reserved for Task 12 / operator WSL |
+| Stand cutover | **not started** |
+
+Integration acceptance covers: full publish cycle ×3 profiles; package intake; corrupted/incomplete package refusal; crash after activation (reads stay closed); reaped completed job; unknown writer refusal; Graph exit 3→FULL; failed mandatory BSL; probes before reopen.
 
 ## Blockers / open
 
 1. Need **1–2 green nights** on PS/ai2 before prod УБД teardown and contour cutover.
 2. Vendor provenance for `compose/mcp_for_1c` incomplete — see `VENDOR.md`.
 3. Live secrets stay on disk (gitignored); not in Git.
-4. Live stand cutover still requires separate explicit permission.
+4. Live stand cutover still requires separate explicit permission (**Task 12**).
 
 ## Next action
 
-1. Observe PS/ai2 nightly LastResult on the stand (operator). Note: Task 9 kit exporters no longer index — until cutover, either keep legacy nightly paths or temporarily dual-run; **do not switch live Task Scheduler to package-only without inbox+contour intake**.
-2. Linux-first kit: Tasks 2–10 done in kit code. Task 10: CLI `status --database` / `intake` / `backup-state`, bootstrap → `/opt/ai-contour` + `/etc/ai-contour` + `/srv/ai-contour`, systemd tmpfiles/logrotate, timer **not** auto-enabled. **Do not switch live Scheduler to package-only without inbox+contour intake.** **No stand cutover**.
-3. Next kit work: **Task 11** (integration fixtures / dry-run acceptance) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
-4. Before stand dry-run: Linux/WSL lock/path checks on a WSL host; Task 12 for cutover.
+1. Observe PS/ai2 nightly LastResult on the stand (operator).
+2. Linux-first kit: Tasks 1–11 done. **No stand cutover**.
+3. Next: **Task 12** only with operator approval — preflight → catch-up → cutover runbooks under `checks/`.
+4. Do not switch live Scheduler to package-only without inbox+contour intake and Task 12 fence.
