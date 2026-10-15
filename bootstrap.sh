@@ -25,6 +25,15 @@ systemd_ready() {
   return 1
 }
 
+run_as_service() {
+  # Prefer runuser so supplementary groups (e.g. docker) are applied.
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$SERVICE_USER" -- "$@"
+  else
+    su -s /bin/sh "$SERVICE_USER" -c 'exec "$@"' -- "$@"
+  fi
+}
+
 ensure_service_user() {
   if id "$SERVICE_USER" >/dev/null 2>&1; then
     return 0
@@ -37,7 +46,85 @@ ensure_service_user() {
   exit 1
 }
 
+docker_socket_path() {
+  host="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+  case "$host" in
+    unix://*)
+      printf '%s\n' "${host#unix://}"
+      ;;
+    /*)
+      printf '%s\n' "$host"
+      ;;
+    *)
+      # tcp:// or other remotes: no local socket group to join
+      printf '\n'
+      ;;
+  esac
+}
+
+ensure_docker_access() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker CLI not found; install Docker Engine, then re-run bootstrap." >&2
+    exit 1
+  fi
+
+  sock=$(docker_socket_path)
+  if [ -n "$sock" ]; then
+    if [ ! -S "$sock" ]; then
+      echo "Docker socket missing: $sock" >&2
+      echo "Start Docker (or set DOCKER_HOST), then re-run bootstrap." >&2
+      echo "Do not chmod the socket world-writable." >&2
+      exit 1
+    fi
+    sock_gid=$(stat -c '%g' "$sock" 2>/dev/null || true)
+    if [ -z "$sock_gid" ]; then
+      echo "Cannot read group of Docker socket $sock." >&2
+      echo "Grant $SERVICE_USER access to the Engine endpoint, then re-run bootstrap." >&2
+      exit 1
+    fi
+    sock_group=$(getent group "$sock_gid" | cut -d: -f1 || true)
+    if [ -z "$sock_group" ]; then
+      echo "Docker socket $sock is gid $sock_gid with no group name." >&2
+      echo "Create a group for that gid, add $SERVICE_USER, then re-run bootstrap." >&2
+      echo "Do not chmod the socket world-writable." >&2
+      exit 1
+    fi
+    if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx "$sock_group"; then
+      if command -v usermod >/dev/null 2>&1; then
+        usermod -aG "$sock_group" "$SERVICE_USER"
+      else
+        echo "usermod unavailable; add $SERVICE_USER to group '$sock_group' manually, then re-run." >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  if ! run_as_service docker info >/dev/null 2>&1; then
+    echo "Docker is not usable as $SERVICE_USER (read-only check failed)." >&2
+    if [ -n "${sock:-}" ]; then
+      echo "Socket: $sock. Ensure $SERVICE_USER is in the socket group and re-login is not required for runuser." >&2
+    else
+      echo "DOCKER_HOST=$DOCKER_HOST — grant $SERVICE_USER credentials for that endpoint." >&2
+    fi
+    echo "Do not open the Docker socket to all users. Fix access, then re-run bootstrap." >&2
+    exit 1
+  fi
+}
+
+ensure_alert_permissions() {
+  if [ ! -f "$DEST/alert.sh" ]; then
+    return 0
+  fi
+  chown "root:$SERVICE_USER" "$DEST/alert.sh"
+  chmod 750 "$DEST/alert.sh"
+  if ! run_as_service test -x "$DEST/alert.sh"; then
+    echo "$DEST/alert.sh is not executable by $SERVICE_USER (need root:$SERVICE_USER mode 0750)." >&2
+    exit 1
+  fi
+}
+
 ensure_service_user
+ensure_docker_access
 
 # Mutable layout (least privilege: package root root-owned; data owned by service user).
 mkdir -p \
@@ -77,9 +164,9 @@ fi
 
 if [ -f "$ROOT/integrations/alert.sh.example" ] && [ ! -f "$DEST/alert.sh" ]; then
   cp "$ROOT/integrations/alert.sh.example" "$DEST/alert.sh"
-  chmod 700 "$DEST/alert.sh"
-  chown "root:$SERVICE_USER" "$DEST/alert.sh"
 fi
+ensure_alert_permissions
+
 if [ -f "$DEST/integrations/idle_bsl.sh" ]; then
   chmod 755 "$DEST/integrations/idle_bsl.sh"
 fi
@@ -101,6 +188,11 @@ if [ -f "$DEST/requirements.lock" ]; then
 fi
 "$DEST/venv/bin/pip" install -e "$DEST/controller"
 
+# Service user must be able to read the installed package and config.
+chown -R "root:$SERVICE_USER" "$DEST"
+chmod -R g+rX "$DEST"
+chmod 750 "$DEST/venv/bin/contour" 2>/dev/null || true
+
 if [ -f "$ROOT/systemd/ai-contour-tmpfiles.conf" ]; then
   cp "$ROOT/systemd/ai-contour-tmpfiles.conf" /etc/tmpfiles.d/ai-contour.conf
   if command -v systemd-tmpfiles >/dev/null 2>&1; then
@@ -111,9 +203,10 @@ if [ -f "$ROOT/systemd/ai-contour-logrotate" ]; then
   cp "$ROOT/systemd/ai-contour-logrotate" /etc/logrotate.d/ai-contour
 fi
 
-if ! "$DEST/venv/bin/contour" --config "$ETC/contour.yaml" validate; then
-  echo "contour validate failed; edit $ETC/contour.yaml (adapters, alert.command, paths)." >&2
-  echo "If alert.sh is still the kit stub, replace $DEST/alert.sh with a real channel." >&2
+if ! run_as_service "$DEST/venv/bin/contour" --config "$ETC/contour.yaml" validate; then
+  echo "contour validate failed as $SERVICE_USER; edit $ETC/contour.yaml (adapters, alert.command, paths)." >&2
+  echo "If alert.sh is still the kit stub, replace $DEST/alert.sh with a real channel (mode 0750, root:$SERVICE_USER)." >&2
+  echo "Ensure $SERVICE_USER can read any secrets used by alert.command." >&2
   exit 1
 fi
 
@@ -127,4 +220,4 @@ systemctl daemon-reload
 
 echo "bootstrap complete: package=$DEST config=$ETC/contour.yaml data=$SRV"
 echo "timer installed but not enabled"
-echo "service user: $SERVICE_USER"
+echo "service user: $SERVICE_USER (Docker access verified)"

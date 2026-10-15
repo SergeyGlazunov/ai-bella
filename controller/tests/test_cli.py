@@ -429,3 +429,66 @@ def test_backup_state_uses_sqlite_api(tmp_path: Path):
         assert row is not None
     finally:
         conn.close()
+
+
+def test_missing_state_backup_does_not_create_state_or_prune(tmp_path: Path):
+    from types import SimpleNamespace
+
+    import contour.cli as cli
+
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    old = backups / "state-20000101T000000Z.db"
+    conn = __import__("sqlite3").connect(old)
+    conn.execute("create table recovery_evidence (value text)")
+    conn.commit()
+    conn.close()
+    source = tmp_path / "missing.db"
+    cfg = SimpleNamespace(runtime=SimpleNamespace(backups_path=str(backups)))
+    rc = cli._backup_state(cfg, SimpleNamespace(db_path=str(source)))
+    assert rc != 0
+    assert not source.exists()
+    assert old.exists()
+
+
+def test_backup_preserves_actual_state(tmp_path: Path):
+    from types import SimpleNamespace
+
+    import contour.cli as cli
+
+    source = tmp_path / "state.db"
+    conn = init_db(str(source))
+    conn.execute("insert or replace into meta(key,value) values('review','saved')")
+    conn.commit()
+    conn.close()
+    backups = tmp_path / "backups"
+    cfg = SimpleNamespace(runtime=SimpleNamespace(backups_path=str(backups)))
+    assert cli._backup_state(cfg, SimpleNamespace(db_path=str(source))) == 0
+    with __import__("sqlite3").connect(next(backups.glob("state-*.db"))) as bconn:
+        assert bconn.execute(
+            "select value from meta where key='review'"
+        ).fetchone() == ("saved",)
+
+
+def test_status_can_inspect_disabled_database(tmp_path: Path, capsys):
+    cfg = _write_cfg(tmp_path)
+    raw = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    raw["databases"]["kb"]["enabled"] = False
+    cfg.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    rc = main(_argv(cfg, tmp_path / "state.db", tmp_path / "lock", "status", "--database", "kb"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "database: kb" in out
+    assert "enabled: false" in out
+
+
+def test_update_still_rejects_disabled_database(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("contour.cli.reconcile", lambda *a, **k: "success")
+    cfg = _write_cfg(tmp_path)
+    raw = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    raw["databases"]["kb"]["enabled"] = False
+    cfg.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--database", "kb")
+    )
+    assert rc != 0

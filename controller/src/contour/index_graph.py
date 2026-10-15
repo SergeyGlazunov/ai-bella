@@ -38,7 +38,13 @@ def set_graph_full_needed(
 def is_graph_full_needed(conn: sqlite3.Connection, database: str) -> bool:
     return get_meta(conn, graph_full_needed_key(database)) == "1"
 
-SRV_LOGS = Path("/srv/ai/logs")
+# Prefer runtime.logs_path from callers. Fallbacks match bootstrap layout, then
+# the legacy single-tree path so older stands keep writing somewhere durable.
+_DEFAULT_LOG_DIRS = (
+    Path("/srv/ai-contour/logs/runs"),
+    Path("/srv/ai-contour/logs"),
+    Path("/srv/ai/logs"),
+)
 
 _COMPOSE_BASENAMES = (
     "compose.yaml",
@@ -139,14 +145,33 @@ def _write_override(text: str) -> str:
     return handle.name
 
 
-def _log_directory() -> Path:
-    if SRV_LOGS.is_dir():
-        return SRV_LOGS
+def _logs_dir_from_cfg(cfg) -> Path | None:
+    runtime = getattr(cfg, "runtime", None) if cfg is not None else None
+    path = getattr(runtime, "logs_path", None) if runtime is not None else None
+    if path:
+        return Path(str(path))
+    return None
+
+
+def _log_directory(logs_dir: str | Path | None = None) -> Path:
+    if logs_dir is not None:
+        path = Path(logs_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    for candidate in _DEFAULT_LOG_DIRS:
+        if candidate.is_dir():
+            return candidate
     return Path(tempfile.gettempdir())
 
 
-def copy_job_logs(docker: DockerRunner, container_id: str) -> str | None:
-    """Write container logs under /srv/ai/logs if it exists, else tempfile.
+def copy_job_logs(
+    docker: DockerRunner,
+    container_id: str,
+    *,
+    logs_dir: str | Path | None = None,
+    cfg=None,
+) -> str | None:
+    """Write container logs under runtime.logs_path (or host fallback), else tempfile.
 
     Bounded by the docker command timeout. Failure returns None without
     affecting the caller's job exit_code.
@@ -160,8 +185,9 @@ def copy_job_logs(docker: DockerRunner, container_id: str) -> str | None:
         )
     except Exception:
         return None
+    resolved = logs_dir if logs_dir is not None else _logs_dir_from_cfg(cfg)
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in container_id)
-    path = _log_directory() / f"contour-graph-{safe}.log"
+    path = _log_directory(resolved) / f"contour-graph-{safe}.log"
     try:
         path.write_text(
             (result.stdout or "") + (result.stderr or ""),
@@ -183,8 +209,8 @@ def copy_job_logs(docker: DockerRunner, container_id: str) -> str | None:
         return handle.name
 
 
-def _copy_logs(docker: DockerRunner, container_id: str) -> str | None:
-    return copy_job_logs(docker, container_id)
+def _copy_logs(docker: DockerRunner, container_id: str, *, cfg=None) -> str | None:
+    return copy_job_logs(docker, container_id, cfg=cfg)
 
 
 def allow_graph_full(
@@ -263,7 +289,7 @@ def _run_graph_job(
     job_id = _insert_job(conn, run_id, stage, container_id, database=database)
     start(container_id, runner=docker)
     exit_code = wait(container_id, runner=docker)
-    log_path = _copy_logs(docker, container_id)
+    log_path = _copy_logs(docker, container_id, cfg=cfg)
     _finish_job(conn, job_id, exit_code, log_path)
     return exit_code
 

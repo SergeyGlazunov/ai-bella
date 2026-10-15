@@ -739,9 +739,11 @@ def writer_blocks_database(
     database: DatabaseConfig,
     peers: Sequence[DatabaseConfig],
     docker,
+    *,
+    cfg=None,
 ) -> str | None:
     """Reason to skip a new writer, or None when the index is free to write."""
-    own = reap_database_jobs(conn, database.name, docker)
+    own = reap_database_jobs(conn, database.name, docker, cfg=cfg)
     if own == "busy":
         return f"{database.name}: previous indexer still running"
     if own == "unknown":
@@ -751,7 +753,7 @@ def writer_blocks_database(
             continue
         if not databases_share_storage(database, peer):
             continue
-        peer_state = reap_database_jobs(conn, peer.name, docker)
+        peer_state = reap_database_jobs(conn, peer.name, docker, cfg=cfg)
         if peer_state == "busy":
             return (
                 f"{database.name}: shared storage busy "
@@ -771,6 +773,7 @@ def _reap_unfinished_rows(
     *,
     database: str | None,
     raise_unknown: bool,
+    cfg=None,
 ) -> str:
     """Reap unfinished jobs. Return idle|busy. Unknown → raise or return via caller."""
     if database is None:
@@ -900,7 +903,7 @@ def _reap_unfinished_rows(
             raise err
         log_path = None
         try:
-            log_path = copy_job_logs(docker, cid)
+            log_path = copy_job_logs(docker, cid, cfg=cfg)
         except Exception:
             log_path = None
         now = datetime.now(timezone.utc).isoformat()
@@ -922,25 +925,25 @@ def _reap_unfinished_rows(
 
 
 def reap_database_jobs(
-    conn: sqlite3.Connection, database: str, docker
+    conn: sqlite3.Connection, database: str, docker, *, cfg=None
 ) -> str:
     """Reap unfinished jobs for one database. Return idle|busy|unknown."""
     try:
         return _reap_unfinished_rows(
-            conn, docker, database=database, raise_unknown=False
+            conn, docker, database=database, raise_unknown=False, cfg=cfg
         )
     except WriterStateUnknown:
         return "unknown"
 
 
-def reap_jobs(conn: sqlite3.Connection, docker) -> str:
+def reap_jobs(conn: sqlite3.Connection, docker, *, cfg=None) -> str:
     """Legacy UBD-only reap. Return idle|busy; raise WriterStateUnknown if unknown.
 
     Filters to ``database='ubd'`` so KB/OPL jobs in a shared SQLite do not block
     or mutate the legacy UBD path after a v2 pass.
     """
     return _reap_unfinished_rows(
-        conn, docker, database="ubd", raise_unknown=True
+        conn, docker, database="ubd", raise_unknown=True, cfg=cfg
     )
 
 
@@ -1323,7 +1326,7 @@ def reopen_reads(
             toml_path = cfg.services.bsl_daemon_toml
             backup = toml_path + ".bak"
             try:
-                writer = reap_jobs(conn, docker)
+                writer = reap_jobs(conn, docker, cfg=cfg)
             except WriterStateUnknown as exc:
                 send(cfg, f"reopen refused: writer state unknown: {exc}")
                 _alert_if_reads_closed(cfg, conn, send)
@@ -1392,7 +1395,7 @@ def _reopen_reads_v2_database(
     conn = init_db(runtime.db_path)
     try:
         with held:
-            writer = reap_database_jobs(conn, db.name, docker)
+            writer = reap_database_jobs(conn, db.name, docker, cfg=cfg)
             if writer == "busy":
                 _safe_send(send, cfg, f"reopen refused: {db.name} indexer still running")
                 return "failed"
@@ -1403,7 +1406,7 @@ def _reopen_reads_v2_database(
                 _safe_send(send, cfg, f"reopen refused: {db.name} graph FULL still needed")
                 return "failed"
             all_profiles = list((cfg.databases or {}).values())
-            block = writer_blocks_database(conn, db, all_profiles, docker)
+            block = writer_blocks_database(conn, db, all_profiles, docker, cfg=cfg)
             if block is not None:
                 _safe_send(send, cfg, f"reopen refused: {block}")
                 return "failed"
@@ -1608,7 +1611,7 @@ def _reconcile_v2_locked(
     for db in selected:
         state.register_database(db.name, _source_kind(db))
         try:
-            reap_database_jobs(conn, db.name, docker)
+            reap_database_jobs(conn, db.name, docker, cfg=cfg)
         except Exception as exc:
             _safe_send(send, cfg, f"{db.name}: reap failed: {exc}")
 
@@ -1624,7 +1627,7 @@ def _reconcile_v2_locked(
             _safe_send(send, cfg, message)
             outcomes.append((db.name, "deferred"))
             continue
-        block = writer_blocks_database(conn, db, all_profiles, docker)
+        block = writer_blocks_database(conn, db, all_profiles, docker, cfg=cfg)
         if block is not None:
             try:
                 run_id = state.start_run(db.name, "(pending)")
@@ -1715,7 +1718,7 @@ def _reconcile_locked(
         return _finish(cfg, conn, run_id, target, "failed", str(exc), send)
 
     try:
-        writer = reap_jobs(conn, docker)
+        writer = reap_jobs(conn, docker, cfg=cfg)
     except WriterStateUnknown as exc:
         send(cfg, f"previous writer state unknown; not starting a new writer: {exc}")
         return _finish(cfg, conn, run_id, target, "failed", "writer unknown", send)

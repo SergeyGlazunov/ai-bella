@@ -148,26 +148,36 @@ docker compose -p bsl-indexer build && docker compose -p bsl-indexer up -d
 Сначала замените канал алерта (kit stub отвергается `validate`), затем bootstrap:
 
 ```bash
-# 1) Подготовить alert.sh (не stub)
+# 1) Подготовить alert.sh (не stub; сервисный пользователь должен уметь читать/исполнять)
 sudo mkdir -p /opt/ai-contour
 sudo cp integrations/alert.sh.example /opt/ai-contour/alert.sh   # затем заменить на реальный канал
-sudo chmod 700 /opt/ai-contour/alert.sh
+sudo chown root:ai-contour /opt/ai-contour/alert.sh
+sudo chmod 750 /opt/ai-contour/alert.sh
 
-# 2) Bootstrap (validate внутри; units/tmpfiles/logrotate без enable timer)
+# 2) Bootstrap (validate и docker info — от ai-contour; units/tmpfiles/logrotate без enable timer)
 sudo ./bootstrap.sh
-
-# 3) contour.yaml: remotes / inbox / adapters; alert.command
-sudo chmod 640 /etc/ai-contour/contour.yaml
-sudo /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml validate
 ```
 
-Если bootstrap остановился на stub alert — замените `/opt/ai-contour/alert.sh` и **повторите** `bootstrap.sh`, не только отдельный `validate`.
+Bootstrap:
+- создаёт пользователя `ai-contour` и добавляет его в группу Docker-сокета (обычно `docker`);
+- проверяет `docker info` **от имени** `ai-contour` — при отказе останавливается с инструкцией (сокет world-writable не открывать);
+- выставляет `alert.sh` в `root:ai-contour` `0750` даже если файл уже существовал;
+- запускает `contour validate` от `ai-contour`.
 
-Периодический бэкап state (вне nightly, по желанию):
+Если bootstrap остановился на stub alert / Docker / правах — исправьте и **повторите** `bootstrap.sh`, не только отдельный `validate`. Секреты канала алерта должны быть читаемы `ai-contour`.
+
+Smoke после успешного bootstrap (без enable timer):
 
 ```bash
+sudo -u ai-contour /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml validate
+sudo -u ai-contour docker info >/dev/null
+sudo -u ai-contour test -r /etc/ai-contour/contour.yaml -w /srv/ai-contour/logs/runs
+sudo -u ai-contour test -x /opt/ai-contour/alert.sh
+# после первого реального state.db:
 sudo -u ai-contour /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml backup-state
 ```
+
+Периодический бэкап state (вне nightly, по желанию) — той же командой `backup-state`. Отсутствующий `state.db` — ошибка (пустой файл не создаётся).
 
 Timer включайте после первого успешного `contour update` в окне.
 

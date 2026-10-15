@@ -138,11 +138,11 @@ def _print_status(cfg, paths: RuntimePaths, *, database: str | None = None) -> i
     conn = init_db(paths.db_path)
     try:
         if database is not None:
-            try:
-                select_databases(cfg, database)
-            except ValueError as exc:
-                print(str(exc))
+            databases = cfg.databases or {}
+            if database not in databases:
+                print(f"unknown database: {database}")
                 return 1
+            # status may inspect enabled:false profiles (repair); update still refuses.
             _print_database_status(conn, cfg, database)
             return 0
 
@@ -296,29 +296,41 @@ def _intake(cfg, database: str) -> int:
 
 
 def _backup_state(cfg, paths: RuntimePaths, *, retain_days: int = STATE_BACKUP_RETAIN_DAYS) -> int:
-    """SQLite online backup into runtime.backups_path; prune older copies."""
+    """SQLite online backup into runtime.backups_path; prune older copies.
+
+    Missing source state.db is an error: do not create an empty DB and do not prune.
+    """
     runtime = getattr(cfg, "runtime", None)
     if runtime is not None and runtime.backups_path:
         backup_dir = Path(runtime.backups_path)
     else:
         backup_dir = Path("/srv/ai-contour/backups/state")
-    backup_dir.mkdir(parents=True, exist_ok=True)
 
+    src_path = Path(paths.db_path)
+    if not src_path.is_file():
+        print(f"backup-state failed: state database missing: {src_path}")
+        return 1
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = backup_dir / f"state-{stamp}.db"
-    src_path = paths.db_path
-    if not Path(src_path).is_file():
-        # Ensure schema exists so first backup still works.
-        conn = init_db(src_path)
-        conn.close()
 
-    src = sqlite3.connect(src_path)
+    # Open source read-only via URI so a missing path cannot create a new DB.
+    try:
+        src = sqlite3.connect(src_path.resolve().as_uri() + "?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"backup-state failed: cannot open {src_path}: {exc}")
+        return 1
     try:
         dst = sqlite3.connect(str(dest))
         try:
             src.backup(dst)
         finally:
             dst.close()
+    except sqlite3.Error as exc:
+        dest.unlink(missing_ok=True)
+        print(f"backup-state failed: {exc}")
+        return 1
     finally:
         src.close()
 
@@ -326,6 +338,8 @@ def _backup_state(cfg, paths: RuntimePaths, *, retain_days: int = STATE_BACKUP_R
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, retain_days))
     for path in backup_dir.glob("state-*.db"):
+        if path.resolve() == dest.resolve():
+            continue
         try:
             # state-YYYYMMDDTHHMMSSZ.db
             token = path.stem.removeprefix("state-")

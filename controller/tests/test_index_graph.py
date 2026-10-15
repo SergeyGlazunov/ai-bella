@@ -343,3 +343,56 @@ def test_index_graph_full_skipped_when_may_write_deferred(tmp_path: Path):
         assert "apply_changes.py" in _override_text(creates[0])
     finally:
         conn.close()
+
+
+def test_copy_job_logs_uses_runtime_logs_path(tmp_path: Path):
+    from contour.index_graph import copy_job_logs
+
+    logs = tmp_path / "runs"
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["runtime"]["logs_path"] = str(logs)
+    compose_dir = tmp_path / "compose"
+    compose_dir.mkdir()
+    (compose_dir / "docker-compose.yml").write_text(
+        "services:\n  metadata-indexer:\n    image: alpine\n",
+        encoding="utf-8",
+    )
+    raw["databases"]["ubd"]["services"]["graph_compose_dir"] = str(compose_dir)
+    cfg_path = tmp_path / "contour.yaml"
+    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+    runner = FakeDockerRunner(log_text="graph boom\n")
+    path = copy_job_logs(runner, "cid-review", cfg=cfg)
+    assert path is not None
+    written = Path(path)
+    assert written.parent == logs
+    assert written.read_text(encoding="utf-8") == "graph boom\n"
+
+
+def test_index_graph_persists_log_under_runtime_logs_path(tmp_path: Path):
+    logs = tmp_path / "runs"
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["runtime"]["logs_path"] = str(logs)
+    compose_dir = tmp_path / "compose"
+    compose_dir.mkdir()
+    (compose_dir / "docker-compose.yml").write_text(
+        "services:\n  metadata-indexer:\n    image: alpine\n",
+        encoding="utf-8",
+    )
+    raw["databases"]["ubd"]["services"]["graph_compose_dir"] = str(compose_dir)
+    cfg_path = tmp_path / "contour.yaml"
+    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+    conn, run_id = _init_run(tmp_path)
+    runner = FakeDockerRunner(wait_codes=[0], log_text="ok-log", conn=conn)
+    try:
+        index_graph(cfg, conn, run_id, runner=runner)
+        row = conn.execute(
+            "SELECT log_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        log_path = Path(row["log_path"])
+        assert log_path.parent == logs
+        assert log_path.is_file()
+    finally:
+        conn.close()
