@@ -1,22 +1,37 @@
-# tools/kb — единственный разрешённый способ трогать хранилище КБ с этой машины
+# tools/kb — выгрузка КБ в immutable package
 
 Скрипт `Update-And-Export-Kb.ps1` делает по порядку:
 
-1. `/ConfigurationRepositoryUpdateCfg -force` + `/UpdateDBCfg` (обновить из хранилища и применить к ИБ)
-2. `/DumpConfigToFiles` → staging → `/srv/ai2/kb/src`
-3. **полная** переиндексация графа (`METADATA_FORCE_REINDEX=true` в one-shot `docker run` по образу контейнера `ai2-metadata-indexer-kb`)
+1. `/ConfigurationRepositoryUpdateCfg -force` + `/UpdateDBCfg`
+2. `/DumpConfigToFiles` → staging
+3. Публикация пакета в `packageInbox`: `.incoming-<id>` → `ready-<id>` с `READY` **последним**
+
+Индексацию графа и BSL скрипт **не** запускает — это зона Linux/`contour` после intake пакета.
 
 Других ключей DESIGNER нет. Переключателей Skip* для store/dump нет.
 
-`apply_changes` для КБ не используем: база маленькая, полный прогон после ночной выгрузки ~10 минут.
+## Профиль
 
-Профиль `kb-connection.json` (опционально):
+Скопируйте `kb-connection.example.json` → `kb-connection.json` (gitignore / не коммитить секреты).
 
 | Поле | По умолчанию | Смысл |
 |------|----------------|-------|
-| `skipGraphReindex` | `false` | пропустить шаг 3 (отладка) |
-| `graphIndexerContainer` | `ai2-metadata-indexer-kb` | эталон env/image/network |
-| `graphNeo4jContainer` | `ai2-neo4j-kb` | ждать healthy перед индексом |
+| `packageInbox` | `workdir/inbox/kb` | корень inbox для `ready-*` пакетов |
+| `exportStaging` | `workdir/kb-export` | временная выгрузка DumpConfigToFiles |
+| `platformVersion` | из `exePath` | поле `platform_version` в `manifest.json` |
 
-На стороне 1С у учётки хранилища (`storeUser` в `kb-connection.json`) выставьте минимальные права
-(получение объектов / обновление из хранилища — без захвата, без помещения в хранилище, без админ-операций).
+На стороне 1С у учётки хранилища (`storeUser`) — минимальные права (получение изменений).
+
+## Пакет
+
+Структура `ready-<export-id>/`:
+
+- `src/` — выгрузка (обязателен `Configuration.xml`)
+- `manifest.json` — schema_version=1, operations: `DumpConfigToFiles`, `UpdateCfg`, `UpdateDBCfg` = `ok`
+- `READY` — маркер готовности (создаётся после манифеста)
+
+Checksum: SHA-256 контракт как в `controller/src/contour/packages.py`.
+
+## Nightly
+
+Task Scheduler: `AI-contour KB nightly export` ≈ **01:00**.

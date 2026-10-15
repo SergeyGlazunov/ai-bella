@@ -1,0 +1,14 @@
+{
+  "exePath": "C:\\Program Files\\1cv8\\8.3.xx.xxxx\\bin\\1cv8.exe",
+  "server": "host",
+  "ref": "kb",
+  "ibUser": "user",
+  "ibPassword": "secret",
+  "storeUrl": "tcp://store-host/kb",
+  "storeUser": "store-user",
+  "storePassword": "store-secret",
+  "logDir": "C:\\AI-contour\\logs\\kb",
+  "exportStaging": "C:\\AI-contour\\workdir\\kb-export",
+  "packageInbox": "C:\\AI-contour\\workdir\\inbox\\kb",
+  "platformVersion": "8.3.25"
+}

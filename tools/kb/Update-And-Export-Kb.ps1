@@ -1,17 +1,11 @@
 <#
 .SYNOPSIS
-  КБ: store+dump → /srv/ai2/kb/src → graph full → code-index (ai2-bsl-kb)
+  КБ: store+dump → immutable package in Linux inbox (no Docker / index).
 
 .DESCRIPTION
-  Запуск: Windows PowerShell. Других операций с хранилищем/конфигуратором скрипт не делает.
-  Запрещены произвольные ключи DESIGNER; нет режимов «только dump» / «пропустить store».
-
-  После копирования выгрузки — полный прогон metadata-indexer (METADATA_FORCE_REINDEX),
-  без apply_changes: КБ маленькая (~10 мин), затем code-index через ai2-bsl-kb.
-  Нужен Docker Engine (без docker compose plugin).
-
-  Права учётки хранилища на стороне 1С тоже должны быть минимальными (только получение
-  изменений). Скрипт — второй контур ограничения.
+  Запуск: Windows PowerShell. Только операции 1С (UpdateCfg+UpdateDBCfg, DumpConfigToFiles)
+  и публикация пакета ready-<export-id> с READY последним.
+  Индексация (graph / BSL) — на стороне Linux orchestrator (contour).
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\kb\Update-And-Export-Kb.ps1
@@ -53,6 +47,17 @@ function Get-LogText {
     }
 }
 
+function Get-PlatformVersionLabel {
+    param([string]$ExePath)
+    try {
+        $v = [Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
+        if ($v.ProductVersion) { return [string]$v.ProductVersion }
+        if ($v.FileVersion) { return [string]$v.FileVersion }
+    }
+    catch { }
+    return "unknown"
+}
+
 function Invoke-DesignerAllowed {
     param(
         [ValidateSet("store-update", "dump-xml")]
@@ -66,7 +71,6 @@ function Invoke-DesignerAllowed {
     $log = Join-Path $LogDir "$Op-$Stamp.log"
     $connect = "/S`"$($Cfg.server)\$($Cfg.ref)`""
 
-    # Белый список argv: ничего кроме этих двух операций (+ UpdateDBCfg внутри store-update).
     switch ($Op) {
         "store-update" {
             $extra = @(
@@ -122,137 +126,10 @@ function Invoke-DesignerAllowed {
     }
 }
 
-$common = Join-Path $PSScriptRoot "..\common\Docker-Index.ps1"
-. (Resolve-Path $common).Path
-
-function Wait-Neo4jHealthy {
-    param(
-        [string]$Container = "ai2-neo4j-kb",
-        [int]$TimeoutSec = 180
-    )
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $null = docker inspect $Container 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Neo4j container not found: $Container"
-        }
-        docker start $Container 2>$null | Out-Null
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-            $health = (docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}" $Container 2>$null)
-            if ($health -eq "healthy" -or $health -eq "running") {
-                if ($health -eq "healthy") { return }
-                Start-Sleep -Seconds 3
-                return
-            }
-            Start-Sleep -Seconds 3
-        }
-        throw "Neo4j not healthy within ${TimeoutSec}s: $Container"
-    }
-    finally {
-        $ErrorActionPreference = $prev
-    }
-}
-
-function Invoke-KbGraphFullReindex {
-    param(
-        [string]$ReferenceContainer = "ai2-metadata-indexer-kb",
-        [string]$Neo4jContainer = "ai2-neo4j-kb",
-        [string]$SrcLinux,
-        [string]$LogDir,
-        [string]$Stamp
-    )
-
-    $log = Join-Path $LogDir "graph-reindex-$Stamp.log"
-    # Create log early so Task Scheduler failures leave a trail (inspect used to abort under Stop).
-    "graph-reindex prepare $(Get-Date -Format o) ref=$ReferenceContainer neo4j=$Neo4jContainer" |
-        Set-Content -LiteralPath $log -Encoding UTF8
-
-    $inspectCode = Invoke-DockerNative -DockerArgs @("inspect", $ReferenceContainer)
-    if ($inspectCode -ne 0) {
-        throw "Reference indexer container missing: $ReferenceContainer (deploy ai2-mcp-kb first). See $log"
-    }
-
-    Wait-Neo4jHealthy -Container $Neo4jContainer
-
-    # Capture JSON under Continue — native docker stderr must not abort the nightly job.
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $inspectJson = & docker inspect $ReferenceContainer 2>$null
-        $inspectExit = [int]$LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $prevEap
-    }
-    if ($inspectExit -ne 0 -or -not $inspectJson) {
-        throw "docker inspect failed for $ReferenceContainer exit=$inspectExit. See $log"
-    }
-    $ref = ($inspectJson | ConvertFrom-Json)[0]
-    if (-not $ref) { throw "Failed to parse docker inspect for $ReferenceContainer. See $log" }
-
-    $image = [string]$ref.Config.Image
-    if (-not $image) { throw "No image on $ReferenceContainer" }
-
-    $network = $null
-    if ($ref.NetworkSettings.Networks) {
-        $network = @($ref.NetworkSettings.Networks.PSObject.Properties.Name)[0]
-    }
-    if (-not $network) { $network = "ai2-mcp-kb_net" }
-
-    $runName = "ai2-metadata-indexer-kb-nightly-$Stamp"
-    $null = Invoke-DockerNative -DockerArgs @("rm", "-f", $runName)
-
-    $dockerArgs = @(
-        "run", "--rm",
-        "--name", $runName,
-        "--network", $network,
-        "-v", "${SrcLinux}:/data/1c-xml:ro",
-        "-w", "/app",
-        "-e", "METADATA_FORCE_REINDEX=true",
-        "-e", "PYTHONUNBUFFERED=1"
-    )
-
-    $skipEnvPrefix = @(
-        "PATH=", "LANG=", "GPG_KEY=", "PYTHON_VERSION=", "PYTHON_SHA256=",
-        "METADATA_FORCE_REINDEX=", "PYTHONUNBUFFERED="
-    )
-    foreach ($e in @($ref.Config.Env)) {
-        $skip = $false
-        foreach ($p in $skipEnvPrefix) {
-            if ($e.StartsWith($p)) { $skip = $true; break }
-        }
-        if ($skip) { continue }
-        $dockerArgs += "-e", $e
-    }
-
-    $dockerArgs += $image, "python", "/app/mcp_metadata_indexer.py"
-
-    Write-Host "=== graph-reindex (full) start $(Get-Date -Format o) ==="
-    Write-Host "image: $image"
-    Write-Host "network: $network"
-    Write-Host "src: $SrcLinux -> /data/1c-xml"
-    Write-Host "force: METADATA_FORCE_REINDEX=true"
-    Write-Host "log: $log"
-
-    Add-Content -LiteralPath $log -Value "image=$image network=$network src=$SrcLinux" -Encoding UTF8
-
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    $exit = Invoke-DockerNative -DockerArgs $dockerArgs -TeeFile $log -AppendTee
-    $sw.Stop()
-    Write-Host "graph-reindex exit=$exit elapsed_sec=$([math]::Round($sw.Elapsed.TotalSeconds, 1))"
-
-    if ($exit -ne 0) {
-        throw "graph-reindex failed exit=$exit. See $log"
-    }
-}
-
 # --- main ---
 $scriptDir = $PSScriptRoot
-if (-not $env:DOCKER_HOST) {
-    $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
-}
+Import-Module (Join-Path $scriptDir "..\common\Export-Package.psm1") -Force
+
 if (-not $Profile) {
     $Profile = Join-Path $scriptDir "kb-connection.json"
 }
@@ -263,27 +140,18 @@ $logDir = if ($cfg.logDir) { [string]$cfg.logDir } else { Join-Path $scriptDir "
 $logDir = [IO.Path]::GetFullPath($logDir)
 $staging = if ($cfg.exportStaging) { [string]$cfg.exportStaging } else { Join-Path $scriptDir "..\..\workdir\kb-export" }
 $staging = [IO.Path]::GetFullPath($staging)
-$destLinux = if ($cfg.exportDestLinux) { [string]$cfg.exportDestLinux } else { "/srv/ai2/kb/src" }
+$packageInbox = if ($cfg.packageInbox) { [string]$cfg.packageInbox } else { Join-Path $scriptDir "..\..\workdir\inbox\kb" }
+$packageInbox = [IO.Path]::GetFullPath($packageInbox)
 
-New-Item -ItemType Directory -Force -Path $logDir, $staging | Out-Null
+New-Item -ItemType Directory -Force -Path $logDir, $staging, $packageInbox | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-
-$skipGraphReindex = $false
-if ($null -ne $cfg.skipGraphReindex) {
-    $skipGraphReindex = [bool]$cfg.skipGraphReindex
-}
-$indexerRef = if ($cfg.graphIndexerContainer) { [string]$cfg.graphIndexerContainer } else { "ai2-metadata-indexer-kb" }
-$neo4jRef = if ($cfg.graphNeo4jContainer) { [string]$cfg.graphNeo4jContainer } else { "ai2-neo4j-kb" }
-$bslContainer = if ($cfg.bslContainer) { [string]$cfg.bslContainer } else { "ai2-bsl-kb" }
-$skipCodeIndex = $false
-if ($null -ne $cfg.skipCodeIndex) { $skipCodeIndex = [bool]$cfg.skipCodeIndex }
+$startedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$platformVersion = if ($cfg.platformVersion) { [string]$cfg.platformVersion } else { Get-PlatformVersionLabel -ExePath $cfg.exePath }
 
 Write-Host "profile: $Profile"
-Write-Host "allowed ops: store-update (UpdateCfg+UpdateDBCfg), dump-xml, copy, graph-reindex(full), code-index"
+Write-Host "allowed ops: store-update (UpdateCfg+UpdateDBCfg), dump-xml, package-publish"
 Write-Host "staging: $staging"
-Write-Host "dest:    $destLinux"
-Write-Host "graph-reindex: $(if ($skipGraphReindex) { 'SKIP' } else { "full via $indexerRef" })"
-Write-Host "code-index: $(if ($skipCodeIndex) { 'SKIP' } else { $bslContainer })"
+Write-Host "inbox:   $packageInbox"
 
 # (1) хранилище → конфигурация ИБ + применение к БД
 Invoke-DesignerAllowed -Op "store-update" -Cfg $cfg -LogDir $logDir -Stamp $stamp
@@ -301,24 +169,20 @@ if (-not (Test-Path -LiteralPath $cfgXml)) {
 $fileCount = (Get-ChildItem -LiteralPath $staging -Recurse -File | Measure-Object).Count
 Write-Host "dump files: $fileCount"
 
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw "docker not found; needed to copy into $destLinux"
-}
-Copy-WinTreeToLinuxPath -StagingWin $staging -DestLinux $destLinux -VolumePrefix "kb-export-stage"
+$finishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$manifest = New-ExportManifest `
+    -Database "kb" `
+    -ExportId $stamp `
+    -SourcePath $staging `
+    -Operations @{
+        DumpConfigToFiles = "ok"
+        UpdateCfg         = "ok"
+        UpdateDBCfg       = "ok"
+    } `
+    -PlatformVersion $platformVersion `
+    -StartedAt $startedAt `
+    -FinishedAt $finishedAt
 
-# (3) полная переиндексация графа КБ (без apply_changes)
-if (-not $skipGraphReindex) {
-    Invoke-KbGraphFullReindex `
-        -ReferenceContainer $indexerRef `
-        -Neo4jContainer $neo4jRef `
-        -SrcLinux $destLinux `
-        -LogDir $logDir `
-        -Stamp $stamp
-}
-
-# (4) code-index
-if (-not $skipCodeIndex) {
-    Invoke-Ai2BslCodeIndex -Container $bslContainer -LogDir $logDir -Stamp $stamp
-}
+$null = Publish-ExportPackage -SourcePath $staging -DestinationRoot $packageInbox -Manifest $manifest
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="

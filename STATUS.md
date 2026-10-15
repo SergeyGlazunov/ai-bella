@@ -1,6 +1,6 @@
 # STATUS
 
-**Updated:** 2026-10-14  
+**Updated:** 2026-10-15  
 **Horizon:** PS/ai2 stable (short) → linux-first / `contour` (next)  
 **Repo:** https://github.com/SergeyGlazunov/ai-bella  
 **Priority:** operational nights + recovery (`For Cursor/LINUX-FIRST-DESIGN.md` §1.1)
@@ -47,7 +47,7 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 
 ## Next action
 
-1. Observe PS/ai2 nightly LastResult on the stand (operator).
-2. Linux-first kit: Tasks 2–8 done; Task 8 closed for kit code (BSL resume≠rebuild, explicit `services.neo4j_container`, bounded logs/API). Set real Neo4j container names per DB on the stand. Code readiness only — **no stand cutover**.
-3. Next kit work: **Task 9** (Windows package exporters) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
+1. Observe PS/ai2 nightly LastResult on the stand (operator). Note: Task 9 kit exporters no longer index — until cutover, either keep legacy nightly paths or temporarily dual-run; **do not switch live Task Scheduler to package-only without inbox+contour intake**.
+2. Linux-first kit: Tasks 2–9 done in kit code. Task 9: `tools/common/Export-Package.psm1` + KB/`klon_opl` publish `ready-*` packages (Pester 9 passed). Set real Neo4j container names per DB on the stand when wiring contour. **No stand cutover**.
+3. Next kit work: **Task 10** (CLI / systemd / bootstrap for `/srv/ai-contour`) from `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`.
 4. Before stand dry-run: Linux/WSL lock/path checks on a WSL host; Tasks 11–12 for dry-run/cutover.

@@ -1,0 +1,11 @@
+{
+  "exePath": "C:\\Program Files\\1cv8\\8.3.xx.xxxx\\bin\\1cv8.exe",
+  "server": "adm-program-102",
+  "ref": "klon_opl",
+  "ibUser": "user",
+  "ibPassword": "secret",
+  "logDir": "C:\\AI-contour\\logs\\klon_opl",
+  "exportStaging": "C:\\AI-contour\\workdir\\klon_opl-export",
+  "packageInbox": "C:\\AI-contour\\workdir\\inbox\\klon_opl",
+  "platformVersion": "8.3.23.1865"
+}

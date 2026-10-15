@@ -39,11 +39,17 @@
 
 ---
 
----
+### 2026-10-15 — Task 9: Windows package exporters (kit only)
 
----
+**Задача.** KB / `klon_opl` на Windows только выгружают 1С и публикуют immutable package (`ready-*` + `READY` last); без Docker/index.
 
----
+**Решение.** `tools/common/Export-Package.psm1` (`New-SourceChecksum` / `New-ExportManifest` / `Publish-ExportPackage`) — checksum как `packages.py`. Скрипты KB/`klon_opl` пишут в `packageInbox`. Примеры профилей `*.example.json`. Pester 5: 9 passed; parser OK.
+
+**Проверено.** `Invoke-Pester tools/common/Export-Package.Tests.ps1`; Python `validate_package` на синтетическом пакете.
+
+**Стенд.** Планировщик **не** переключали на package-only (нет intake/`contour`). Живые `*-connection.json` не трогали.
+
+**Откат.** Вернуть прежние скрипты с `Docker-Index.ps1` / graph+BSL шагами из git.
 
 ---
 

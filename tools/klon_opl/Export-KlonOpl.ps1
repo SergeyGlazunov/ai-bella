@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-  klon_opl: выгрузить конфигурацию → /srv/ai2/klon_opl/src → code-index (ai2-bsl-klon-opl)
+  klon_opl: DumpConfigToFiles → immutable package in Linux inbox (no Docker / index).
 
 .DESCRIPTION
-  Запуск: Windows PowerShell. Хранилища нет — DumpConfigToFiles + copy + code-index.
-  Белый список ключей DESIGNER: только dump-xml.
+  Запуск: Windows PowerShell. Хранилища нет — только dump + публикация пакета.
+  Индексация BSL — на стороне Linux orchestrator (contour).
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\klon_opl\Export-KlonOpl.ps1
@@ -41,6 +41,17 @@ function Get-LogText {
     catch {
         return [Text.Encoding]::Default.GetString($bytes)
     }
+}
+
+function Get-PlatformVersionLabel {
+    param([string]$ExePath)
+    try {
+        $v = [Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
+        if ($v.ProductVersion) { return [string]$v.ProductVersion }
+        if ($v.FileVersion) { return [string]$v.FileVersion }
+    }
+    catch { }
+    return "unknown"
 }
 
 function Invoke-DesignerDump {
@@ -90,14 +101,10 @@ function Invoke-DesignerDump {
     }
 }
 
-$common = Join-Path $PSScriptRoot "..\common\Docker-Index.ps1"
-. (Resolve-Path $common).Path
-
 # --- main ---
 $scriptDir = $PSScriptRoot
-if (-not $env:DOCKER_HOST) {
-    $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
-}
+Import-Module (Join-Path $scriptDir "..\common\Export-Package.psm1") -Force
+
 if (-not $Profile) {
     $Profile = Join-Path $scriptDir "klon_opl-connection.json"
 }
@@ -108,19 +115,18 @@ $logDir = if ($cfg.logDir) { [string]$cfg.logDir } else { Join-Path $scriptDir "
 $logDir = [IO.Path]::GetFullPath($logDir)
 $staging = if ($cfg.exportStaging) { [string]$cfg.exportStaging } else { Join-Path $scriptDir "..\..\workdir\klon_opl-export" }
 $staging = [IO.Path]::GetFullPath($staging)
-$destLinux = if ($cfg.exportDestLinux) { [string]$cfg.exportDestLinux } else { "/srv/ai2/klon_opl/src" }
-$bslContainer = if ($cfg.bslContainer) { [string]$cfg.bslContainer } else { "ai2-bsl-klon-opl" }
-$skipCodeIndex = $false
-if ($null -ne $cfg.skipCodeIndex) { $skipCodeIndex = [bool]$cfg.skipCodeIndex }
+$packageInbox = if ($cfg.packageInbox) { [string]$cfg.packageInbox } else { Join-Path $scriptDir "..\..\workdir\inbox\klon_opl" }
+$packageInbox = [IO.Path]::GetFullPath($packageInbox)
 
-New-Item -ItemType Directory -Force -Path $logDir, $staging | Out-Null
+New-Item -ItemType Directory -Force -Path $logDir, $staging, $packageInbox | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$startedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$platformVersion = if ($cfg.platformVersion) { [string]$cfg.platformVersion } else { Get-PlatformVersionLabel -ExePath $cfg.exePath }
 
 Write-Host "profile: $Profile"
-Write-Host "allowed ops: dump-xml, copy, code-index (no store)"
+Write-Host "allowed ops: dump-xml, package-publish (no store)"
 Write-Host "staging: $staging"
-Write-Host "dest:    $destLinux"
-Write-Host "code-index: $(if ($skipCodeIndex) { 'SKIP' } else { $bslContainer })"
+Write-Host "inbox:   $packageInbox"
 
 Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -134,13 +140,16 @@ if (-not (Test-Path -LiteralPath $cfgXml)) {
 $fileCount = (Get-ChildItem -LiteralPath $staging -Recurse -File | Measure-Object).Count
 Write-Host "dump files: $fileCount"
 
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw "docker not found; needed to copy into $destLinux"
-}
-Copy-WinTreeToLinuxPath -StagingWin $staging -DestLinux $destLinux -VolumePrefix "klon-opl-export-stage"
+$finishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$manifest = New-ExportManifest `
+    -Database "klon_opl" `
+    -ExportId $stamp `
+    -SourcePath $staging `
+    -Operations @{ DumpConfigToFiles = "ok" } `
+    -PlatformVersion $platformVersion `
+    -StartedAt $startedAt `
+    -FinishedAt $finishedAt
 
-if (-not $skipCodeIndex) {
-    Invoke-Ai2BslCodeIndex -Container $bslContainer -LogDir $logDir -Stamp $stamp
-}
+$null = Publish-ExportPackage -SourcePath $staging -DestinationRoot $packageInbox -Manifest $manifest
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="
