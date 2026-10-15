@@ -57,16 +57,21 @@ function New-SourceChecksum {
         'manifest.json' = $true
     }
 
-    $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force |
-        Where-Object {
-            $rel = Get-RelativePosixPath -Root $root -FullPath $_.FullName
-            -not $excluded.ContainsKey($rel)
-        } |
-        Sort-Object { Get-RelativePosixPath -Root $root -FullPath $_.FullName }
+    # Collect then sort by relative POSIX path with Ordinal comparer so the
+    # order matches Python sorted(..., key=as_posix) regardless of PS culture.
+    $byRel = New-Object 'System.Collections.Generic.Dictionary[string,System.IO.FileInfo]'
+    Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
+        $rel = Get-RelativePosixPath -Root $root -FullPath $_.FullName
+        if ($excluded.ContainsKey($rel)) { return }
+        $byRel[$rel] = $_
+    }
+    $relKeys = New-Object string[] $byRel.Count
+    $byRel.Keys.CopyTo($relKeys, 0)
+    [Array]::Sort($relKeys, [StringComparer]::Ordinal)
 
     $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($f in $files) {
-        $rel = Get-RelativePosixPath -Root $root -FullPath $f.FullName
+    foreach ($rel in $relKeys) {
+        $f = $byRel[$rel]
         $len = $f.Length
         $digest = Get-FileSha256Hex -Path $f.FullName
         $lines.Add("${rel}`0${len}`0${digest}")
@@ -129,7 +134,8 @@ function New-ExportManifest {
             $srcDir = Join-Path $tempPkg 'src'
             New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
             $roboCode = 0
-            & robocopy.exe $root $srcDir /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+            # Cap retries: default robocopy is 1e6 retries × 30s on a single error.
+            & robocopy.exe $root $srcDir /E /NFL /NDL /NJH /NJS /nc /ns /np /R:2 /W:2 | Out-Null
             $roboCode = [int]$LASTEXITCODE
             if ($roboCode -ge 8) { throw "robocopy failed exit=$roboCode while staging dump for manifest" }
             $pkgRoot = $tempPkg
@@ -198,6 +204,16 @@ function Test-PackageIdentityMatch {
     )
 }
 
+function Test-PackageContentComplete {
+    param([Parameter(Mandatory = $true)][string]$PackagePath)
+    $manifestPath = Join-Path $PackagePath 'manifest.json'
+    $cfg = Join-Path $PackagePath 'src\Configuration.xml'
+    return (
+        (Test-Path -LiteralPath $manifestPath -PathType Leaf) -and
+        (Test-Path -LiteralPath $cfg -PathType Leaf)
+    )
+}
+
 <#
 .SYNOPSIS
   Copy dump tree into inbox as .incoming-<id>, write manifest, publish ready-<id>, create READY last.
@@ -230,25 +246,44 @@ function Publish-ExportPackage {
     $readyPath = Join-Path $destRoot $readyName
     $incomingPath = Join-Path $destRoot $incomingName
 
+    $readyMarker = Join-Path $readyPath 'READY'
     if (Test-Path -LiteralPath $readyPath) {
-        if (Test-PackageIdentityMatch -ReadyPath $readyPath -Manifest $Manifest) {
-            Write-Host "package already published (idempotent): $readyName"
+        $hasReady = Test-Path -LiteralPath $readyMarker -PathType Leaf
+        if ($hasReady) {
+            if (Test-PackageIdentityMatch -ReadyPath $readyPath -Manifest $Manifest) {
+                Write-Host "package already published (idempotent): $readyName"
+                return $readyPath
+            }
+            throw "claim collision for export_id=$exportId"
+        }
+        # Renamed but READY missing (interrupted publish). Finish only when
+        # content matches this delivery; otherwise remove and rebuild.
+        if (
+            (Test-PackageContentComplete -PackagePath $readyPath) -and
+            (Test-PackageIdentityMatch -ReadyPath $readyPath -Manifest $Manifest)
+        ) {
+            [IO.File]::WriteAllBytes($readyMarker, [byte[]]@())
+            if (-not (Test-Path -LiteralPath $readyMarker -PathType Leaf)) {
+                throw "READY missing after completing interrupted publish"
+            }
+            Write-Host "completed interrupted publish (READY written): $readyName"
             return $readyPath
         }
-        throw "claim collision for export_id=$exportId"
+        Remove-Item -LiteralPath $readyPath -Recurse -Force -ErrorAction Stop
+        Write-Host "removed incomplete package without READY: $readyName"
     }
 
     if (Test-Path -LiteralPath $incomingPath) {
         Remove-Item -LiteralPath $incomingPath -Recurse -Force -ErrorAction Stop
     }
 
-    $published = $false
+    $renamed = $false
     try {
         $srcDir = Join-Path $incomingPath 'src'
         New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
 
-        # Copy dump → incoming/src (robocopy exit 0-7 = success)
-        $robo = & robocopy.exe $dump $srcDir /E /NFL /NDL /NJH /NJS /nc /ns /np
+        # Copy dump → incoming/src (robocopy exit 0-7 = success). Cap retries.
+        $null = & robocopy.exe $dump $srcDir /E /NFL /NDL /NJH /NJS /nc /ns /np /R:2 /W:2
         $roboCode = [int]$LASTEXITCODE
         if ($roboCode -ge 8) {
             throw "robocopy failed exit=$roboCode"
@@ -271,35 +306,33 @@ function Publish-ExportPackage {
 
         $manifestPath = Join-Path $incomingPath 'manifest.json'
         Write-ExportManifestFile -Path $manifestPath -Manifest $Manifest
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "manifest.json missing before publish"
+        }
 
-        # Atomic-ish publish: rename incoming → ready, then READY last
+        # Atomic-ish publish: rename incoming → ready, verify content, READY last.
+        # After READY the consumer may claim_package (move) immediately — do not
+        # re-check inbox paths after writing the marker.
         Move-Item -LiteralPath $incomingPath -Destination $readyPath -Force
-        $published = $true
+        $renamed = $true
 
-        $readyMarker = Join-Path $readyPath 'READY'
+        if (-not (Test-PackageContentComplete -PackagePath $readyPath)) {
+            throw "package incomplete after rename (manifest/src)"
+        }
+
         [IO.File]::WriteAllBytes($readyMarker, [byte[]]@())
-
-        if (-not (Test-Path -LiteralPath $manifestPath.Replace($incomingName, $readyName))) {
-            # path after move
-        }
-        $finalManifest = Join-Path $readyPath 'manifest.json'
-        if (-not (Test-Path -LiteralPath $finalManifest)) {
-            throw "manifest.json missing after publish"
-        }
-        if (-not (Test-Path -LiteralPath $readyMarker)) {
-            throw "READY missing after publish"
-        }
+        # Creating READY hands the package to the consumer; treat as success.
 
         Write-Host "published package: $readyName files=$fileCount"
         return $readyPath
     }
     catch {
-        if (-not $published -and (Test-Path -LiteralPath $incomingPath)) {
+        if (-not $renamed -and (Test-Path -LiteralPath $incomingPath)) {
             # leave .incoming-* for operator inspection; do not create READY
             Write-Host "publish failed; left incomplete: $incomingName"
         }
-        elseif ($published -and (Test-Path -LiteralPath $readyPath) -and -not (Test-Path -LiteralPath (Join-Path $readyPath 'READY'))) {
-            # failed after rename but before READY — rename back to incoming so inbox stays unpublished
+        elseif ($renamed -and (Test-Path -LiteralPath $readyPath) -and -not (Test-Path -LiteralPath $readyMarker)) {
+            # failed after rename but before READY — rename back to incoming
             $rollback = Join-Path $destRoot $incomingName
             if (-not (Test-Path -LiteralPath $rollback)) {
                 Move-Item -LiteralPath $readyPath -Destination $rollback -Force -ErrorAction SilentlyContinue

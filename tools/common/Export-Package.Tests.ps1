@@ -47,6 +47,19 @@ Describe 'New-SourceChecksum' {
         $psHash | Should -Be $pyHash
         $psHash | Should -Match '^[0-9a-f]{64}$'
     }
+
+    It 'matches Python with mixed case, underscore and ordering-sensitive names' {
+        $pkg = Join-Path $TestDrive 'pkg-mixed'
+        New-Item -ItemType Directory -Force -Path (Join-Path $pkg 'src\Catalogs') | Out-Null
+        Set-Content -LiteralPath (Join-Path $pkg 'src\Configuration.xml') -Value '<Configuration/>' -Encoding Ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $pkg 'src\Catalogs\Zebra.xml') -Value '<Z/>' -Encoding Ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $pkg 'src\Catalogs\aTest.xml') -Value '<a/>' -Encoding Ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $pkg 'src\Catalogs\_Special.xml') -Value '<_/>' -Encoding Ascii -NoNewline
+
+        $psHash = New-SourceChecksum -SourcePath $pkg
+        $pyHash = Get-PythonChecksum -PackageRoot $pkg
+        $psHash | Should -Be $pyHash
+    }
 }
 
 Describe 'Publish-ExportPackage' {
