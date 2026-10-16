@@ -44,8 +44,8 @@ UBD FULL graph uses bootstrap `/srv/ai2/tools/ubd/neo4j_timeout_bootstrap.py` (`
 |------|--------|
 | Tasks 1–10 | done in kit (`c19dedd` latest graph logs_path fix) |
 | Task 11 integration | `controller/tests/integration/` — nightly cycle UBD/KB/klon_opl + recovery scenarios; fake Docker / temp SQLite |
-| Runbooks | `checks/linux-first-{preflight,catchup,cutover}.md` |
-| WSL bootstrap dry-run on host | **not executed** (no `/opt` install, no timer); reserved for Task 12 / operator WSL |
+| Runbooks | `checks/linux-first-{preflight,catchup,cutover}.md` — rollback A/B + wait-for-idle writers (catch-up/cutover) |
+| WSL bootstrap dry-run on host | **pending gate** before catch-up (no `/opt` install, no timer yet); not claimed as proof |
 | Stand cutover | **not started** |
 
 Integration acceptance covers: full publish cycle ×3 profiles; package intake; corrupted/incomplete package refusal; crash after activation (reads stay closed); reaped completed job; unknown writer refusal; Graph exit 3→FULL; failed mandatory BSL; probes before reopen.
@@ -61,5 +61,5 @@ Integration acceptance covers: full publish cycle ×3 profiles; package intake; 
 
 1. Observe PS/ai2 nightly LastResult on the stand (operator).
 2. Linux-first kit: Tasks 1–11 done. **No stand cutover**.
-3. Next: **Task 12** only with operator approval — preflight → catch-up → cutover runbooks under `checks/`.
+3. Before catch-up: **WSL bootstrap dry-run** on host (pending gate) — then Task 12 only with operator approval (preflight → catch-up → cutover).
 4. Do not switch live Scheduler to package-only without inbox+contour intake and Task 12 fence.

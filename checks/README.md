@@ -7,6 +7,7 @@ Cutover без PASS gates + drill бэкапа чат-слоя + явного р
 
 | Gate | Файл | Суть |
 | --- | --- | --- |
+| Reboot bring-up | [`stand_reboot_bringup.md`](stand_reboot_bringup.md) | Ручной запуск после перезагрузки: `DockerWSL\start.ps1`, `docker start` ai2, smoke `:3000`/MCP |
 | BSL watch pause | [`stand_watch_pause.md`](stand_watch_pause.md) | Убрать `/repos/SRC` из `daemon.toml`, reload; touch не запускает index; `serve` жив; restore |
 | Close reads | [`stand_close_reads.md`](stand_close_reads.md) | `docker stop` graph; disconnect BSL от сети чата; IdleProbe; restore. Firewall на publish-порт — optional |
 

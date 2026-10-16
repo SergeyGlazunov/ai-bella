@@ -31,19 +31,28 @@
 
 До Step «enable timer»:
 
-1. `contour backup-state` свежий
+1. `contour backup-state` свежий (справка; не единственный откат после записи)
 2. Chat volumes backup (throwaway restore уже доказан)
 3. Список Scheduled Tasks: какие indexing останутся disabled
 4. `systemctl is-enabled ai-sync.timer` = disabled
 5. Published revisions всех трёх баз
+6. Inventory writers (процессы, indexer containers, SQLite jobs)
 
-**Rollback after enable:**
+### Rollback after enable — до vs после ночной записи
+
+**Общее (сразу):**
 
 ```bash
 sudo systemctl disable --now ai-sync.timer
-# Restore state.db from backup if contour night corrupted state
-# Re-enable legacy indexing tasks only if operator accepts dual-horizon rollback
+# Останавливает timer и *текущий* oneshot ai-sync.service, если он ещё в unit.
+# Не убивает уже отделившиеся indexer containers — их дождаться / проверить (§ wait).
 ```
+
+Затем § «Wait for idle writers»: нет running `ai-sync.service`, нет job containers, SQLite jobs не created/running. При unknown — не включать legacy.
+
+**A. Ночь ещё не писала / activate не было:** актуальная SQLite согласована со старым source — rollback без restore старого `state.db`.
+
+**B. После activate / частичной индексации:** **не** накатывать старый `state.db` на живой контур. Сохранить текущую SQLite; довести базу через contour (достройка/пересборка из исходников) → probes → open. Legacy schedule — только после idle writers + согласованных source/layers/probes (см. catch-up rollback B и USER.md).
 
 Не удалять rollback assets в observation period.
 
@@ -63,15 +72,28 @@ Windows: подтвердить, что indexing tasks disabled; export-only tas
 
 ## Mutating commands (ordered)
 
-### 1. Final fence of Windows indexing
+### 1. Final fence of Windows indexing schedules
 
 ```powershell
 # Disable indexing tasks from preflight inventory (not export-only)
 Disable-ScheduledTask -TaskName 'UBD Config Sync'
+Get-ScheduledTask -TaskName 'UBD Config Sync' | Select-Object TaskName, State
 # Keep KB / klon_opl *export* tasks if they only publish packages to inbox
 ```
 
-### 2. Enable WSL timer (only after catch-up PASS)
+Disable запрещает **будущие** старты. Уже бегущий PS/indexer продолжит работу — см. wait.
+
+### 1b. Wait for idle writers (обязательно)
+
+Перед enable timer и перед любым возвратом legacy:
+
+1. Scheduled indexing tasks не Running; нет процессов из preflight inventory.
+2. `systemctl is-active ai-sync.service` → inactive (если unit есть).
+3. `docker ps` — нет contour/index one-shot jobs; MCP permanent OK.
+4. SQLite jobs не в created/running/paused (или понятный post-reap idle).
+5. Unknown writer → **стоп**, timer не enable, legacy не возвращать. Kill indexer не штатный способ.
+
+### 2. Enable WSL timer (only after catch-up PASS + §1b idle)
 
 ```bash
 sudo systemctl daemon-reload
