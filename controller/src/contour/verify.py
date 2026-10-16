@@ -158,10 +158,25 @@ def sample_current_tree(
     else:
         max_xml = 0
 
+    # Prefer typical 1C module roots for probes (often indexed), but never exclude
+    # other .bsl — empty preferred set must still sample AccumulationRegisters/,
+    # CommonForms/, Ext/, extensions, etc.
+    _BSL_PREF = (
+        "CommonModules/",
+        "Catalogs/",
+        "Documents/",
+        "DataProcessors/",
+        "Reports/",
+        "InformationRegisters/",
+        "BusinessProcesses/",
+        "Tasks/",
+    )
+
     root = Path(repo)
     sub = (workspace_subdir or "").replace("\\", "/").strip().strip("/")
     walk = root / sub if sub else root
-    bsl_paths: list[str] = []
+    preferred_bsl: list[str] = []
+    other_bsl: list[str] = []
     xml_paths: list[str] = []
     if walk.is_dir():
         for path in sorted(walk.rglob("*")):
@@ -171,26 +186,21 @@ def sample_current_tree(
             if ".git" in rel.parts:
                 continue
             posix = rel.as_posix()
-            _BSL_PREF = (
-                "CommonModules/",
-                "Catalogs/",
-                "Documents/",
-                "DataProcessors/",
-                "Reports/",
-                "InformationRegisters/",
-                "BusinessProcesses/",
-                "Tasks/",
-            )
-            if posix.endswith(".bsl") and len(bsl_paths) < max_bsl:
-                if not any(posix.startswith(p) for p in _BSL_PREF):
-                    continue
-                bsl_paths.append(posix)
+            if posix.endswith(".bsl"):
+                if any(posix.startswith(p) for p in _BSL_PREF):
+                    if len(preferred_bsl) < max_bsl:
+                        preferred_bsl.append(posix)
+                elif len(other_bsl) < max_bsl:
+                    other_bsl.append(posix)
             elif posix.endswith(".xml") and len(xml_paths) < max_xml:
                 xml_paths.append(posix)
-            bsl_done = len(bsl_paths) >= max_bsl
+            # Do not stop early on other_bsl alone — preferred roots may sort later.
             xml_done = len(xml_paths) >= max_xml
-            if bsl_done and xml_done:
+            if len(preferred_bsl) >= max_bsl and xml_done:
                 break
+    bsl_paths = list(preferred_bsl)
+    if len(bsl_paths) < max_bsl:
+        bsl_paths.extend(other_bsl[: max_bsl - len(bsl_paths)])
     return Samples(
         bsl_paths=bsl_paths,
         xml_paths=xml_paths,

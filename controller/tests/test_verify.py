@@ -218,6 +218,30 @@ def test_sample_current_tree_code_index_only_ignores_xml_quota(tmp_path: Path):
     assert samples.xml_paths == []
 
 
+def test_sample_current_tree_prefers_typical_roots_but_keeps_other_bsl(
+    tmp_path: Path,
+):
+    repo = tmp_path / "pref"
+    repo.mkdir()
+    (repo / "AccumulationRegisters" / "Qty" / "Ext").mkdir(parents=True)
+    (repo / "AccumulationRegisters" / "Qty" / "Ext" / "RecordSetModule.bsl").write_text(
+        "// reg", encoding="utf-8"
+    )
+    (repo / "CommonModules").mkdir()
+    (repo / "CommonModules" / "Foo.bsl").write_text("// foo", encoding="utf-8")
+    samples = sample_current_tree(
+        repo, required_layers=("code_index",), bsl_limit=1
+    )
+    assert samples.bsl_paths == ["CommonModules/Foo.bsl"]
+
+    samples_fallback = sample_current_tree(
+        repo / "AccumulationRegisters",
+        required_layers=("code_index",),
+        bsl_limit=2,
+    )
+    assert samples_fallback.bsl_paths == ["Qty/Ext/RecordSetModule.bsl"]
+
+
 def test_verify_indexes_xml_only_uses_empty_code_contract():
     samples = Samples(
         bsl_paths=[],
