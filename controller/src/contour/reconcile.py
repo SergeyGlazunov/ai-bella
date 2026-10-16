@@ -1045,7 +1045,34 @@ _PERMANENT_NAMES = frozenset(
 )
 
 
-def cleanup_jobs(conn: sqlite3.Connection, docker, *, dry_run: bool) -> list[str]:
+def protected_container_names(cfg) -> frozenset[str]:
+    """Containers `cleanup` must never remove: stand services from config + chat.
+
+    v2 exec jobs record the profile's permanent BSL container as
+    container_id, so every configured bsl_container / graph_mcp /
+    neo4j_container must be protected regardless of its name.
+    """
+    names = set(_PERMANENT_NAMES)
+    databases = getattr(cfg, "databases", None) or {}
+    for database in databases.values():
+        services = getattr(database, "services", None)
+        if services is None:
+            continue
+        for attr in ("bsl_container", "graph_mcp", "neo4j_container"):
+            value = getattr(services, attr, None)
+            if value:
+                names.add(str(value))
+    return frozenset(names)
+
+
+def cleanup_jobs(
+    conn: sqlite3.Connection,
+    docker,
+    *,
+    dry_run: bool,
+    protected: frozenset[str] | None = None,
+) -> list[str]:
+    protected_names = protected if protected is not None else _PERMANENT_NAMES
     rows = conn.execute(
         """
         SELECT id, container_id, status FROM jobs
@@ -1059,7 +1086,8 @@ def cleanup_jobs(conn: sqlite3.Connection, docker, *, dry_run: bool) -> list[str
         name = cid
         try:
             named = docker.run(
-                ["docker", "inspect", "-f", "{{.Name}} {{.State.Status}}", cid]
+                ["docker", "inspect", "-f", "{{.Name}} {{.State.Status}}", cid],
+                timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
             )
             text = (named.stdout or "").strip()
         except Exception:
@@ -1067,7 +1095,7 @@ def cleanup_jobs(conn: sqlite3.Connection, docker, *, dry_run: bool) -> list[str
         parts = text.split()
         status = parts[-1] if parts else ""
         name = parts[0].lstrip("/") if parts else cid
-        if name in _PERMANENT_NAMES:
+        if name in protected_names:
             continue
         if status == "running":
             continue

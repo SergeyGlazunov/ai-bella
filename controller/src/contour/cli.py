@@ -24,6 +24,7 @@ from contour.reconcile import (
     DEFAULT_LOCK,
     RuntimePaths,
     cleanup_jobs,
+    protected_container_names,
     reconcile,
     reopen_reads,
     resolve_runtime_paths,
@@ -554,7 +555,12 @@ def main(argv: list[str] | None = None) -> int:
         conn = init_db(paths.db_path)
         try:
             with held:
-                ids = cleanup_jobs(conn, _docker(), dry_run=bool(args.dry_run))
+                ids = cleanup_jobs(
+                    conn,
+                    _docker(),
+                    dry_run=bool(args.dry_run),
+                    protected=protected_container_names(cfg),
+                )
         finally:
             conn.close()
         for cid in ids:

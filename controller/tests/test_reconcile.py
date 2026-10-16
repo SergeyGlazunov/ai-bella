@@ -1088,3 +1088,61 @@ def test_cleanup_finished_only_without_force(tmp_path: Path):
             assert "--force" not in cmd
     finally:
         conn.close()
+
+
+def test_protected_container_names_cover_config_profiles(tmp_path: Path):
+    """A6: v2 profile service containers must be protected regardless of name."""
+    from contour.reconcile import protected_container_names
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["runtime"] = {
+        "root": str(tmp_path),
+        "db_path": str(tmp_path / "state.db"),
+        "lock_path": str(tmp_path / "sync.lock"),
+        "logs_path": str(tmp_path / "logs"),
+        "backups_path": str(tmp_path / "backups"),
+    }
+    cfg_path = tmp_path / "contour.yaml"
+    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+
+    protected = protected_container_names(cfg)
+    assert {"bsl-indexer", "bsl-kb", "bsl-klon-opl"} <= protected
+    assert {"mcp-metadata-graph", "mcp-graph-kb"} <= protected
+    assert {"open-webui", "omniroute"} <= protected
+
+
+def test_cleanup_spares_config_protected_container(tmp_path: Path):
+    """A stopped v2 BSL service container referenced by a job must stay."""
+    db_path = tmp_path / "state.db"
+    conn = init_db(str(db_path))
+    docker = FakeDocker()
+    try:
+        conn.execute(
+            "INSERT INTO runs (target_commit, started_at) VALUES (?, ?)",
+            ("abc", "2026-09-20T00:00:00Z"),
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (run_id, stage, status, container_id)
+            VALUES (1, 'bsl_index', 'ok', 'bsl-kb')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (run_id, stage, status, container_id)
+            VALUES (1, 'bsl_index', 'ok', 'cid-job-ok')
+            """
+        )
+        conn.commit()
+        removed = cleanup_jobs(
+            conn,
+            docker,
+            dry_run=False,
+            protected=frozenset({"bsl-kb", "bsl-indexer", "mcp-metadata-graph"}),
+        )
+        assert "cid-job-ok" in removed
+        assert "bsl-kb" not in removed
+        assert "bsl-kb" not in docker.removed
+    finally:
+        conn.close()
