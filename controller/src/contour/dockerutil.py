@@ -64,6 +64,14 @@ class DockerRunner(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
 
+class ExecRecordGone(RuntimeError):
+    """Docker no longer has the exec record (collected after exit).
+
+    The exit code is unrecoverable. Callers must resolve the job without
+    claiming success (resume/rebuild path), not block as "unknown" forever.
+    """
+
+
 class SubprocessRunner:
     def run(
         self,
@@ -251,24 +259,47 @@ def wait(
     *,
     runner: DockerRunner | None = None,
     timeout: float | None = None,
+    observe_cap: float | None = None,
 ) -> int:
+    """Wait for a job container, re-arming the short chunk until the cap.
+
+    ``timeout`` (if given) is the *total* observation budget for this call,
+    preserving legacy small-budget callers. Otherwise the total comes from
+    ``observe_cap`` or ``RuntimePolicy.writer_max_observe_seconds`` so a real
+    nightly stage (graph FULL ≈ hours) is observed to completion in the same
+    night instead of deferring after the first 300 s chunk. The container is
+    never killed; total-cap exhaustion raises ``WriterStillAlive``.
+    """
     from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriterStillAlive
 
     docker_runner = runner if runner is not None else _get_default_runner()
-    budget = (
-        timeout
-        if timeout is not None
-        else DEFAULT_RUNTIME_POLICY.writer_observation_budget_seconds
-    )
-    try:
-        result = docker_runner.run(
-            ["docker", "wait", container_id], timeout=budget
-        )
-    except (TimeoutError, subprocess.TimeoutExpired) as exc:
-        raise WriterStillAlive(
-            f"observation budget exceeded waiting for {container_id}"
-        ) from exc
-    return int(result.stdout.strip())
+    if timeout is not None:
+        total = float(timeout)
+    elif observe_cap is not None:
+        total = float(observe_cap)
+    else:
+        total = DEFAULT_RUNTIME_POLICY.writer_max_observe_seconds
+    chunk = DEFAULT_RUNTIME_POLICY.writer_observation_budget_seconds
+    started = time.monotonic()
+    while True:
+        remaining = total - (time.monotonic() - started)
+        if remaining <= 0:
+            raise WriterStillAlive(
+                f"observation budget exceeded waiting for {container_id} "
+                f"({total:.0f}s)"
+            )
+        try:
+            result = docker_runner.run(
+                ["docker", "wait", container_id], timeout=min(chunk, remaining)
+            )
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
+            if time.monotonic() - started >= total:
+                raise WriterStillAlive(
+                    f"observation budget exceeded waiting for {container_id} "
+                    f"({total:.0f}s)"
+                ) from exc
+            continue
+        return int(result.stdout.strip())
 
 
 def list_exec_ids(container: str, *, runner: DockerRunner | None = None) -> list[str]:
@@ -314,6 +345,8 @@ def _exec_inspect(exec_id: str, runner: DockerRunner) -> dict:
         conn.request("GET", f"/v1.44/exec/{exec_id}/json")
         response = conn.getresponse()
         body = response.read().decode("utf-8")
+        if response.status == 404:
+            raise ExecRecordGone(f"exec record gone: {exec_id}")
         if response.status >= 400:
             raise RuntimeError(f"exec inspect HTTP {response.status}: {body}")
         return json.loads(body)
@@ -328,11 +361,17 @@ def wait_exec(
     runner: DockerRunner | None = None,
     poll_interval: float = 1.0,
     timeout: float | None = None,
+    observe_cap: float | None = None,
 ) -> int:
     """Wait for a detached `docker exec`. Does not `docker wait` the permanent container.
 
-    Observation budget matches ``dockerutil.wait`` (default 300s). Exhaustion
-    raises ``WriterStillAlive`` so the caller can defer without killing the writer.
+    ``timeout`` (if given) is the total observation budget (legacy callers);
+    otherwise the cap comes from ``observe_cap`` or
+    ``RuntimePolicy.writer_max_observe_seconds`` so long nightly BSL stages are
+    observed to completion in the same night. Cap exhaustion raises
+    ``WriterStillAlive`` so the caller can defer without killing the writer.
+    ``ExecRecordGone`` propagates: the daemon collected the record and the
+    result is unrecoverable.
     """
     from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriterStillAlive
 
@@ -340,11 +379,12 @@ def wait_exec(
     wait_fn = getattr(docker_runner, "wait_exec", None)
     if callable(wait_fn):
         return int(wait_fn(container, exec_id))
-    budget = (
-        timeout
-        if timeout is not None
-        else DEFAULT_RUNTIME_POLICY.writer_observation_budget_seconds
-    )
+    if timeout is not None:
+        budget = float(timeout)
+    elif observe_cap is not None:
+        budget = float(observe_cap)
+    else:
+        budget = DEFAULT_RUNTIME_POLICY.writer_max_observe_seconds
     deadline = time.monotonic() + budget
     while True:
         payload = _exec_inspect(exec_id, docker_runner)
@@ -353,7 +393,8 @@ def wait_exec(
             return int(payload.get("ExitCode") or 0)
         if time.monotonic() >= deadline:
             raise WriterStillAlive(
-                f"observation budget exceeded waiting for exec {exec_id} on {container}"
+                f"observation budget exceeded waiting for exec {exec_id} "
+                f"on {container} ({budget:.0f}s)"
             )
         time.sleep(poll_interval)
 

@@ -50,3 +50,21 @@ def test_example_yaml_loads_adapters():
     assert cfg.adapters is not None
     assert cfg.adapters.idle_probe
     assert cfg.schedule.duration_warn_seconds is None
+
+
+def test_runtime_observe_cap_parsed_and_validated(tmp_path: Path):
+    import yaml
+
+    example = Path(__file__).resolve().parents[2] / "contour.example.yaml"
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    raw["runtime"]["writer_max_observe_seconds"] = 600
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(path))
+    assert cfg.runtime is not None
+    assert cfg.runtime.writer_max_observe_seconds == 600.0
+
+    raw["runtime"]["writer_max_observe_seconds"] = "soon"
+    path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="writer_max_observe_seconds"):
+        load_config(str(path))

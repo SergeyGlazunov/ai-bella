@@ -368,6 +368,14 @@ def _sole_enabled_database_name(cfg) -> str | None:
     return next(iter(enabled))
 
 
+def _runtime_observe_cap(cfg) -> float | None:
+    """runtime.writer_max_observe_seconds when set (None → policy default)."""
+    runtime = getattr(cfg, "runtime", None)
+    if runtime is None:
+        return None
+    return getattr(runtime, "writer_max_observe_seconds", None)
+
+
 def _default_v2_database_runner(
     database: DatabaseConfig,
     *,
@@ -535,6 +543,7 @@ def _default_v2_database_runner(
         docker_runner=docker,
         may_write=may_write,
         logs_path=logs_path,
+        observe_cap=_runtime_observe_cap(cfg),
     )
     result = run_database_pipeline(
         database,
@@ -841,6 +850,26 @@ def _reap_unfinished_rows(
                 exit_code = int(dockerutil.wait_exec(cid, exec_id, runner=docker))
             except WriterStillAlive:
                 busy = True
+                continue
+            except dockerutil.ExecRecordGone:
+                # Daemon collected the finished exec record; the exit code is
+                # unrecoverable. Resolve as failed (never success) and let the
+                # next run resume/rebuild — do not stay "unknown" forever.
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed', finished_at = ?, exit_code = NULL
+                    WHERE id = ?
+                    """,
+                    (now, row["id"]),
+                )
+                set_meta(
+                    conn,
+                    "last_exec_record_gone",
+                    f"{now} job={row['id']} database={job_db} exec={exec_id}",
+                )
+                conn.commit()
                 continue
             except Exception as exc:
                 err = WriterStateUnknown(
@@ -1810,6 +1839,7 @@ def _reconcile_locked(
 
     started = time.monotonic()
     set_meta(conn, "duration_warned", "")
+    observe_cap = _runtime_observe_cap(cfg)
 
     try:
         head = git.ff_only(repo, cfg.repo.branch)
@@ -1823,7 +1853,7 @@ def _reconcile_locked(
                 )
             _maybe_duration_warn(cfg, conn, started, send)
             _mark_building(conn, "code_index")
-            index_bsl(cfg, conn, run_id, runner=docker)
+            index_bsl(cfg, conn, run_id, runner=docker, observe_cap=observe_cap)
             _maybe_duration_warn(cfg, conn, started, send)
 
         # Keep watcher paused through graph + verify (F03). Restore in _open_and_verify.
@@ -1863,6 +1893,7 @@ def _reconcile_locked(
                 remaining_budget=remaining,
                 measure=measure,
                 full_needed=full_needed,
+                observe_cap=observe_cap,
             )
             _maybe_duration_warn(cfg, conn, started, send)
 

@@ -14,6 +14,7 @@ import yaml
 from contour.alert import send as alert_send
 from contour.config import Config, load_config
 from contour.db import get_meta, init_db, set_meta
+from contour.dockerutil import ExecRecordGone
 from contour.lock import MemoryBackend, acquire
 from contour.reconcile import (
     RuntimePaths,
@@ -1017,6 +1018,40 @@ def test_reopen_refuses_mixed_indexes(tmp_path: Path):
     conn = init_db(db_path)
     try:
         assert get_meta(conn, "reads_closed") == "1"
+    finally:
+        conn.close()
+
+
+def test_reap_marks_job_failed_when_exec_record_gone(tmp_path: Path):
+    """A2/GC: vanished exec record resolves as failed, never 'unknown' forever."""
+    db_path = tmp_path / "state.db"
+    conn = init_db(str(db_path))
+    try:
+        conn.execute(
+            "INSERT INTO runs (target_commit, started_at) VALUES (?, ?)",
+            ("abc", "2026-09-20T00:00:00Z"),
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (run_id, stage, status, container_id, exec_id)
+            VALUES (1, 'bsl_index', 'running', 'bsl-indexer', 'exec-gone')
+            """
+        )
+        conn.commit()
+
+        class GoneDocker(FakeDocker):
+            def wait_exec(self, container: str, exec_id: str) -> int:
+                raise ExecRecordGone(f"exec record gone: {exec_id}")
+
+        assert reap_jobs(conn, GoneDocker()) == "idle"
+        row = conn.execute(
+            "SELECT status, exit_code FROM jobs WHERE id = 1"
+        ).fetchone()
+        assert row["status"] == "failed"
+        assert row["exit_code"] is None
+        note = get_meta(conn, "last_exec_record_gone")
+        assert "exec-gone" in note
+        assert "job=1" in note
     finally:
         conn.close()
 

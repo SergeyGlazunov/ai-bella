@@ -12,7 +12,14 @@ class RuntimePolicy:
     docker_command_timeout_seconds: float = 30.0
     docker_transient_retries: int = 2
     docker_transient_pause_seconds: float = 1.0
+    # Chunk for one `docker wait` / exec-inspect poll cycle. Expiry alone does
+    # not give up: observation re-arms until writer_max_observe_seconds.
     writer_observation_budget_seconds: float = 300.0
+    # Total time one writer stage is observed in the same night before
+    # deferring (WriterStillAlive). Must cover real stage durations (UBD graph
+    # FULL measured ~5.3 h). Running jobs are never killed. Overridable per
+    # stand via runtime.writer_max_observe_seconds.
+    writer_max_observe_seconds: float = 21600.0
 
 
 DEFAULT_RUNTIME_POLICY = RuntimePolicy()

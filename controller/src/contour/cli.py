@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -164,6 +165,9 @@ def _print_status(cfg, paths: RuntimePaths, *, database: str | None = None) -> i
                 f"last_run: target={last['target_commit']} "
                 f"result={last['result']} message={last['message']}"
             )
+        reap_note = get_meta(conn, "last_exec_record_gone")
+        if reap_note:
+            print(f"last_exec_record_gone: {reap_note}")
         jobs = conn.execute(
             """
             SELECT id, stage, status, container_id, exec_id, started_at, finished_at
@@ -422,6 +426,20 @@ def main(argv: list[str] | None = None) -> int:
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--dry-run", action="store_true")
 
+    jobs_parser = sub.add_parser(
+        "jobs",
+        help="operator job maintenance",
+    )
+    jobs_sub = jobs_parser.add_subparsers(dest="jobs_command", required=True)
+    jobs_fail = jobs_sub.add_parser(
+        "fail",
+        help=(
+            "mark an unfinished job failed after confirming its writer is gone; "
+            "the next run resumes or rebuilds the layer"
+        ),
+    )
+    jobs_fail.add_argument("job_id", type=int)
+
     args = parser.parse_args(rest)
     args.config = global_args.config
     args.db = global_args.db
@@ -542,5 +560,48 @@ def main(argv: list[str] | None = None) -> int:
         for cid in ids:
             print(cid)
         return 0
+
+    if args.command == "jobs" and getattr(args, "jobs_command", None) == "fail":
+        held = acquire(paths.lock_path)
+        if held is None:
+            print(
+                "jobs fail: another contour process holds the lock",
+                file=sys.stderr,
+            )
+            return 1
+        conn = init_db(paths.db_path)
+        try:
+            with held:
+                row = conn.execute(
+                    "SELECT id, status FROM jobs WHERE id = ?",
+                    (args.job_id,),
+                ).fetchone()
+                if row is None:
+                    print(f"jobs fail: no job {args.job_id}", file=sys.stderr)
+                    return 1
+                if str(row["status"]) in {"ok", "failed", "removed"}:
+                    print(
+                        f"jobs fail: job {args.job_id} already finished "
+                        f"({row['status']})",
+                        file=sys.stderr,
+                    )
+                    return 1
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed', finished_at = ?, exit_code = NULL
+                    WHERE id = ?
+                    """,
+                    (now, args.job_id),
+                )
+                conn.commit()
+                print(
+                    f"jobs fail ok: job {args.job_id} marked failed; "
+                    "next run resumes or rebuilds the layer"
+                )
+                return 0
+        finally:
+            conn.close()
 
     return 2

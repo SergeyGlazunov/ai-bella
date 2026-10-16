@@ -156,6 +156,10 @@ class RuntimeConfig:
     lock_path: str
     logs_path: str
     backups_path: str
+    # Total observation budget for one writer stage (seconds). Long stages
+    # (UBD graph FULL ~5.3 h) must be observed to completion in the same
+    # night; running jobs are never killed. None → RuntimePolicy default (6 h).
+    writer_max_observe_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -335,12 +339,24 @@ def _parse_adapters(adapters_raw: dict[str, Any], label: str = "adapters") -> Ad
 
 
 def _parse_runtime(runtime_raw: dict[str, Any]) -> RuntimeConfig:
+    observe = runtime_raw.get("writer_max_observe_seconds")
+    if observe is not None and (
+        isinstance(observe, bool)
+        or not isinstance(observe, (int, float))
+        or observe <= 0
+    ):
+        raise ValueError(
+            "runtime.writer_max_observe_seconds must be a positive number or null"
+        )
     return RuntimeConfig(
         root=str(runtime_raw["root"]),
         db_path=str(runtime_raw["db_path"]),
         lock_path=str(runtime_raw["lock_path"]),
         logs_path=str(runtime_raw["logs_path"]),
         backups_path=str(runtime_raw["backups_path"]),
+        writer_max_observe_seconds=(
+            float(observe) if observe is not None else None
+        ),
     )
 
 

@@ -67,6 +67,7 @@ class ProfilesLayerRunner:
     docker_runner: object | None = None
     may_write: Callable[[], str] | None = None
     logs_path: str | None = None
+    observe_cap: float | None = None
 
     def run(
         self,
@@ -89,6 +90,7 @@ class ProfilesLayerRunner:
             may_write=may_write or self.may_write,
             full_needed=full_needed,
             logs_path=self.logs_path,
+            observe_cap=self.observe_cap,
             on_layer_start=on_layer_start,
             on_layer_result=on_layer_result,
             on_layer_error=on_layer_error,

@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from contour.cli import main
-from contour.db import init_db
+from contour.db import init_db, set_meta
 from contour.lock import Lock, MemoryBackend
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "contour.example.yaml"
@@ -492,3 +492,60 @@ def test_update_still_rejects_disabled_database(tmp_path: Path, monkeypatch):
         _argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--database", "kb")
     )
     assert rc != 0
+
+
+def test_jobs_fail_marks_unfinished_failed(tmp_path: Path, monkeypatch):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    lock = tmp_path / "sync.lock"
+    conn = init_db(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO runs (target_commit, started_at) VALUES (?, ?)",
+            ("abc", "2026-09-20T00:00:00Z"),
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (run_id, stage, status, container_id)
+            VALUES (1, 'graph', 'running', 'cid-stuck')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fake_acquire(path, backend=None):
+        return Lock(path, MemoryBackend())
+
+    monkeypatch.setattr("contour.cli.acquire", fake_acquire)
+
+    rc = main(_argv(cfg, db, lock, "jobs", "fail", "1"))
+    assert rc == 0
+    conn = init_db(str(db))
+    try:
+        row = conn.execute(
+            "SELECT status, exit_code, finished_at FROM jobs WHERE id = 1"
+        ).fetchone()
+        assert row["status"] == "failed"
+        assert row["exit_code"] is None
+        assert row["finished_at"] is not None
+    finally:
+        conn.close()
+
+    # Already finished → refuse; unknown id → refuse.
+    assert main(_argv(cfg, db, lock, "jobs", "fail", "1")) != 0
+    assert main(_argv(cfg, db, lock, "jobs", "fail", "99")) != 0
+
+
+def test_status_shows_exec_record_gone_note(tmp_path: Path, capsys):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    conn = init_db(str(db))
+    try:
+        set_meta(conn, "last_exec_record_gone", "2026-10-16 job=1 exec=e1")
+    finally:
+        conn.close()
+    rc = main(_argv(cfg, db, tmp_path / "lock", "status"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "last_exec_record_gone: 2026-10-16 job=1 exec=e1" in out

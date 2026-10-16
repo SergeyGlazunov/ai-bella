@@ -136,6 +136,72 @@ def test_wait_returns_exit_code():
     assert runner.calls[-1] == ["docker", "wait", "abc123"]
 
 
+def test_wait_re_arms_chunk_until_container_exits():
+    """A1: chunk expiry re-arms until the container finishes (same-night)."""
+
+    class SlowThenExit:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, cmd: list[str], *, timeout: float | None = None):
+            assert cmd[:2] == ["docker", "wait"]
+            self.calls += 1
+            if self.calls < 3:
+                raise subprocess.TimeoutExpired(cmd, timeout or 0)
+            return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+
+    runner = SlowThenExit()
+    assert dockerutil.wait("abc", runner=runner) == 0
+    assert runner.calls == 3
+
+
+def test_wait_total_timeout_raises_writer_still_alive():
+    from contour.runtime_policy import WriterStillAlive
+
+    class HangingWait:
+        def run(self, cmd: list[str], *, timeout: float | None = None):
+            raise subprocess.TimeoutExpired(cmd, timeout or 0)
+
+    with pytest.raises(WriterStillAlive):
+        dockerutil.wait("abc", runner=HangingWait(), timeout=0.05)
+
+
+def test_wait_exec_uses_inspect_until_done():
+    class PollRunner:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def inspect_exec(self, exec_id: str) -> dict:
+            self.polls += 1
+            return {"Running": self.polls < 2, "ExitCode": 7}
+
+    assert (
+        dockerutil.wait_exec("c", "e1", runner=PollRunner(), poll_interval=0) == 7
+    )
+
+
+def test_wait_exec_total_timeout_raises_writer_still_alive():
+    from contour.runtime_policy import WriterStillAlive
+
+    class AlwaysRunning:
+        def inspect_exec(self, exec_id: str) -> dict:
+            return {"Running": True, "ExitCode": None}
+
+    with pytest.raises(WriterStillAlive):
+        dockerutil.wait_exec(
+            "c", "e1", runner=AlwaysRunning(), poll_interval=0, timeout=0.05
+        )
+
+
+def test_wait_exec_propagates_exec_record_gone():
+    class GoneRunner:
+        def inspect_exec(self, exec_id: str) -> dict:
+            raise dockerutil.ExecRecordGone(f"exec record gone: {exec_id}")
+
+    with pytest.raises(dockerutil.ExecRecordGone):
+        dockerutil.wait_exec("c", "e1", runner=GoneRunner(), poll_interval=0)
+
+
 def test_ping_raises_on_hung_api():
     runner = FakeDockerRunner(ping_timeout=True)
     with pytest.raises(subprocess.TimeoutExpired):
