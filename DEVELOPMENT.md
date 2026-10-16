@@ -39,6 +39,22 @@
 
 ---
 
+### 2026-10-16 — Ревью-правки раздела 1 (ночь / восстановление / диск / алерт)
+
+**Задача.** Внедрить раздел 1 внешнего ревью v2 (`CODE-REVIEW-AI-contour-2026-10-16-v2.md`, вне репо): 1.1 наблюдение длинных этапов + исчезнувший exec; 1.2 retention/free-space; 1.3 cleanup protected; 1.4 видимость сбоя алерта; 1.5 duration_warn в v2 / убрать `measure_max_seconds`; 1.6 текст ошибок конфига. Ветка `refactor/nightly-hardening`, PR в main.
+
+**Причина.** Бюджет наблюдения 300 с меньше реальных этапов (graph FULL ~5.3 ч) → deferred с закрытым чтением до следующей ночи; exec-GC демона делал отложенный добор вечным «unknown writer»; `.prev-*`/`accepted`/`runs` росли без уборки при отсутствии проверки места; cleanup мог `docker rm` остановленный сервисный контейнер профиля (v2 exec-job'ы пишут его имя в `container_id`); сбой доставки алерта был неотличим от тихой ночи; ручки длительности не работали в v2.
+
+**Решение.** `dockerutil.wait/wait_exec`: полный бюджет наблюдения (`runtime.writer_max_observe_seconds`, дефолт 6 ч из `RuntimePolicy`) с перезарядкой 300-с чанков — этап наблюдается до конца в ту же ночь, задания не убиваются; явный `timeout` сохраняет старую семантику для тестов. `ExecRecordGone` (exec inspect 404) в reap → job failed + meta `last_exec_record_gone` (виден в `status`), выход — штатный resume/rebuild; операторская команда `contour jobs fail <id>`. Новый `contour/maintenance.py`: preflight `disk_usage` (`runtime.min_free_gb`, дефолт 5 GiB) до закрытия чтения/клона; post-publish retention (не портит published-результат): accepted пакеты → keep `runtime.retain_packages` (дефолт 3, пакет published-ревизии не удаляется), `.prev-*` → новейший 1 (rollback-хэндл), завершённые runs/jobs старше `runtime.retain_runs_days` (дефолт 90; незавершённые не трогаются). `protected_container_names(cfg)` — защищённые имена из конфига (bsl/graph/neo4j всех профилей + чат), cleanup inspect получил таймаут. Алерт: сбой доставки в stderr (journal) + meta `alert_delivery_last_error` в `status`. `duration_warn_seconds` работает в v2 (ключ `duration_warned:<db>`, один алерт на прогон); `schedule.measure_max_seconds` удалён (старые конфиги грузятся, ключ игнорируется). Ошибки `load_config` печатают причину.
+
+**Проверено.** `python -m pytest` в `controller/` — **324 passed, 8 skipped** (было 303). Добавлено: бюджеты wait/wait_exec (re-arm + total + WriterStillAlive), ExecRecordGone в reap, `contour jobs fail`, maintenance (accepted/prev/history/free-space), cleanup protected из конфига, алерт stderr+meta, scoped duration warn, конфиг-ручки, текст ошибок конфига.
+
+**Стенд.** Не тронут; kit-only, живой Scheduler не менялся. Раздел 2 ревью (dry-run: ExecIDs/exec-API на реальном демоне, фактические длительности, темп роста диска) остаётся входными данными для настройки `writer_max_observe_seconds`/`min_free_gb` перед Task 12.
+
+**Откат.** `git revert` серии (4 коммита независимы по файлам, кроме соседних reconcile/cli); все новые ручки конфига опциональны — откат конфига не требуется.
+
+---
+
 ### 2026-10-15 — Task 9: Windows package exporters (kit only)
 
 **Задача.** KB / `klon_opl` на Windows только выгружают 1С и публикуют immutable package (`ready-*` + `READY` last); без Docker/index.
