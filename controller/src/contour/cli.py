@@ -19,6 +19,7 @@ from contour.db import get_component, get_meta, init_db
 from contour.dockerutil import SubprocessRunner
 from contour.gitutil import safe_remote
 from contour.lock import acquire
+from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
 from contour.reconcile import (
     DEFAULT_DB,
     DEFAULT_LOCK,
@@ -367,6 +368,54 @@ def _bsl_watch_reload(cfg) -> None:
     reload_bsl_daemon(cfg)
 
 
+def _writer_gone(row, docker) -> str | None:
+    """Reason the job must stay unfinished, or None when the writer is gone.
+
+    The orchestrator lock proves no *orchestrator* is writing; it says nothing
+    about a detached Docker writer left behind by a crash or a deferred
+    observation. Check the recorded writer before releasing job accounting.
+    """
+    from contour import dockerutil
+    from contour.dockerutil import ExecRecordGone
+
+    exec_id = str(row["exec_id"] or "")
+    container_id = str(row["container_id"] or "")
+    if exec_id:
+        try:
+            payload = dockerutil.exec_state(exec_id, runner=docker)
+        except ExecRecordGone:
+            # Record collected long after exit; the writer is finished.
+            return None
+        except Exception as exc:
+            return f"writer state unknown: {exc}"
+        running = payload.get("Running")
+        if running is True or running in (1, "true", "True"):
+            return f"exec {exec_id} is still running"
+        return None
+    if container_id:
+        try:
+            result = docker.run(
+                [
+                    "docker",
+                    "inspect",
+                    "-f",
+                    "{{.State.Status}}",
+                    container_id,
+                ],
+                timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+            )
+        except Exception as exc:
+            return f"writer state unknown: {exc}"
+        status = (getattr(result, "stdout", "") or "").strip()
+        if status in ("running", "paused", "restarting"):
+            return f"container {container_id} is {status}"
+        if status in ("exited", "dead", "created", "removing"):
+            return None
+        return f"container {container_id} state {status!r} unrecognized; refusing"
+    # No recorded writer identity — nothing that can still be writing.
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(argv) if argv is not None else None
     # R01: pull --config/--db/--lock from anywhere so both
@@ -438,11 +487,24 @@ def main(argv: list[str] | None = None) -> int:
     jobs_fail = jobs_sub.add_parser(
         "fail",
         help=(
-            "mark an unfinished job failed after confirming its writer is gone; "
-            "the next run resumes or rebuilds the layer"
+            "mark an unfinished job failed; refuses while its writer is "
+            "running or its state is unknown"
         ),
     )
     jobs_fail.add_argument("job_id", type=int)
+    jobs_fail.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "override the writer check for a job you have verified yourself "
+            "(e.g. the Docker record is gone); requires --reason"
+        ),
+    )
+    jobs_fail.add_argument(
+        "--reason",
+        default="",
+        help="why the writer check is being overridden (recorded in state)",
+    )
 
     args = parser.parse_args(rest)
     args.config = global_args.config
@@ -584,7 +646,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with held:
                 row = conn.execute(
-                    "SELECT id, status FROM jobs WHERE id = ?",
+                    """
+                    SELECT id, status, container_id, exec_id FROM jobs
+                    WHERE id = ?
+                    """,
                     (args.job_id,),
                 ).fetchone()
                 if row is None:
@@ -597,6 +662,25 @@ def main(argv: list[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                     return 1
+                reason = str(getattr(args, "reason", "") or "").strip()
+                if getattr(args, "force", False):
+                    if not reason:
+                        print(
+                            "jobs fail: --force requires --reason "
+                            "(who verified the writer and how)",
+                            file=sys.stderr,
+                        )
+                        return 1
+                else:
+                    block = _writer_gone(row, _docker())
+                    if block is not None:
+                        print(
+                            f"jobs fail: refusing, {block}; verify the writer "
+                            "yourself and rerun with --force --reason, or fix "
+                            "Docker first",
+                            file=sys.stderr,
+                        )
+                        return 1
                 now = datetime.now(timezone.utc).isoformat()
                 conn.execute(
                     """
@@ -606,9 +690,18 @@ def main(argv: list[str] | None = None) -> int:
                     """,
                     (now, args.job_id),
                 )
+                if getattr(args, "force", False):
+                    from contour.db import set_meta
+
+                    set_meta(
+                        conn,
+                        f"jobs_fail_override:{args.job_id}",
+                        f"{now} reason={reason}",
+                    )
                 conn.commit()
+                forced = " (forced)" if getattr(args, "force", False) else ""
                 print(
-                    f"jobs fail ok: job {args.job_id} marked failed; "
+                    f"jobs fail ok{forced}: job {args.job_id} marked failed; "
                     "next run resumes or rebuilds the layer"
                 )
                 return 0

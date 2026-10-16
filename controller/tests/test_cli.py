@@ -494,10 +494,8 @@ def test_update_still_rejects_disabled_database(tmp_path: Path, monkeypatch):
     assert rc != 0
 
 
-def test_jobs_fail_marks_unfinished_failed(tmp_path: Path, monkeypatch):
-    cfg = _write_cfg(tmp_path)
-    db = tmp_path / "state.db"
-    lock = tmp_path / "sync.lock"
+def _seed_running_job(db: Path, *, job_id: int = 1, container_id: str = "cid-stuck",
+                       exec_id: str = "") -> None:
     conn = init_db(str(db))
     try:
         conn.execute(
@@ -506,18 +504,49 @@ def test_jobs_fail_marks_unfinished_failed(tmp_path: Path, monkeypatch):
         )
         conn.execute(
             """
-            INSERT INTO jobs (run_id, stage, status, container_id)
-            VALUES (1, 'graph', 'running', 'cid-stuck')
-            """
+            INSERT INTO jobs (run_id, stage, status, container_id, exec_id)
+            VALUES (1, 'graph', 'running', ?, ?)
+            """,
+            (container_id, exec_id),
         )
         conn.commit()
     finally:
         conn.close()
 
-    def fake_acquire(path, backend=None):
-        return Lock(path, MemoryBackend())
 
-    monkeypatch.setattr("contour.cli.acquire", fake_acquire)
+class _InspectDocker:
+    """docker inspect fake returning a fixed container status."""
+
+    def __init__(self, status: str) -> None:
+        self.status = status
+
+    def run(self, cmd: list[str], *, timeout: float | None = None):
+        assert cmd[:2] == ["docker", "inspect"]
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{self.status}\n", stderr="")
+
+
+class _ExecDocker:
+    """Runner exposing inspect_exec for the exec path."""
+
+    def __init__(self, payload: dict | Exception) -> None:
+        self.payload = payload
+
+    def inspect_exec(self, exec_id: str) -> dict:
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        return self.payload
+
+
+def test_jobs_fail_marks_unfinished_failed_when_writer_exited(
+    tmp_path: Path, monkeypatch
+):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    lock = tmp_path / "sync.lock"
+    _seed_running_job(db)
+
+    monkeypatch.setattr("contour.cli.acquire", _memory_lock)
+    monkeypatch.setattr("contour.cli._docker", lambda: _InspectDocker("exited"))
 
     rc = main(_argv(cfg, db, lock, "jobs", "fail", "1"))
     assert rc == 0
@@ -535,6 +564,105 @@ def test_jobs_fail_marks_unfinished_failed(tmp_path: Path, monkeypatch):
     # Already finished → refuse; unknown id → refuse.
     assert main(_argv(cfg, db, lock, "jobs", "fail", "1")) != 0
     assert main(_argv(cfg, db, lock, "jobs", "fail", "99")) != 0
+
+
+def test_jobs_fail_refuses_live_container_writer(tmp_path: Path, monkeypatch):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_running_job(db, container_id="live-writer")
+    monkeypatch.setattr("contour.cli.acquire", _memory_lock)
+    monkeypatch.setattr("contour.cli._docker", lambda: _InspectDocker("running"))
+
+    rc = main(_argv(cfg, db, tmp_path / "lock", "jobs", "fail", "1"))
+    assert rc != 0
+    conn = init_db(str(db))
+    try:
+        assert conn.execute("SELECT status FROM jobs WHERE id=1").fetchone()[
+            "status"
+        ] == "running"
+    finally:
+        conn.close()
+
+
+def test_jobs_fail_refuses_unknown_writer_state(tmp_path: Path, monkeypatch):
+    class BrokenDocker:
+        def run(self, cmd: list[str], *, timeout: float | None = None):
+            raise OSError("docker unreachable")
+
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_running_job(db)
+    monkeypatch.setattr("contour.cli.acquire", _memory_lock)
+    monkeypatch.setattr("contour.cli._docker", lambda: BrokenDocker())
+
+    assert main(_argv(cfg, db, tmp_path / "lock", "jobs", "fail", "1")) != 0
+
+
+def test_jobs_fail_refuses_running_exec_and_allows_gone_exec(
+    tmp_path: Path, monkeypatch
+):
+    from contour.dockerutil import ExecRecordGone
+
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    lock = tmp_path / "sync.lock"
+
+    _seed_running_job(db, container_id="bsl-indexer", exec_id="exec-1")
+    monkeypatch.setattr("contour.cli.acquire", _memory_lock)
+    monkeypatch.setattr(
+        "contour.cli._docker", lambda: _ExecDocker({"Running": True, "ExitCode": None})
+    )
+    assert main(_argv(cfg, db, lock, "jobs", "fail", "1")) != 0
+
+    monkeypatch.setattr(
+        "contour.cli._docker", lambda: _ExecDocker(ExecRecordGone("gone"))
+    )
+    assert main(_argv(cfg, db, lock, "jobs", "fail", "1")) == 0
+    conn = init_db(str(db))
+    try:
+        assert conn.execute("SELECT status FROM jobs WHERE id=1").fetchone()[
+            "status"
+        ] == "failed"
+    finally:
+        conn.close()
+
+
+def test_jobs_fail_force_requires_reason_and_records_it(
+    tmp_path: Path, monkeypatch
+):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    lock = tmp_path / "sync.lock"
+    _seed_running_job(db, container_id="live-writer")
+    monkeypatch.setattr("contour.cli.acquire", _memory_lock)
+    monkeypatch.setattr("contour.cli._docker", lambda: _InspectDocker("running"))
+
+    # --force without --reason is refused.
+    assert main(_argv(cfg, db, lock, "jobs", "fail", "1", "--force")) != 0
+    # Explicit override with a recorded reason succeeds despite the live check.
+    rc = main(
+        _argv(
+            cfg, db, lock, "jobs", "fail", "1", "--force",
+            "--reason", "writer verified gone manually by operator",
+        )
+    )
+    assert rc == 0
+    conn = init_db(str(db))
+    try:
+        assert conn.execute("SELECT status FROM jobs WHERE id=1").fetchone()[
+            "status"
+        ] == "failed"
+        note = conn.execute(
+            "SELECT value FROM meta WHERE key = 'jobs_fail_override:1'"
+        ).fetchone()
+        assert note is not None
+        assert "verified gone manually" in note["value"]
+    finally:
+        conn.close()
+
+
+def _memory_lock(path, backend=None):
+    return Lock(path, MemoryBackend())
 
 
 def test_status_shows_exec_record_gone_note(tmp_path: Path, capsys):
