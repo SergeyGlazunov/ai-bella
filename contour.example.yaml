@@ -31,7 +31,6 @@ schedule:
   duration_warn_seconds: null
   # deprecated alias; prefer duration_warn_seconds
   build_deadline_seconds: null
-  measure_max_seconds: 43200   # optional --measure log cap; does not kill jobs
 
 alert:
   # Replace with a real on-call channel. The kit example refuses until replaced

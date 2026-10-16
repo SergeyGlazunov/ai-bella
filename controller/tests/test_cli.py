@@ -549,3 +549,26 @@ def test_status_shows_exec_record_gone_note(tmp_path: Path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "last_exec_record_gone: 2026-10-16 job=1 exec=e1" in out
+
+
+def test_status_shows_alert_delivery_error(tmp_path: Path, capsys):
+    cfg = _write_cfg(tmp_path)
+    db = tmp_path / "state.db"
+    conn = init_db(str(db))
+    try:
+        set_meta(conn, "alert_delivery_last_error", "2026-10-16 alert exit 1")
+    finally:
+        conn.close()
+    rc = main(_argv(cfg, db, tmp_path / "lock", "status"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alert_delivery_last_error: 2026-10-16 alert exit 1" in out
+
+
+def test_config_load_error_prints_reason(tmp_path: Path, capsys):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("schedule: [not, a, mapping]\n", encoding="utf-8")
+    rc = main(["--config", str(bad), "status"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "config error" in captured.err

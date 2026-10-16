@@ -98,7 +98,6 @@ class ScheduleConfig:
     timezone: str
     build_deadline_seconds: int | None
     duration_warn_seconds: int | None = None
-    measure_max_seconds: int = 43200
 
 
 @dataclass(frozen=True)
@@ -258,9 +257,6 @@ def _parse_schedule(schedule_raw: dict[str, Any]) -> ScheduleConfig:
     deadline = _optional_int(schedule_raw, "build_deadline_seconds")
     if warn is None:
         warn = deadline
-    measure_max = schedule_raw.get("measure_max_seconds", 43200)
-    if isinstance(measure_max, bool) or not isinstance(measure_max, int):
-        raise ValueError("schedule.measure_max_seconds must be int")
     window_start = str(schedule_raw["window_start"])
     window_end = str(schedule_raw["window_end"])
     timezone = str(schedule_raw["timezone"])
@@ -274,7 +270,6 @@ def _parse_schedule(schedule_raw: dict[str, Any]) -> ScheduleConfig:
         timezone=timezone,
         build_deadline_seconds=deadline,
         duration_warn_seconds=warn,
-        measure_max_seconds=measure_max,
     )
 
 

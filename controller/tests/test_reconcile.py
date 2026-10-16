@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -636,6 +637,56 @@ def test_alert_send_missing_binary_does_not_raise(tmp_path: Path):
     cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
     cfg = load_config(str(cfg_path))
     alert_send(cfg, "must-not-raise")
+
+
+def test_alert_delivery_failure_visible_in_stderr_and_meta(tmp_path: Path, capsys):
+    """Review 1.4: a broken alert channel must not be silent."""
+    from contour.alert import _note_delivery
+    from contour.reconcile import _persist_alert_delivery_note
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["alert"]["command"] = [str(tmp_path / "no-such-contour-alert-bin")]
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+
+    alert_send(cfg, "nightly summary")
+    captured = capsys.readouterr()
+    assert "alert delivery failed" in captured.err
+
+    db_path = str(tmp_path / "state.db")
+    conn = init_db(db_path)
+    try:
+        _note_delivery(cfg, "alert.command exit 3")
+        _persist_alert_delivery_note(cfg, conn)
+        note = get_meta(conn, "alert_delivery_last_error")
+        assert "alert.command exit 3" in note
+    finally:
+        conn.close()
+
+
+def test_duration_warn_uses_scoped_key_per_database(tmp_path: Path):
+    """Review 1.5: v2 duration warn is scoped per database and warns once."""
+    from contour.reconcile import _maybe_duration_warn
+
+    cfg = _make_config(tmp_path, duration_warn_seconds=0)
+    db_path = str(tmp_path / "state.db")
+    conn = init_db(db_path)
+    alerts: list[str] = []
+    try:
+        _maybe_duration_warn(
+            cfg, conn, time.monotonic() - 5, lambda _c, m: alerts.append(m),
+            warn_key="duration_warned:kb", database="kb",
+        )
+        _maybe_duration_warn(
+            cfg, conn, time.monotonic() - 5, lambda _c, m: alerts.append(m),
+            warn_key="duration_warned:kb", database="kb",
+        )
+        assert len(alerts) == 1
+        assert alerts[0].startswith("kb: duration_warn_seconds exceeded")
+        assert get_meta(conn, "duration_warned:kb") == "1"
+    finally:
+        conn.close()
 
 
 def test_reap_persists_exit_code(tmp_path: Path):

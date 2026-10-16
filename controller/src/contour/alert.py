@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -52,6 +53,9 @@ def send(cfg, message: str) -> None:
 
 
 def _note_delivery(cfg, text: str) -> None:
+    # stderr lands in the systemd journal so a broken alert channel is not
+    # indistinguishable from a quiet night (review 1.4).
+    print(f"[contour] {text}", file=sys.stderr)
     notes = getattr(cfg, "_alert_delivery_errors", None)
     if notes is None:
         try:

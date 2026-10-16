@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -153,8 +154,8 @@ def format_nightly_alert(
 def _safe_send(send, cfg, message: str) -> None:
     try:
         send(cfg, message)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[contour] alert send failed: {exc}", file=sys.stderr)
 
 
 def select_databases(
@@ -597,6 +598,10 @@ def _default_v2_database_runner(
         logs_path=logs_path,
         observe_cap=_runtime_observe_cap(cfg),
     )
+    # Review 1.5: duration_warn_seconds works in v2 too (scoped meta key).
+    warn_key = f"duration_warned:{database.name}"
+    set_meta(conn, warn_key, "")
+    started = time.monotonic()
     result = run_database_pipeline(
         database,
         provider,
@@ -606,6 +611,9 @@ def _default_v2_database_runner(
         probes,
         conn=conn,
         may_write=may_write,
+    )
+    _maybe_duration_warn(
+        cfg, conn, started, send, warn_key=warn_key, database=database.name
     )
     status = _normalize_db_result(result.result)
     if status == "success":
@@ -1374,6 +1382,18 @@ def _alert_if_reads_closed(cfg, conn: sqlite3.Connection, send) -> None:
         send(cfg, CLOSED_READS_ALERT)
 
 
+def _persist_alert_delivery_note(cfg, conn: sqlite3.Connection) -> None:
+    """Persist alert delivery failures so `contour status` can show them."""
+    notes = getattr(cfg, "_alert_delivery_errors", None)
+    if not notes:
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        set_meta(conn, "alert_delivery_last_error", f"{now} " + "; ".join(notes[-3:]))
+    except Exception as exc:
+        print(f"[contour] could not persist alert delivery note: {exc}", file=sys.stderr)
+
+
 def _finish(
     cfg,
     conn: sqlite3.Connection,
@@ -1384,6 +1404,7 @@ def _finish(
     send,
 ) -> str:
     _alert_if_reads_closed(cfg, conn, send)
+    _persist_alert_delivery_note(cfg, conn)
     _finish_run(conn, run_id, target, result, message)
     return result
 
@@ -1799,22 +1820,33 @@ def _reconcile_v2_locked(
     aggregate = aggregate_database_results(outcomes)
     if aggregate != "success":
         _safe_send(send, cfg, format_nightly_alert(conn, outcomes))
+    _persist_alert_delivery_note(cfg, conn)
     return aggregate
 
 
-def _maybe_duration_warn(cfg, conn: sqlite3.Connection, started: float, send) -> None:
+def _maybe_duration_warn(
+    cfg,
+    conn: sqlite3.Connection,
+    started: float,
+    send,
+    *,
+    warn_key: str = "duration_warned",
+    database: str | None = None,
+) -> None:
     warn = duration_warn_seconds(cfg)
     if warn is None:
         return
     if (time.monotonic() - started) < warn:
         return
-    if get_meta(conn, "duration_warned") == "1":
+    if get_meta(conn, warn_key) == "1":
         return
+    name = f"{database}: " if database else ""
     send(
         cfg,
-        f"duration_warn_seconds exceeded ({warn}s); indexer continues, not killed",
+        f"{name}duration_warn_seconds exceeded ({warn}s); "
+        "indexer continues, not killed",
     )
-    set_meta(conn, "duration_warned", "1")
+    set_meta(conn, warn_key, "1")
 
 
 def _reconcile_locked(

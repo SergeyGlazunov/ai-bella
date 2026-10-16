@@ -169,6 +169,9 @@ def _print_status(cfg, paths: RuntimePaths, *, database: str | None = None) -> i
         reap_note = get_meta(conn, "last_exec_record_gone")
         if reap_note:
             print(f"last_exec_record_gone: {reap_note}")
+        delivery_note = get_meta(conn, "alert_delivery_last_error")
+        if delivery_note:
+            print(f"alert_delivery_last_error: {delivery_note}")
         jobs = conn.execute(
             """
             SELECT id, stage, status, container_id, exec_id, started_at, finished_at
@@ -449,13 +452,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate":
         try:
             cfg = load_config(args.config)
-        except Exception:
+        except Exception as exc:
+            print(f"config error: {args.config}: {exc}", file=sys.stderr)
             return 1
         return _validate(cfg)
 
     try:
         cfg = load_config(args.config)
-    except Exception:
+    except Exception as exc:
+        print(f"config error: {args.config}: {exc}", file=sys.stderr)
         return 1
 
     paths = resolve_runtime_paths(

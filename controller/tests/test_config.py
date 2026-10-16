@@ -68,3 +68,16 @@ def test_runtime_observe_cap_parsed_and_validated(tmp_path: Path):
     path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match="writer_max_observe_seconds"):
         load_config(str(path))
+
+
+def test_measure_max_seconds_knob_removed(tmp_path: Path):
+    """Review 1.5: the unused knob is gone; old configs still load (ignored)."""
+    import yaml
+
+    example = Path(__file__).resolve().parents[2] / "contour.example.yaml"
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    raw["schedule"]["measure_max_seconds"] = 43200
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(path))
+    assert not hasattr(cfg.schedule, "measure_max_seconds")
