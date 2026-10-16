@@ -39,6 +39,22 @@
 
 ---
 
+### 2026-10-16 — Правки по ревью ветки nightly-hardening (P1/P2/P3)
+
+**Задача.** Закрыть три замечания ревью `refactor/nightly-hardening@4789d87`: P1 `jobs fail` снимал учёт writer без проверки его завершения; P2 `prune_run_history` удалял данные незавершённого восстановления; P3 duration-warn приходил только после завершения pipeline.
+
+**Причина.** Lock оркестратора не доказывает, что отделённый Docker writer завершился — перевод job в failed открывал второго писателя. Очистка истории смотрела на возраст/статус отдельных jobs, а не на завершённость прогона и состояние базы: у старого незавершённого прогона удалялся успешный `bsl_index` (evidence для attempt-resume). Порог длительности проверялся только после `run_database_pipeline` — при этапе 5 ч уведомление приходило после его конца.
+
+**Решение.** P1: `jobs fail` перед пометкой проверяет писателя (`_writer_gone`: exec inspect → `Running`/`ExecRecordGone`; docker inspect → running/paused/restarting отказ, exited/dead/created/removing — можно); аварийный обход — отдельным явным `--force --reason <текст>` с записью в meta `jobs_fail_override:<id>`. P2: `prune_run_history` удаляет только законченные (`finished_at`) прогоны здоровых баз (нет незавершённых прогонов, staged_revision, lifecycle needs_recovery/failed/recovering, слоёв building/failed/unknown — та же форма, что `required_recovery`); jobs удаляются только вместе со своим прогоном; retention считается от `finished_at`. P3: `wait`/`wait_exec` принимают `on_observe`-callback (вызов на каждом чанке/полле, ошибки callback не рвут ожидание); проводка как у `observe_cap` до BSL/Graph; v2-раннер строит callback из `_maybe_duration_warn` — предупреждение уходит, пока writer ещё работает; финальная проверка после pipeline сохранена как страховка (идемпотентна по флагу).
+
+**Проверено.** `python -m pytest` в `controller/` — **334 passed, 8 skipped** (было 324/8 на этой машине). Добавлено/переписано: отказ `jobs fail` при живом/неизвестном писателе (контейнер и exec), `ExecRecordGone` → разрешение, `--force` без reason отказан, override записан; защита незавершённых прогонов и recovery-баз в retention (сценарии ревью воспроизведены), сохранение published-пакета на реальных пакетах; `on_observe` срабатывает до завершения writer, ошибка callback не рвёт wait.
+
+**Стенд.** Не тронут.
+
+**Откат.** `git revert` трёх коммитов; поведения CLI `jobs fail` без `--force` стало строже — при откате учесть, что сценарий «писатель точно мёртв, но Docker недоступен» снова потребует ручного UPDATE.
+
+---
+
 ### 2026-10-16 — Ревью-правки раздела 1 (ночь / восстановление / диск / алерт)
 
 **Задача.** Внедрить раздел 1 внешнего ревью v2 (`CODE-REVIEW-AI-contour-2026-10-16-v2.md`, вне репо): 1.1 наблюдение длинных этапов + исчезнувший exec; 1.2 retention/free-space; 1.3 cleanup protected; 1.4 видимость сбоя алерта; 1.5 duration_warn в v2 / убрать `measure_max_seconds`; 1.6 текст ошибок конфига. Ветка `refactor/nightly-hardening`, PR в main.
