@@ -68,6 +68,7 @@ class ProfilesLayerRunner:
     may_write: Callable[[], str] | None = None
     logs_path: str | None = None
     observe_cap: float | None = None
+    on_observe: Callable[[], None] | None = None
 
     def run(
         self,
@@ -91,6 +92,7 @@ class ProfilesLayerRunner:
             full_needed=full_needed,
             logs_path=self.logs_path,
             observe_cap=self.observe_cap,
+            on_observe=self.on_observe,
             on_layer_start=on_layer_start,
             on_layer_result=on_layer_result,
             on_layer_error=on_layer_error,

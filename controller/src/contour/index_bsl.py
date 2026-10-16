@@ -177,6 +177,7 @@ def _run_exec(
     docker: DockerRunner,
     *,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> None:
     """Create exec → INSERT job → start → wait (R04: no race on ExecIDs)."""
     container = cfg.services.bsl_container
@@ -189,7 +190,13 @@ def _run_exec(
     )
     start_exec(exec_id, detach=True, runner=docker)
     _mark_exec_running(conn, job_id)
-    exit_code = wait_exec(container, exec_id, runner=docker, observe_cap=observe_cap)
+    exit_code = wait_exec(
+        container,
+        exec_id,
+        runner=docker,
+        observe_cap=observe_cap,
+        on_observe=on_observe,
+    )
     _finish_exec_job(conn, job_id, exit_code)
     if exit_code != 0:
         raise RuntimeError(f"{stage} failed with exit {exit_code}")
@@ -296,6 +303,7 @@ def index_bsl(
     may_write=None,
     resume: bool | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> None:
     docker = _runner(runner)
     database = _database_for_run(cfg, conn, run_id)
@@ -331,7 +339,7 @@ def index_bsl(
             )
         _run_exec(
             cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker,
-            observe_cap=observe_cap,
+            observe_cap=observe_cap, on_observe=on_observe,
         )
     if may_write is not None:
         decision = may_write()
@@ -343,7 +351,7 @@ def index_bsl(
     if revision is None:
         _run_exec(
             cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker,
-            observe_cap=observe_cap,
+            observe_cap=observe_cap, on_observe=on_observe,
         )
     else:
         recorded = _read_bsl_attempt(conn, database)
@@ -359,4 +367,5 @@ def index_bsl(
                 ["clean", "--path", SRC_PATH],
                 docker,
                 observe_cap=observe_cap,
+                on_observe=on_observe,
             )

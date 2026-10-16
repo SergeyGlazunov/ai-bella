@@ -283,6 +283,7 @@ def _run_graph_job(
     *,
     logs_path: str | Path | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> int:
     job_service, container_name = _job_identity(stage)
     existing = _existing_compose_files(cfg.services.graph_compose_dir)
@@ -307,7 +308,12 @@ def _run_graph_job(
     database = _database_for_run(cfg, conn, run_id)
     job_id = _insert_job(conn, run_id, stage, container_id, database=database)
     start(container_id, runner=docker)
-    exit_code = wait(container_id, runner=docker, observe_cap=observe_cap)
+    exit_code = wait(
+        container_id,
+        runner=docker,
+        observe_cap=observe_cap,
+        on_observe=on_observe,
+    )
     # Logging must never block recording the real indexer exit code.
     log_path = None
     try:
@@ -333,13 +339,15 @@ def index_graph(
     full_needed: bool = False,
     logs_path: str | Path | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> str:
     """Run graph delta/FULL. Returns the writer container id used last.
 
     ``logs_path`` is the host directory for diagnostic files (typically
     ``cfg.runtime.logs_path``). Pass it explicitly when ``cfg`` is a
     ``DatabaseConfig`` without ``runtime``. ``observe_cap`` bounds total
-    observation of one stage (same-night completion for long FULL runs).
+    observation of one stage (same-night completion for long FULL runs);
+    ``on_observe`` runs on every observation chunk while the writer runs.
     """
     docker = _runner(runner)
     database = _database_for_run(cfg, conn, run_id)
@@ -349,7 +357,7 @@ def index_graph(
         if full_needed
         else _run_graph_job(
             cfg, conn, run_id, "graph", docker, logs_path=resolved_logs,
-            observe_cap=observe_cap,
+            observe_cap=observe_cap, on_observe=on_observe,
         )
     )
     if code == 0:
@@ -370,7 +378,7 @@ def index_graph(
             )
         full_code = _run_graph_job(
             cfg, conn, run_id, "graph_full", docker, logs_path=resolved_logs,
-            observe_cap=observe_cap,
+            observe_cap=observe_cap, on_observe=on_observe,
         )
         if full_code != 0:
             raise RuntimeError(f"graph FULL failed with exit {full_code}")

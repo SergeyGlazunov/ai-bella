@@ -4,6 +4,7 @@ import http.client
 import json
 import socket
 import subprocess
+import sys
 import time
 from typing import Protocol, runtime_checkable
 
@@ -254,12 +255,23 @@ def start(container_id: str, *, runner: DockerRunner | None = None) -> None:
     docker_runner.run(["docker", "start", container_id])
 
 
+def _run_observe_callback(on_observe) -> None:
+    """Run the observation callback; a warn path must never break the wait."""
+    if on_observe is None:
+        return
+    try:
+        on_observe()
+    except Exception as exc:
+        print(f"[contour] observe callback failed: {exc}", file=sys.stderr)
+
+
 def wait(
     container_id: str,
     *,
     runner: DockerRunner | None = None,
     timeout: float | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> int:
     """Wait for a job container, re-arming the short chunk until the cap.
 
@@ -269,6 +281,8 @@ def wait(
     nightly stage (graph FULL ≈ hours) is observed to completion in the same
     night instead of deferring after the first 300 s chunk. The container is
     never killed; total-cap exhaustion raises ``WriterStillAlive``.
+    ``on_observe`` runs on every chunk expiry (≈ every 300 s) so duration
+    warnings fire while the writer still runs.
     """
     from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriterStillAlive
 
@@ -282,6 +296,7 @@ def wait(
     chunk = DEFAULT_RUNTIME_POLICY.writer_observation_budget_seconds
     started = time.monotonic()
     while True:
+        _run_observe_callback(on_observe)
         remaining = total - (time.monotonic() - started)
         if remaining <= 0:
             raise WriterStillAlive(
@@ -354,6 +369,12 @@ def _exec_inspect(exec_id: str, runner: DockerRunner) -> dict:
         conn.close()
 
 
+def exec_state(exec_id: str, *, runner: DockerRunner | None = None) -> dict:
+    """Inspect one exec instance; raises ``ExecRecordGone`` when collected."""
+    docker_runner = runner if runner is not None else _get_default_runner()
+    return _exec_inspect(exec_id, docker_runner)
+
+
 def wait_exec(
     container: str,
     exec_id: str,
@@ -362,6 +383,7 @@ def wait_exec(
     poll_interval: float = 1.0,
     timeout: float | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> int:
     """Wait for a detached `docker exec`. Does not `docker wait` the permanent container.
 
@@ -371,7 +393,8 @@ def wait_exec(
     observed to completion in the same night. Cap exhaustion raises
     ``WriterStillAlive`` so the caller can defer without killing the writer.
     ``ExecRecordGone`` propagates: the daemon collected the record and the
-    result is unrecoverable.
+    result is unrecoverable. ``on_observe`` runs on every poll so duration
+    warnings fire while the writer still runs.
     """
     from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriterStillAlive
 
@@ -387,6 +410,7 @@ def wait_exec(
         budget = DEFAULT_RUNTIME_POLICY.writer_max_observe_seconds
     deadline = time.monotonic() + budget
     while True:
+        _run_observe_callback(on_observe)
         payload = _exec_inspect(exec_id, docker_runner)
         running = payload.get("Running")
         if running is False or running in {0, "false", "False"}:

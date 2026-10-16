@@ -591,17 +591,25 @@ def _default_v2_database_runner(
     )
     runtime = getattr(cfg, "runtime", None)
     logs_path = runtime.logs_path if runtime is not None else None
+    # Review 1.5: duration warn fires from inside the observation loops while
+    # the writer still runs (not only after the pipeline finishes).
+    warn_key = f"duration_warned:{database.name}"
+    set_meta(conn, warn_key, "")
+    started = time.monotonic()
+
+    def _on_observe() -> None:
+        _maybe_duration_warn(
+            cfg, conn, started, send, warn_key=warn_key, database=database.name
+        )
+
     layers = ProfilesLayerRunner(
         conn=conn,
         docker_runner=docker,
         may_write=may_write,
         logs_path=logs_path,
         observe_cap=_runtime_observe_cap(cfg),
+        on_observe=_on_observe,
     )
-    # Review 1.5: duration_warn_seconds works in v2 too (scoped meta key).
-    warn_key = f"duration_warned:{database.name}"
-    set_meta(conn, warn_key, "")
-    started = time.monotonic()
     result = run_database_pipeline(
         database,
         provider,
@@ -612,6 +620,8 @@ def _default_v2_database_runner(
         conn=conn,
         may_write=may_write,
     )
+    # Belt-and-suspenders: covers fast pipelines whose stages finished before
+    # any observation chunk expired. Idempotent via the warn_key flag.
     _maybe_duration_warn(
         cfg, conn, started, send, warn_key=warn_key, database=database.name
     )

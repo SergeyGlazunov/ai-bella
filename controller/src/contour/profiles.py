@@ -51,6 +51,7 @@ def run_bsl_layer(
     may_write: Callable[[], str] | None = None,
     *,
     observe_cap: float | None = None,
+    on_observe=None,
 ) -> LayerResult:
     """Run the code_index layer for ``database`` and return a verified result."""
     _ensure_run_revision(conn, run_id, database.name, revision)
@@ -65,6 +66,7 @@ def run_bsl_layer(
         may_write=may_write,
         resume=resume,
         observe_cap=observe_cap,
+        on_observe=on_observe,
     )
     storage_id = dockerutil.volume_identity(
         database.storage.code_index_volume, runner=runner
@@ -91,6 +93,7 @@ def run_graph_layer(
     full_needed: bool = False,
     logs_path: str | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
     **graph_kwargs: Any,
 ) -> LayerResult:
     """Run the graph layer; preserve exit-code-3 → FULL contract.
@@ -99,7 +102,8 @@ def run_graph_layer(
     that forbids it (same contract as ``may_write_decision``).
     ``full_needed`` applies a previously saved FULL requirement (recovery).
     ``logs_path`` is host ``runtime.logs_path`` (DatabaseConfig has no runtime).
-    ``observe_cap`` bounds total observation of one stage.
+    ``observe_cap`` bounds total observation of one stage; ``on_observe``
+    runs on every observation chunk while the writer runs.
     """
     _ensure_run_revision(conn, run_id, database.name, revision)
     writer_container = index_graph(
@@ -111,6 +115,7 @@ def run_graph_layer(
         full_needed=full_needed,
         logs_path=logs_path,
         observe_cap=observe_cap,
+        on_observe=on_observe,
         **graph_kwargs,
     )
     storage_id = dockerutil.volume_identity(
@@ -137,6 +142,7 @@ def run_required_layers(
     full_needed: bool = False,
     logs_path: str | None = None,
     observe_cap: float | None = None,
+    on_observe=None,
     on_layer_start: Callable[[str], None] | None = None,
     on_layer_result: Callable[[LayerResult], None] | None = None,
     on_layer_error: Callable[[str, BaseException], None] | None = None,
@@ -178,6 +184,7 @@ def run_required_layers(
                     runner=runner,
                     may_write=may_write,
                     observe_cap=observe_cap,
+                    on_observe=on_observe,
                 )
             elif layer == "graph":
                 item = run_graph_layer(
@@ -190,6 +197,7 @@ def run_required_layers(
                     full_needed=full_needed,
                     logs_path=logs_path,
                     observe_cap=observe_cap,
+                    on_observe=on_observe,
                 )
             else:  # pragma: no cover - guarded by profile_from_config
                 raise ValueError(f"unsupported layer: {layer}")

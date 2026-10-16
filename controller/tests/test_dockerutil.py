@@ -202,6 +202,63 @@ def test_wait_exec_propagates_exec_record_gone():
         dockerutil.wait_exec("c", "e1", runner=GoneRunner(), poll_interval=0)
 
 
+def test_wait_calls_on_observe_while_writer_runs():
+    """P3: duration warn hook fires during observation, before completion."""
+
+    class SlowThenExit:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, cmd: list[str], *, timeout: float | None = None):
+            self.calls += 1
+            if self.calls < 3:
+                raise subprocess.TimeoutExpired(cmd, timeout or 0)
+            return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+
+    seen: list[float] = []
+    runner = SlowThenExit()
+    assert dockerutil.wait("abc", runner=runner, on_observe=lambda: seen.append(0.0)) == 0
+    assert len(seen) == 3  # once per loop entry, before each docker wait
+
+    class SlowExec:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def inspect_exec(self, exec_id: str) -> dict:
+            self.polls += 1
+            return {"Running": self.polls < 3, "ExitCode": 5}
+
+    exec_seen: list[str] = []
+    assert (
+        dockerutil.wait_exec(
+            "c",
+            "e1",
+            runner=SlowExec(),
+            poll_interval=0,
+            on_observe=lambda: exec_seen.append("warn"),
+        )
+        == 5
+    )
+    assert len(exec_seen) == 3  # fired on every poll while the writer ran
+
+
+def test_wait_observe_callback_error_does_not_break_wait():
+    class SlowThenExit:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, cmd: list[str], *, timeout: float | None = None):
+            self.calls += 1
+            if self.calls < 2:
+                raise subprocess.TimeoutExpired(cmd, timeout or 0)
+            return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+
+    def broken() -> None:
+        raise RuntimeError("warn channel down")
+
+    assert dockerutil.wait("abc", runner=SlowThenExit(), on_observe=broken) == 0
+
+
 def test_ping_raises_on_hung_api():
     runner = FakeDockerRunner(ping_timeout=True)
     with pytest.raises(subprocess.TimeoutExpired):
