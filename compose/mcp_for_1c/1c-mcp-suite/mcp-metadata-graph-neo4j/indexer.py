@@ -372,7 +372,10 @@ def main() -> int:
         log.warning("В %s не найден Configuration.xml — возможно, это не корень выгрузки",
                     src_dir)
 
-    neo = Neo4j(neo4j_url, neo4j_usr, neo4j_pwd)
+    neo = Neo4j(
+        neo4j_url, neo4j_usr, neo4j_pwd,
+        timeout=float(os.environ.get("NEO4J_TIMEOUT_SEC", "3600")),
+    )
     log.info("Ожидание Neo4j…")
     neo.wait(timeout=120)
     log.info("  ✓ доступен")

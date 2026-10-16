@@ -253,7 +253,9 @@ def _build_override(
     base_file: str,
 ) -> str:
     extra = (
-        "    environment:\n      - METADATA_FORCE_REINDEX=true\n"
+        "    environment:\n"
+        "      - METADATA_FORCE_REINDEX=true\n"
+        "      - NEO4J_TIMEOUT_SEC=3600\n"
         if stage == "graph_full"
         else '    entrypoint: ["python"]\n    command: ["/app/apply_changes.py"]\n'
     )

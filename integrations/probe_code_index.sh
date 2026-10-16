@@ -19,12 +19,21 @@ set -e
 
 found=0
 not_found=0
+# Prefer structured hit markers. Do not scan whole bodies for "не найден" —
+# BSL source text often contains that phrase and would false-negative present.
 if printf '%s' "$out" | grep -Eq '"path"|file_path|"functions"'; then
   found=1
 fi
-if printf '%s' "$out" | grep -Eiq 'not found|no such|File not found|не найден|^null$'; then
-  not_found=1
-  found=0
+if [ "$found" -eq 0 ]; then
+  if printf '%s' "$out" | grep -Eiq 'not found|no such|File not found|не найден|^null$'; then
+    not_found=1
+  fi
+fi
+# Bare null summary with no markers
+if [ "$found" -eq 0 ] && [ "$not_found" -eq 0 ]; then
+  if printf '%s' "$out" | grep -Eq '^null$'; then
+    not_found=1
+  fi
 fi
 
 control_fail=0

@@ -171,7 +171,19 @@ def sample_current_tree(
             if ".git" in rel.parts:
                 continue
             posix = rel.as_posix()
+            _BSL_PREF = (
+                "CommonModules/",
+                "Catalogs/",
+                "Documents/",
+                "DataProcessors/",
+                "Reports/",
+                "InformationRegisters/",
+                "BusinessProcesses/",
+                "Tasks/",
+            )
             if posix.endswith(".bsl") and len(bsl_paths) < max_bsl:
+                if not any(posix.startswith(p) for p in _BSL_PREF):
+                    continue
                 bsl_paths.append(posix)
             elif posix.endswith(".xml") and len(xml_paths) < max_xml:
                 xml_paths.append(posix)
