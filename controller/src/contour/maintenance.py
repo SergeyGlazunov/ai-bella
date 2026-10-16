@@ -122,23 +122,55 @@ def prune_previous_sources(published_path: Path, *, keep: int = 1) -> list[str]:
 
 
 def prune_run_history(conn: sqlite3.Connection, *, days: int = 90) -> int:
-    """Delete finished runs/jobs older than ``days``; never touches unfinished work."""
+    """Delete dead run history older than ``days``; keep recovery evidence.
+
+    A run is deletable only when it is finished (``finished_at`` set) and its
+    database is currently healthy: no unfinished runs, no staged revision, no
+    needs_recovery/failed/recovering lifecycle and no building/failed/unknown
+    layer (same shape as ``StateStore.required_recovery``). Jobs are deleted
+    only together with their run, so completed stages of an unfinished run —
+    including BSL attempt resume evidence — always stay. Retention counts from
+    the run's finish, not its start.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
-    cur = conn.execute(
+    protected: set[str] = set()
+    for row in conn.execute(
+        "SELECT DISTINCT database FROM runs WHERE finished_at IS NULL"
+    ):
+        protected.add(str(row["database"]))
+    for row in conn.execute(
         """
-        DELETE FROM jobs WHERE status IN ('ok', 'failed', 'removed')
-          AND run_id IN (SELECT id FROM runs WHERE started_at < ?)
+        SELECT database FROM database_state
+        WHERE staged_revision IS NOT NULL
+           OR lifecycle_status IN ('needs_recovery', 'failed', 'recovering')
+        """
+    ):
+        protected.add(str(row["database"]))
+    for row in conn.execute(
+        """
+        SELECT DISTINCT database FROM layer_state
+        WHERE status IN ('building', 'failed', 'unknown')
+        """
+    ):
+        protected.add(str(row["database"]))
+
+    deletable: list[int] = []
+    for row in conn.execute(
+        """
+        SELECT id, database, finished_at FROM runs
+        WHERE finished_at IS NOT NULL AND finished_at < ?
         """,
         (cutoff,),
-    )
-    deleted = int(cur.rowcount or 0)
-    cur = conn.execute(
-        """
-        DELETE FROM runs WHERE started_at < ?
-          AND id NOT IN (SELECT DISTINCT run_id FROM jobs)
-        """,
-        (cutoff,),
-    )
-    deleted += int(cur.rowcount or 0)
+    ):
+        if str(row["database"]) in protected:
+            continue
+        deletable.append(int(row["id"]))
+
+    deleted = 0
+    for run_id in deletable:
+        cur = conn.execute("DELETE FROM jobs WHERE run_id = ?", (run_id,))
+        deleted += int(cur.rowcount or 0)
+        conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        deleted += 1
     conn.commit()
     return deleted

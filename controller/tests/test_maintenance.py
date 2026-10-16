@@ -95,39 +95,132 @@ def test_prune_previous_sources_keeps_newest_handle(tmp_path: Path):
     assert published.exists()
 
 
-def test_prune_run_history_keeps_unfinished(tmp_path: Path):
+def test_prune_run_history_protects_unfinished_runs(tmp_path: Path):
     db_path = tmp_path / "state.db"
     conn = init_db(str(db_path))
     try:
-        old = "2020-01-01T00:00:00Z"
+        old_finished = "2020-01-01T01:00:00Z"
+        # ubd: unfinished run keeps the whole database history alive,
+        # including its old finished failed run (BSL resume evidence).
         conn.execute(
-            "INSERT INTO runs (id, database, target_commit, started_at, finished_at,"
-            " result) VALUES (1, 'ubd', 'a', ?, '2020-01-01T01:00:00Z', 'failed')",
-            (old,),
+            "INSERT INTO runs (id, database, target_commit, started_at,"
+            " finished_at, result) VALUES (1, 'ubd', 'a', '2020-01-01T00:00:00Z',"
+            " ?, 'failed')",
+            (old_finished,),
+        )
+        conn.execute(
+            "INSERT INTO jobs (run_id, stage, status) VALUES (1, 'bsl_index', 'ok')"
         )
         conn.execute(
             "INSERT INTO runs (id, database, target_commit, started_at)"
-            " VALUES (2, 'ubd', 'b', ?)",
-            (old,),
+            " VALUES (2, 'ubd', 'b', '2020-01-02T00:00:00Z')"
         )
         conn.execute(
-            "INSERT INTO jobs (run_id, stage, status) VALUES (1, 'graph', 'ok')"
+            "INSERT INTO jobs (run_id, stage, status) VALUES (2, 'bsl_clean', 'running')"
+        )
+        # kb: healthy database, old finished run → dead history.
+        conn.execute(
+            "INSERT INTO runs (id, database, target_commit, started_at,"
+            " finished_at, result) VALUES (3, 'kb', 'c', '2020-01-01T00:00:00Z',"
+            " ?, 'published')",
+            (old_finished,),
         )
         conn.execute(
-            "INSERT INTO jobs (run_id, stage, status) VALUES (2, 'graph', 'running')"
+            "INSERT INTO jobs (run_id, stage, status) VALUES (3, 'bsl_index', 'ok')"
         )
         conn.commit()
 
-        deleted = maintenance.prune_run_history(conn, days=90)
-        assert deleted >= 1
-        remaining_runs = {
-            row["id"] for row in conn.execute("SELECT id FROM runs")
-        }
+        maintenance.prune_run_history(conn, days=90)
+        remaining_runs = {row["id"] for row in conn.execute("SELECT id FROM runs")}
         remaining_jobs = {
             row["run_id"] for row in conn.execute("SELECT run_id FROM jobs")
         }
-        # Finished old run+job deleted; unfinished run and its job survive.
-        assert remaining_runs == {2}
-        assert remaining_jobs == {2}
+        # Unfinished ubd run and its sibling finished run both stay;
+        # healthy kb history is deleted together with its job.
+        assert remaining_runs == {1, 2}
+        assert remaining_jobs == {1, 2}
     finally:
         conn.close()
+
+
+def test_prune_run_history_keeps_unfinished_run_before_first_job():
+    conn = init_db(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs(id,database,target_revision,started_at)"
+            " VALUES(1,'kb','r','2020-01-01T00:00:00Z')"
+        )
+        conn.commit()
+        maintenance.prune_run_history(conn)
+        assert conn.execute("SELECT id FROM runs WHERE id=1").fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_prune_run_history_keeps_completed_stage_of_unfinished_run():
+    conn = init_db(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO runs(id,database,target_revision,started_at)"
+            " VALUES(1,'ubd','r','2020-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO jobs(id,run_id,database,stage,status)"
+            " VALUES(1,1,'ubd','bsl_index','ok')"
+        )
+        conn.execute(
+            "INSERT INTO jobs(id,run_id,database,stage,status)"
+            " VALUES(2,1,'ubd','bsl_clean','running')"
+        )
+        conn.commit()
+        maintenance.prune_run_history(conn)
+        assert conn.execute("SELECT id FROM jobs WHERE id=1").fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_prune_run_history_protects_recovery_databases(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    conn = init_db(str(db_path))
+    try:
+        conn.execute(
+            "INSERT INTO runs (id, database, target_commit, started_at,"
+            " finished_at, result) VALUES (1, 'kb', 'a', '2020-01-01T00:00:00Z',"
+            " '2020-01-01T01:00:00Z', 'failed')"
+        )
+        conn.execute(
+            "INSERT INTO layer_state (database, layer, status, updated_at)"
+            " VALUES ('kb', 'code_index', 'failed', '2020-01-01T00:00:00Z')"
+        )
+        conn.commit()
+        maintenance.prune_run_history(conn, days=90)
+        assert conn.execute("SELECT id FROM runs WHERE id=1").fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_prune_accepted_preserves_real_published_package(tmp_path: Path):
+    from test_packages import _make_package
+    from contour.packages import validate_package
+
+    root = tmp_path / "accepted"
+    root.mkdir()
+    published = _make_package(
+        root, name="ready-published", database="kb", export_id="published"
+    )
+    revision = validate_package(published, frozenset({"kb"})).revision
+    for i in range(4):
+        path = _make_package(
+            root, name=f"ready-new-{i}", database="kb", export_id=f"new-{i}"
+        )
+        manifest = path / "manifest.json"
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        raw["finished_at"] = f"2030-01-0{i + 1}T00:00:00Z"
+        manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    removed = maintenance.prune_accepted_packages(
+        root, published_revision=revision, keep=3
+    )
+    assert len(removed) == 1
+    assert published.exists()
+
