@@ -8,6 +8,19 @@ runtime:
   lock_path: /srv/ai-contour/locks/sync.lock
   logs_path: /srv/ai-contour/logs/runs
   backups_path: /srv/ai-contour/backups/state
+  # Total observation budget for one writer stage. Long stages (graph FULL
+  # ~5.3 h) are observed to completion in the same night; jobs never killed.
+  writer_max_observe_seconds: 21600
+  # Refuse heavy update work when free space under runtime.root is below
+  # this threshold (GiB). Fails the database run with an alert before any
+  # clone/copy or read close.
+  min_free_gb: 5
+  # Retention after each verified publish: keep this many newest accepted
+  # packages per package database (the published revision's package always
+  # stays), keep only the newest previous-source snapshot, delete finished
+  # runs/jobs older than retain_runs_days days.
+  retain_packages: 3
+  retain_runs_days: 90
 
 schedule:
   window_start: "01:30"

@@ -376,6 +376,55 @@ def _runtime_observe_cap(cfg) -> float | None:
     return getattr(runtime, "writer_max_observe_seconds", None)
 
 
+def _preflight_free_space(cfg) -> None:
+    """Refuse heavy update work when free space under runtime.root is low."""
+    from contour import maintenance
+
+    runtime = getattr(cfg, "runtime", None)
+    root = (
+        Path(runtime.root)
+        if runtime is not None and runtime.root
+        else Path("/srv/ai-contour")
+    )
+    min_free_gb = getattr(runtime, "min_free_gb", 5.0) if runtime is not None else 5.0
+    maintenance.check_free_space(root, min_free_gb=float(min_free_gb))
+
+
+def _prune_after_publish(cfg, database, conn: sqlite3.Connection, state, send) -> None:
+    """Post-publish retention (review 1.2). Never fails the published result."""
+    from contour import maintenance
+    from contour.config import PackageSourceConfig
+    from contour.sources import published_path_for
+
+    runtime = getattr(cfg, "runtime", None)
+
+    def _int_knob(name: str, default: int) -> int:
+        value = getattr(runtime, name, default) if runtime is not None else default
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        if isinstance(database.source, PackageSourceConfig):
+            published_revision = None
+            try:
+                published_revision = state.get_database(database.name)[
+                    "published_revision"
+                ]
+            except Exception:
+                published_revision = None
+            maintenance.prune_accepted_packages(
+                _accepted_root_for(cfg, database),
+                published_revision=published_revision,
+                keep=_int_knob("retain_packages", 3),
+            )
+        maintenance.prune_previous_sources(published_path_for(database), keep=1)
+        maintenance.prune_run_history(conn, days=_int_knob("retain_runs_days", 90))
+    except Exception as exc:
+        _safe_send(send, cfg, f"{database.name}: retention prune failed: {exc}")
+
+
 def _default_v2_database_runner(
     database: DatabaseConfig,
     *,
@@ -530,6 +579,9 @@ def _default_v2_database_runner(
         if watch_reload is not None
         else _watch_reload_for_database(database, None)
     )
+    # Review 1.2: refuse heavy update work when free space is low — before
+    # any clone/copy closes reads or touches sources.
+    _preflight_free_space(cfg)
     reads = DatabaseReadController(
         database, conn, docker, watch_reload=reload_fn
     )
@@ -555,7 +607,12 @@ def _default_v2_database_runner(
         conn=conn,
         may_write=may_write,
     )
-    return _normalize_db_result(result.result)
+    status = _normalize_db_result(result.result)
+    if status == "success":
+        # Review 1.2: retention runs only after a verified publish and never
+        # fails the published result.
+        _prune_after_publish(cfg, database, conn, state, send)
+    return status
 
 
 class _GitutilOps:

@@ -160,6 +160,14 @@ class RuntimeConfig:
     # (UBD graph FULL ~5.3 h) must be observed to completion in the same
     # night; running jobs are never killed. None → RuntimePolicy default (6 h).
     writer_max_observe_seconds: float | None = None
+    # Refuse heavy update work when free space under runtime.root is below
+    # this threshold (GiB).
+    min_free_gb: float = 5.0
+    # Keep this many newest accepted packages per package database (the
+    # published revision's package is always kept on top of this).
+    retain_packages: int = 3
+    # Delete finished runs/jobs older than this many days.
+    retain_runs_days: int = 90
 
 
 @dataclass(frozen=True)
@@ -338,6 +346,13 @@ def _parse_adapters(adapters_raw: dict[str, Any], label: str = "adapters") -> Ad
     )
 
 
+def _positive_number(raw: dict[str, Any], key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"runtime.{key} must be a positive number")
+    return float(value)
+
+
 def _parse_runtime(runtime_raw: dict[str, Any]) -> RuntimeConfig:
     observe = runtime_raw.get("writer_max_observe_seconds")
     if observe is not None and (
@@ -356,6 +371,13 @@ def _parse_runtime(runtime_raw: dict[str, Any]) -> RuntimeConfig:
         backups_path=str(runtime_raw["backups_path"]),
         writer_max_observe_seconds=(
             float(observe) if observe is not None else None
+        ),
+        min_free_gb=_positive_number(runtime_raw, "min_free_gb", 5.0),
+        retain_packages=int(
+            _positive_number(runtime_raw, "retain_packages", 3.0)
+        ),
+        retain_runs_days=int(
+            _positive_number(runtime_raw, "retain_runs_days", 90.0)
         ),
     )
 
