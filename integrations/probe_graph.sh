@@ -16,38 +16,47 @@ REL=$(printf '%s' "$REL" | tr '\\' '/')
 ESC=$(printf '%s' "$REL" | sed "s/'/\\\\'/g")
 
 # Map top-level dump dirs → MetadataObject kind (english), aligned with indexer KINDS.
+# Shell `case` globs match `/`, so Catalogs/X/Forms/.../Form.xml would otherwise
+# become Catalog.X/Forms/.../Form — reject any base that still contains `/`.
 xml_to_full_name() {
-  # stdin: relative xml path → stdout: full_name_eng or empty
+  # arg: relative xml path → stdout: full_name_eng or empty
   rel="$1"
+  kind=""
+  base=""
   case "$rel" in
-    Catalogs/*.xml)      base=${rel#Catalogs/}; base=${base%.xml}; printf 'Catalog.%s' "$base" ;;
-    Documents/*.xml)     base=${rel#Documents/}; base=${base%.xml}; printf 'Document.%s' "$base" ;;
-    CommonModules/*.xml) base=${rel#CommonModules/}; base=${base%.xml}; printf 'CommonModule.%s' "$base" ;;
-    InformationRegisters/*.xml) base=${rel#InformationRegisters/}; base=${base%.xml}; printf 'InformationRegister.%s' "$base" ;;
-    AccumulationRegisters/*.xml) base=${rel#AccumulationRegisters/}; base=${base%.xml}; printf 'AccumulationRegister.%s' "$base" ;;
-    AccountingRegisters/*.xml) base=${rel#AccountingRegisters/}; base=${base%.xml}; printf 'AccountingRegister.%s' "$base" ;;
-    CalculationRegisters/*.xml) base=${rel#CalculationRegisters/}; base=${base%.xml}; printf 'CalculationRegister.%s' "$base" ;;
-    ChartsOfAccounts/*.xml) base=${rel#ChartsOfAccounts/}; base=${base%.xml}; printf 'ChartOfAccounts.%s' "$base" ;;
-    ChartsOfCharacteristicTypes/*.xml) base=${rel#ChartsOfCharacteristicTypes/}; base=${base%.xml}; printf 'ChartOfCharacteristicTypes.%s' "$base" ;;
-    ChartsOfCalculationTypes/*.xml) base=${rel#ChartsOfCalculationTypes/}; base=${base%.xml}; printf 'ChartOfCalculationTypes.%s' "$base" ;;
-    BusinessProcesses/*.xml) base=${rel#BusinessProcesses/}; base=${base%.xml}; printf 'BusinessProcess.%s' "$base" ;;
-    Tasks/*.xml) base=${rel#Tasks/}; base=${base%.xml}; printf 'Task.%s' "$base" ;;
-    Enums/*.xml) base=${rel#Enums/}; base=${base%.xml}; printf 'Enum.%s' "$base" ;;
-    Reports/*.xml) base=${rel#Reports/}; base=${base%.xml}; printf 'Report.%s' "$base" ;;
-    DataProcessors/*.xml) base=${rel#DataProcessors/}; base=${base%.xml}; printf 'DataProcessor.%s' "$base" ;;
-    ExchangePlans/*.xml) base=${rel#ExchangePlans/}; base=${base%.xml}; printf 'ExchangePlan.%s' "$base" ;;
-    FilterCriteria/*.xml) base=${rel#FilterCriteria/}; base=${base%.xml}; printf 'FilterCriterion.%s' "$base" ;;
-    SettingsStorages/*.xml) base=${rel#SettingsStorages/}; base=${base%.xml}; printf 'SettingsStorage.%s' "$base" ;;
-    Subsystems/*.xml) base=${rel#Subsystems/}; base=${base%.xml}; printf 'Subsystem.%s' "$base" ;;
-    Roles/*.xml) base=${rel#Roles/}; base=${base%.xml}; printf 'Role.%s' "$base" ;;
-    CommonForms/*.xml) base=${rel#CommonForms/}; base=${base%.xml}; printf 'CommonForm.%s' "$base" ;;
-    CommonTemplates/*.xml) base=${rel#CommonTemplates/}; base=${base%.xml}; printf 'CommonTemplate.%s' "$base" ;;
-    CommonPictures/*.xml) base=${rel#CommonPictures/}; base=${base%.xml}; printf 'CommonPicture.%s' "$base" ;;
-    Constants/*.xml) base=${rel#Constants/}; base=${base%.xml}; printf 'Constant.%s' "$base" ;;
-    DefinedTypes/*.xml) base=${rel#DefinedTypes/}; base=${base%.xml}; printf 'DefinedType.%s' "$base" ;;
-    SessionParameters/*.xml) base=${rel#SessionParameters/}; base=${base%.xml}; printf 'SessionParameter.%s' "$base" ;;
-    FunctionalOptions/*.xml) base=${rel#FunctionalOptions/}; base=${base%.xml}; printf 'FunctionalOption.%s' "$base" ;;
-    *) printf '' ;;
+    Catalogs/*.xml)      kind=Catalog; base=${rel#Catalogs/} ;;
+    Documents/*.xml)     kind=Document; base=${rel#Documents/} ;;
+    CommonModules/*.xml) kind=CommonModule; base=${rel#CommonModules/} ;;
+    InformationRegisters/*.xml) kind=InformationRegister; base=${rel#InformationRegisters/} ;;
+    AccumulationRegisters/*.xml) kind=AccumulationRegister; base=${rel#AccumulationRegisters/} ;;
+    AccountingRegisters/*.xml) kind=AccountingRegister; base=${rel#AccountingRegisters/} ;;
+    CalculationRegisters/*.xml) kind=CalculationRegister; base=${rel#CalculationRegisters/} ;;
+    ChartsOfAccounts/*.xml) kind=ChartOfAccounts; base=${rel#ChartsOfAccounts/} ;;
+    ChartsOfCharacteristicTypes/*.xml) kind=ChartOfCharacteristicTypes; base=${rel#ChartsOfCharacteristicTypes/} ;;
+    ChartsOfCalculationTypes/*.xml) kind=ChartOfCalculationTypes; base=${rel#ChartsOfCalculationTypes/} ;;
+    BusinessProcesses/*.xml) kind=BusinessProcess; base=${rel#BusinessProcesses/} ;;
+    Tasks/*.xml) kind=Task; base=${rel#Tasks/} ;;
+    Enums/*.xml) kind=Enum; base=${rel#Enums/} ;;
+    Reports/*.xml) kind=Report; base=${rel#Reports/} ;;
+    DataProcessors/*.xml) kind=DataProcessor; base=${rel#DataProcessors/} ;;
+    ExchangePlans/*.xml) kind=ExchangePlan; base=${rel#ExchangePlans/} ;;
+    FilterCriteria/*.xml) kind=FilterCriterion; base=${rel#FilterCriteria/} ;;
+    SettingsStorages/*.xml) kind=SettingsStorage; base=${rel#SettingsStorages/} ;;
+    Subsystems/*.xml) kind=Subsystem; base=${rel#Subsystems/} ;;
+    Roles/*.xml) kind=Role; base=${rel#Roles/} ;;
+    CommonForms/*.xml) kind=CommonForm; base=${rel#CommonForms/} ;;
+    CommonTemplates/*.xml) kind=CommonTemplate; base=${rel#CommonTemplates/} ;;
+    CommonPictures/*.xml) kind=CommonPicture; base=${rel#CommonPictures/} ;;
+    Constants/*.xml) kind=Constant; base=${rel#Constants/} ;;
+    DefinedTypes/*.xml) kind=DefinedType; base=${rel#DefinedTypes/} ;;
+    SessionParameters/*.xml) kind=SessionParameter; base=${rel#SessionParameters/} ;;
+    FunctionalOptions/*.xml) kind=FunctionalOption; base=${rel#FunctionalOptions/} ;;
+    *) printf ''; return ;;
+  esac
+  base=${base%.xml}
+  case "$base" in
+    ""|*/*) printf '' ;;
+    *) printf '%s.%s' "$kind" "$base" ;;
   esac
 }
 
