@@ -53,13 +53,13 @@ Integration acceptance covers: full publish cycle ×3 profiles; package intake; 
 
 ## Blockers / open
 
-1. **KB graph** not published — indexer still gets empty `/data/1c-xml` (compose volume/workspace wiring under `/srv/ai2/compose/mcp_for_1c-kb`); code_index ready. Evidence `/srv/ai-contour/backups/task12-kb*`.
+1. **KB** temporarily `enabled: false` in `/etc/ai-contour/contour.yaml` — graph indexer still sees empty `/data/1c-xml`; re-enable after mount fix. Evidence `/srv/ai-contour/backups/task12-kb*`.
 2. Vendor provenance for `compose/mcp_for_1c` incomplete — see `VENDOR.md`.
 3. Live secrets stay on disk (gitignored); not in Git.
-4. First green night after timer enable — verify after `2026-10-19 01:30`.
+4. First green night — verify after `2026-10-19 01:30` (see `/srv/ai-contour/backups/MORNING-CHECK.txt`).
 
 ## Next action
 
-1. Observe first `ai-sync.timer` night (`journalctl -u ai-sync.service`, contour status).
-2. Repair KB graph publish (Linux compose under `/srv/ai2/compose/mcp_for_1c-kb` seeded; still exit 2).
-3. Keep Windows UBD Config Sync indexing **Disabled**; exporters remain package-only.
+1. After night: `journalctl -u ai-sync.service --since 01:00` + `contour status` (UBD+klon must stay published).
+2. Repair KB graph workspace mount, then set `kb.enabled: true`.
+3. Keep Windows `UBD Config Sync` **Disabled**; exporters package-only.
