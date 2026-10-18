@@ -53,7 +53,7 @@ Integration acceptance covers: full publish cycle ×3 profiles; package intake; 
 
 ## Blockers / open
 
-1. **KB graph** not published — compose create/index still failing (`graph index failed with exit 2`); code_index ready. Evidence `/srv/ai-contour/backups/task12-kb2-*`.
+1. **KB graph** not published — indexer still gets empty `/data/1c-xml` (compose volume/workspace wiring under `/srv/ai2/compose/mcp_for_1c-kb`); code_index ready. Evidence `/srv/ai-contour/backups/task12-kb*`.
 2. Vendor provenance for `compose/mcp_for_1c` incomplete — see `VENDOR.md`.
 3. Live secrets stay on disk (gitignored); not in Git.
 4. First green night after timer enable — verify after `2026-10-19 01:30`.
