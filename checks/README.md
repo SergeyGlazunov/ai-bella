@@ -1,5 +1,7 @@
 # Stand gates and linux-first runbooks
 
+Контракт продукта — [../docs/superpowers/specs/2026-10-18-installable-contour-design.md](../docs/superpowers/specs/2026-10-18-installable-contour-design.md). Файлы ниже — процедуры живого стенда, не новая цель разработки.
+
 Процедуры на **живом** стенде перед переключением на `contour`.
 Cutover без PASS gates + drill бэкапа чат-слоя + явного разрешения — нельзя.
 

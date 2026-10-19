@@ -4,7 +4,7 @@
 
 **Оркестратор в комплекте есть; на живой стенд ADM-SAPHX-TECH не переключён**, пока не сделаны drill бэкапа чат-слоя и явное разрешение. Ночной sync на стенде пока PowerShell + задача `UBD Config Sync`.
 
-Для агента разработки: [AGENT.md](AGENT.md). Состояние и журнал: [DEVELOPMENT.md](DEVELOPMENT.md). Манифест состава: [release-manifest.json](release-manifest.json).
+Контракт продукта: [docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md). Для агента разработки: [AGENT.md](AGENT.md). Состояние и журнал: [DEVELOPMENT.md](DEVELOPMENT.md). Факты стенда: [STATUS.md](STATUS.md). Манифест состава: [release-manifest.json](release-manifest.json).
 
 Не копировать leftover с `C:\MCP`, `C:\ai-stack`, `C:\instructions-main-system_analytics`.
 

@@ -1,8 +1,10 @@
 # AI-Contour — для агента
 
-Источник правды по **текущему живому стенду** (PS/ai2 nightly, УБД-first) и общим запретам cutover. Состояние стенда/пакета и журнал решений — **[DEVELOPMENT.md](DEVELOPMENT.md)** (сначала его). Эксплуатация и установка для человека — **[USER.md](USER.md)**.
+Контракт продукта, вектор и алгоритм правки — **[docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md)**. Его читают до кода. Для новой работы он выше этого файла и `For Cursor/LINUX-FIRST-DESIGN.md`.
 
-Linux-first / трёхбазовый оркестратор `contour` (UBD + KB + `klon_opl`), операционный приоритет восстановления и правила ревью — **[For Cursor/LINUX-FIRST-DESIGN.md](For%20Cursor/LINUX-FIRST-DESIGN.md)** §1.1 и **[For Cursor/AGENT.md](For%20Cursor/AGENT.md)**. При расхождении с разделами ниже про «только УБД / fail-closed на всё чтение» для kit-работы следуй For Cursor-документам; этот файл описывает legacy-контракт стенда до cutover.
+Этот файл — источник правды по **текущему живому стенду** (PS/ai2 nightly, УБД-first) и общим запретам cutover. Состояние стенда/пакета и журнал решений — **[DEVELOPMENT.md](DEVELOPMENT.md)**. Эксплуатация и установка для человека — **[USER.md](USER.md)**.
+
+Linux-first / оркестратор `contour` — **[For Cursor/LINUX-FIRST-DESIGN.md](For%20Cursor/LINUX-FIRST-DESIGN.md)** §1.1 и **[For Cursor/AGENT.md](For%20Cursor/AGENT.md)**. Оба ниже контракта продукта. При расхождении разделов этого файла про «только УБД / fail-closed на всё чтение» с For Cursor для kit-работы следуй For Cursor; с контрактом продукта — контракту.
 
 Не называть код пакета внедрённым, пока он не переключён на стенде. Живой стенд не переключать без явного разрешения. История чата не нужна.
 

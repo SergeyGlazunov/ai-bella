@@ -3,7 +3,7 @@
 **Updated:** 2026-10-18  
 **Horizon:** linux-first / `contour` on stand (Task 12 cutover)  
 **Repo:** https://github.com/SergeyGlazunov/ai-bella  
-**Priority:** first green night on `ai-sync.timer` + finish KB graph publish
+**Priority:** first green night on `ai-sync.timer` (UBD + KB + klon)
 
 ## Active runtime (stand ADM-SAPHX-TECH)
 
@@ -12,9 +12,9 @@
 | Canon data | `/srv/ai2/{ubd,kb,klon_opl}/src` (contour sources: `/srv/ai-contour/sources/{ubd,kb,klon_opl}`) |
 | Chat | Open WebUI `:3000` (healthy); OmniRoute `:20128` |
 | MDD MCP | `:8080` (do not confuse with WebUI) |
-| УБД graph MCP | `:8001` (`ai2-mcp-metadata-graph`) |
+| УБД graph MCP | `:8101` (`ai2-mcp-metadata-graph` on `ai2-stack`; WebUI bearer = shared MCP secret) |
 | УБД code MCP | `:8011` (`ai2-bsl-indexer`) |
-| КБ graph / code | `:8201` / `:8211` |
+| КБ graph / code | `:8201` / `:8211` — **published** 2026-10-18 (graph FULL + open) |
 | OPL code | `:8311` (`ai2-bsl-klon-opl`) |
 | Orchestrator | **`ai-sync.timer` enabled** — next `01:30 Asia/Vladivostok` |
 
@@ -53,13 +53,17 @@ Integration acceptance covers: full publish cycle ×3 profiles; package intake; 
 
 ## Blockers / open
 
-1. **KB** temporarily `enabled: false` in `/etc/ai-contour/contour.yaml` — graph indexer still sees empty `/data/1c-xml`; re-enable after mount fix. Evidence `/srv/ai-contour/backups/task12-kb*`.
-2. Vendor provenance for `compose/mcp_for_1c` incomplete — see `VENDOR.md`.
-3. Live secrets stay on disk (gitignored); not in Git.
-4. First green night — verify after `2026-10-19 01:30` (see `/srv/ai-contour/backups/MORNING-CHECK.txt`).
+1. Vendor provenance for `compose/mcp_for_1c` incomplete — see `VENDOR.md`.
+2. Live secrets stay on disk (gitignored); not in Git.
+3. First green night — verify after `2026-10-19 01:30` (see `/srv/ai-contour/backups/MORNING-CHECK.txt`).
+
+## KB repair (2026-10-18)
+
+- Root cause: `docker compose create` has no `--no-deps`; job services extending `metadata-indexer` tried to recreate `ai2-neo4j-kb` → name conflict / empty mount path.
+- Fix: job overlay + KB/UBD overrides set `depends_on: !reset`; workspace mount smoke `OK True True`.
+- Evidence: `/srv/ai-contour/backups/task12-kb-pub-20261018T103942Z` — `kb` lifecycle ready (graph + code_index published); probes XML catalog + CommonModules BSL + code_index PASS.
 
 ## Next action
 
-1. After night: `journalctl -u ai-sync.service --since 01:00` + `contour status` (UBD+klon must stay published).
-2. Repair KB graph workspace mount, then set `kb.enabled: true`.
-3. Keep Windows `UBD Config Sync` **Disabled**; exporters package-only.
+1. After night: `journalctl -u ai-sync.service --since 01:00` + `contour status` (UBD+KB+klon published).
+2. Keep Windows `UBD Config Sync` **Disabled**; exporters package-only.

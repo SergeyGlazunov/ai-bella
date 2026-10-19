@@ -4,6 +4,7 @@
 
 | Документ | Содержание |
 |----------|------------|
+| [docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md) | Контракт продукта: что ставим, вектор, алгоритм правки |
 | [STATUS.md](STATUS.md) | Текущий runtime, блокеры, следующий шаг |
 | [ROADMAP.md](ROADMAP.md) | PS/ai2 stable → linux-first / contour |
 | [VENDOR.md](VENDOR.md) | Vendor trees и неизвестные upstream pin |
@@ -31,4 +32,4 @@ C:\AI-contour\
   logs/ workdir/ secrets/   локальный мусор стенда (gitignore)
 ```
 
-Оркестратор в комплекте есть; на живой стенд не переключён без явного разрешения.
+Контракт продукта — [устанавливаемый контур](docs/superpowers/specs/2026-10-18-installable-contour-design.md). Факты стенда — [STATUS.md](STATUS.md). Живой стенд не переустанавливать без явного разрешения.

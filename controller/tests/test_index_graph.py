@@ -178,7 +178,9 @@ def _job_override_path(cmd: list[str]) -> str:
 
 
 def _override_container_name(cmd: list[str]) -> str | None:
-    data = yaml.safe_load(Path(_job_override_path(cmd)).read_text(encoding="utf-8")) or {}
+    # Compose merge tags (!reset) are not plain YAML; neutralize for asserts.
+    raw = Path(_job_override_path(cmd)).read_text(encoding="utf-8")
+    data = yaml.safe_load(raw.replace("!reset", "null")) or {}
     names = [
         spec.get("container_name")
         for spec in (data.get("services") or {}).values()

@@ -38,8 +38,10 @@ services:
       - ENABLE_WATCH_TOOLS=0
       - NEO4J_HTTP_TIMEOUT_SEC=${NEO4J_HTTP_TIMEOUT_SEC:-90}
       - NEO4J_PROBE_TIMEOUT_SEC=${NEO4J_PROBE_TIMEOUT_SEC:-45}
+    # Open WebUI (ai2-stack) resolves ai2-mcp-metadata-graph by DNS.
     networks:
       - default
+      - ai2-stack
     restart: unless-stopped
 
   neo4j:
@@ -59,4 +61,14 @@ services:
     restart: unless-stopped
 
   metadata-indexer:
+    # Job create inherits this; reset so live Neo4j container_name is not recreated.
+    depends_on: !reset
     restart: "no"
+
+networks:
+  default:
+    name: ai2-mcp_net
+    external: true
+  ai2-stack:
+    name: ai2-stack
+    external: true
