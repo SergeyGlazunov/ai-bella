@@ -135,6 +135,8 @@ def build_create_cmd(
     *,
     files: list[str] | None = None,
 ) -> list[str]:
+    # compose create has no --no-deps; job overlays must reset depends_on
+    # so live Neo4j/MCP container_name values are not recreated.
     return [
         "docker",
         "compose",

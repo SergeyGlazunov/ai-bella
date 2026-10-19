@@ -41,7 +41,7 @@ def test_build_create_cmd_excludes_rm():
         ["--rm", "--no-deps", "--entrypoint", "python", "metadata-indexer", "/app/apply_changes.py"],
     )
     assert "--rm" not in cmd
-    assert "--no-deps" not in cmd
+    assert "--no-deps" not in cmd  # create has no --no-deps; overlays reset depends_on
     assert "--entrypoint" not in cmd
     assert "/app/apply_changes.py" not in cmd
     assert "metadata-indexer" in cmd

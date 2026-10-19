@@ -1,6 +1,6 @@
 # ROADMAP
 
-Two horizons. Do not start stand cutover to `contour` until the short horizon is green.
+Продукт дальше — [docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md). Горизонты A и B ниже — пройденный путь к оркестратору, не список следующей работы. Факты стенда — [STATUS.md](STATUS.md).
 
 ## Horizon A — PS/ai2 stable (current)
 

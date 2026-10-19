@@ -266,6 +266,9 @@ def _build_override(
         f"      file: {json.dumps(base_file)}\n"
         f"      service: {base_service}\n"
         f"    container_name: {container_name}\n"
+        # create has no --no-deps; clear inherited neo4j depends_on so
+        # fixed container_name deps (ai2-neo4j-kb) are not recreated.
+        "    depends_on: !reset\n"
         f"{extra}"
     )
 
