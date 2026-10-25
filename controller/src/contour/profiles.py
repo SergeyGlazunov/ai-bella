@@ -106,7 +106,7 @@ def run_graph_layer(
     runs on every observation chunk while the writer runs.
     """
     _ensure_run_revision(conn, run_id, database.name, revision)
-    writer_container = index_graph(
+    index_graph(
         database,
         conn,
         run_id,
@@ -121,7 +121,16 @@ def run_graph_layer(
     storage_id = dockerutil.volume_identity(
         database.storage.graph_volume, runner=runner
     )
-    indexer_version = dockerutil.image_id(writer_container, runner=runner)
+    # Identity-gate symmetry (2026-10-26 stand incident): the recovery gate
+    # (_live_layer_identities) compares this layer's image against the
+    # SERVING graph MCP container. Recording the writer job image made the
+    # gate mismatch forever once the MCP image was rebuilt: every night was
+    # "changed" → PublishedRecoveryProvider → git fetch never ran and the
+    # source stayed frozen behind green runs. Record the MCP image so that
+    # "recorded" and "live" identities come from the same object.
+    indexer_version = dockerutil.image_id(
+        database.services.graph_mcp, runner=runner
+    )
     return LayerResult(
         layer="graph",
         revision=revision,

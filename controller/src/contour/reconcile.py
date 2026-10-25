@@ -334,6 +334,40 @@ def _published_needs_recovery(
     return status in {"not_ready", "changed"}
 
 
+def _recovery_source_note(
+    database: DatabaseConfig,
+    published_revision: str,
+    git=None,
+) -> str:
+    """Alert text for a git-source database that updates from recovery.
+
+    Recovery republishes the local tree and never fetches upstream. Without
+    this note an upstream that moved ahead stays invisible behind green
+    "published" runs (2026-10-26 incident: UBD frozen on a 10-day-old
+    revision for eight green nights). Best-effort: the upstream check must
+    never break the recovery run itself — a failed fetch degrades to a
+    shorter note.
+    """
+    git = git if git is not None else _GitutilOps()
+    source = database.source
+    prefix = f"{database.name}: recovery from published {published_revision[:12]}; "
+    if not isinstance(source, GitSourceConfig):
+        return prefix + "source check skipped (not a git source)"
+    try:
+        git.fetch(Path(source.path))
+        origin_rev = git.rev_parse(
+            Path(source.path), f"origin/{source.branch}"
+        )
+    except Exception as exc:  # noqa: BLE001 — visibility only, never fatal
+        return prefix + f"source check skipped (fetch failed: {type(exc).__name__})"
+    if origin_rev == published_revision:
+        return prefix + f"upstream {source.branch} unchanged"
+    return (
+        prefix
+        + f"upstream {source.branch} is ahead: {origin_rev[:12]} != published"
+    )
+
+
 def _docker_for_database(database: DatabaseConfig, base_docker):
     """Wrap ``base_docker`` with this database's idle_probe when configured."""
     adapters = getattr(database, "adapters", None)
@@ -568,7 +602,23 @@ def _default_v2_database_runner(
     else:
         if _published_needs_recovery(database, conn, state, docker):
             published = published_path_for(database)
-            if published.is_dir() and read_revision(published):
+            published_revision = (
+                read_revision(published) if published.is_dir() else None
+            )
+            if published_revision:
+                if (
+                    send is not None
+                    and isinstance(database.source, GitSourceConfig)
+                ):
+                    # Fix 3 (2026-10-26): recovery never fetches upstream;
+                    # make that visible instead of hiding behind green runs.
+                    _safe_send(
+                        send,
+                        cfg,
+                        _recovery_source_note(
+                            database, published_revision
+                        ),
+                    )
                 provider = build_source_provider(database, cfg, recovery=True)
             else:
                 provider = build_source_provider(database, cfg)
