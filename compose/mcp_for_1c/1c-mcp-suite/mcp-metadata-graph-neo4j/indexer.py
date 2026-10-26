@@ -25,7 +25,8 @@ Env:
   METADATA_FORCE_REINDEX    false                игнорировать ОБА fingerprint'а
   METADATA_FORCE_XML        false                форс только фазы 1 (CFG-3)
   METADATA_FORCE_BSL        false                форс только фазы 2 (CFG-3)
-  METADATA_FINGERPRINT_STRICT false              fingerprint по содержимому (PERF-3)
+  METADATA_FINGERPRINT_STRICT false              форс fingerprint по содержимому
+  METADATA_FINGERPRINT_STAT   false              opt-out: stat-режим (легаси, mtime)
   METADATA_CONFIG_NAME      Конфигурация        имя для узла :Configuration
   METADATA_SKIP_BSL         false                пропустить фазу 2 (R&D-режим)
   METADATA_BSL_LOG_LEVEL    (наследует)          отдельный log level для BSL-фазы
@@ -343,6 +344,10 @@ def main() -> int:
     force_xml = force_all or _env_bool("METADATA_FORCE_XML", False)
     force_bsl = force_all or _env_bool("METADATA_FORCE_BSL", False)
     strict_fp = _env_bool("METADATA_FINGERPRINT_STRICT", False)
+    stat_fp = _env_bool("METADATA_FINGERPRINT_STAT", False)
+    # content — дефолт (PERF-3, 2026-10-26): mtime ломается на рестейджинге.
+    # Явные env лишь выбирают режим поверх дефолта.
+    fp_strict: bool | None = True if strict_fp else (False if stat_fp else None)
     skip_bsl  = _env_bool("METADATA_SKIP_BSL", False)
     cfg_name  = os.environ.get("METADATA_CONFIG_NAME", "Конфигурация")
     bsl_log_level = os.environ.get("METADATA_BSL_LOG_LEVEL", "").strip().upper()
@@ -358,7 +363,8 @@ def main() -> int:
     log.info("Neo4j:           %s", neo4j_url)
     log.info("METADATA_FORCE_REINDEX: %s (XML: %s, BSL: %s)",
              force_all, force_xml, force_bsl)
-    log.info("METADATA_FINGERPRINT_STRICT: %s", strict_fp)
+    log.info("METADATA_FINGERPRINT_STRICT: %s (STAT: %s; default=content)",
+             strict_fp, stat_fp)
     # Имя переменной в подписи полное: короткое `SKIP_BSL` в логе
     # провоцировало передавать `-e SKIP_BSL=true`, что не работает —
     # проверено на боевом прогоне, где фаза 2 запустилась вопреки намерению.
@@ -383,7 +389,7 @@ def main() -> int:
     # ─ Считаем оба fingerprint'а за один обход дерева (PERF-3) ──────
     log.info("Считаем fingerprint workspace…")
     digests, fp_meta = fingerprint_workspace_multi(
-        src_dir, (".xml", ".bsl"), strict=strict_fp,
+        src_dir, (".xml", ".bsl"), strict=fp_strict,
     )
     fp_mode = fp_meta["mode"]
     fp_xml_new = digests[".xml"]

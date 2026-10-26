@@ -39,6 +39,26 @@
 
 ---
 
+### 2026-10-26 — Graph-fingerprint: контент вместо mtime (P2-1: ночная FULL на неизменных данных)
+
+**Задача.** Убрать еженощную полную пересборку графа УБД (~3 ч Neo4j) при неизменном источнике: graph-этап каждую ночь падал exit 3 «изменились корневые файлы конфигурации» → graph_full.
+
+**Причина.** Отпечатки в `partial_fingerprint.scan_workspace` и `graph_writer.fingerprint_workspace_multi` строились из кортежа (путь, размер, **st_mtime_ns**) — содержимое не читалось вовсе. Оркестратор перестейджирует дерево каждую ночь (git clone --no-hardlinks / копирование published): байты те же, mtime у всех файлов новые → `_root` всегда «изменён» → FULL. Воспроизведено замером на стенде: published и staged (байт-в-байт) дали разные digest `_root` (`efb0bd61` vs `71afcd9b`) — разница только в mtime. Дефолт stat был обоснован легаси-условиями (дерево на месте + windows bind-mount, 26 мс/файл → 12 мин чтения), в contour-пайплайне предпосылка неверна структурно. Отягчающее: `scan_workspace` не имел контентного режима вообще — `METADATA_FINGERPRINT_STRICT=true` не чинил частичный путь (apply_changes в strict даже отказывался обновлять глобальные ключи).
+
+**Решение.** Content-режим (sha256 содержимого) — умолчание в обоих модулях; stat — opt-out через `METADATA_FINGERPRINT_STAT=true` для легаси. `scan_workspace(strict=None|True|False)` зеркалит `fingerprint_workspace_multi`; режим пишется в `meta["mode"]`; apply_changes передаёт единый режим в скан и всегда обновляет глобальные ключи (metadata_xml/bsl_source) с честной меткой режима; смена режима на сохранённом состоянии даёт одну полную пересборку (несравнимые значения — индексер пишет об этом в лог, режим в `:Fingerprint.mode`). Обёртки fingerprint_workspace/files — strict=None. Цена: чтение ~1,2 ГБ за скан — десятки секунд на ext4.
+
+**Отвергнуто.** Сохранение/нормализация mtime при стейджинге (git clone mtime не сохраняет; любой touch извне снова даёт ложный FULL); индексация из published вместо staged (меняет контракт пайплайна).
+
+**Изменено.** `compose/mcp_for_1c/1c-mcp-suite/mcp-metadata-graph-neo4j/`: partial_fingerprint.py (режимы+sha256+meta.mode), graph_writer.py (дефолт content, резолвер, обёртки), apply_changes.py (единый режим, запись глобальных ключей), indexer.py (env-резолв, лог, таблица env), tests_partial_fingerprint.py (3 новых), tests_fingerprint.py (дефолт content, stat opt-out, stat-тесты на strict=False), docker-compose.yml + .env.example (METADATA_FINGERPRINT_STAT), этот журнал.
+
+**Проверено.** TDD: RED зафиксирован (touch-only менял digest; mode='stat' != 'content'), затем GREEN. Сюит метаданных на хосте: partial_fingerprint, fingerprint, graph_writer (4 skip — Neo4j), incremental (2 skip), indexer_phases — OK; полный список в коммит-сообщении. На стенде не развёрнуто: после мержа — синхронизация /srv-копии сюита и пересборка job-образа (иначе ночи продолжат идти на stat-коде).
+
+**Откат.** `git revert` коммита; либо на стенде `METADATA_FINGERPRINT_STAT=true` (без отката кода) возвращает stat-семантику ценой возврата P2-1.
+
+**Дальше.** PR → мерж → пересборка образа графа + /srv-синк → первая ночь: одна конверсионная FULL (смена режима), со второй ночи при неизменном источнике ожидаем «изменений нет» вместо graph-этапа. P2-2 (KB: «сохранённого состояния нет») чинится следующим — там состояние вообще не переживает ночь.
+
+---
+
 ### 2026-10-16 — Правки по ревью ветки nightly-hardening (P1/P2/P3)
 
 **Задача.** Закрыть три замечания ревью `refactor/nightly-hardening@4789d87`: P1 `jobs fail` снимал учёт writer без проверки его завершения; P2 `prune_run_history` удалял данные незавершённого восстановления; P3 duration-warn приходил только после завершения pipeline.
