@@ -264,25 +264,41 @@ def ensure_schema(neo: Neo4j) -> None:
 
 # PERF-3. Два режима подсчёта fingerprint'а.
 #
-#   FP_MODE_STAT    — по кортежу (путь, размер, mtime_ns). Режим по умолчанию.
-#   FP_MODE_CONTENT — по sha256 содержимого. Прежнее поведение, включается
-#                     флагом METADATA_FINGERPRINT_STRICT=true.
+#   FP_MODE_CONTENT — по sha256 содержимого. Режим по умолчанию с 2026-10-26.
+#   FP_MODE_STAT    — по кортежу (путь, размер, mtime_ns). Opt-out через
+#                     METADATA_FINGERPRINT_STAT=true для легаси «дерево
+#                     лежит на месте». METADATA_FINGERPRINT_STRICT=true
+#                     форсирует content (до 2026-10-26 был включателем).
 #
-# Почему сменился умолчательный режим. На боевой выгрузке 56 410 файлов и
-# 1,2 ГБ, и честная сумма по содержимому считалась 12 минут ПРИ КАЖДОМ
-# запуске индексера — включая запуски, где не менялось ничего. Узкое место
-# не в самом хешировании, а в файловых операциях: около 26 мс на файл на
-# виндовом bind-mount. Открывать и читать гигабайт ради ответа на вопрос
-# «изменилось ли хоть что-нибудь» — избыточно: (размер, mtime) отвечает на
-# него столь же надёжно в 99% случаев и стоит одного stat на файл.
+# Почему дефолт сменился на content. Прежняя логика «(размер, mtime) отвечает
+# не хуже в 99% случаев и стоит одного stat» предполагала, что дерево выгрузки
+# лежит на месте и mtime меняется только реальной выгрузкой 1С. Оркестратор
+# contour перестейджирует дерево каждую ночь (git clone --no-hardlinks или
+# копирование): байты те же, mtime у всех файлов новые — stat-режим видел
+# «изменились корневые файлы» и запускал FULL ~3 ч на неизменных данных
+# (инцидент стенда 2026-10-18..26). Чтение ~1,2 ГБ на ext4 стоит десятки
+# секунд — прежние 12 минут были платой именно windows bind-mount
+# (~26 мс на файл), а не самого хеширования.
 #
-# Оставшийся 1% — копирование выгрузки утилитой, сохраняющей mtime, при
-# котором содержимое отличается, а размер совпал. Ровно для него и оставлен
-# строгий режим. Способ подсчёта пишется в лог и в свойство `mode` узла
-# :Fingerprint, чтобы «почему не переиндексировалось» имело ответ в логе, а
-# не в чьей-то памяти.
+# Способ подсчёта пишется в лог и в свойство `mode` узла :Fingerprint,
+# чтобы «почему не переиндексировалось» имело ответ в логе, а не в чьей-то
+# памяти. При смене режима на уже сохранённом состоянии первый прогон честно
+# увидит расхождение и сделает одну полную пересборку.
 FP_MODE_STAT = "stat"
 FP_MODE_CONTENT = "content"
+
+_STAT_TRUTHY = ("1", "true", "yes", "y", "on")
+
+
+def _fp_strict_from_env(strict) -> bool:
+    """Свести (strict, env) в флаг content-режима. См. partial_fingerprint."""
+    if strict is not None:
+        return bool(strict)
+    if os.environ.get("METADATA_FINGERPRINT_STRICT", "").strip().lower() in (
+            "1", "true", "yes", "y", "on"):
+        return True
+    env = os.environ.get("METADATA_FINGERPRINT_STAT", "")
+    return env.strip().lower() not in _STAT_TRUTHY
 
 
 def _sha256_file(p: Path, chunk: int = 65536) -> str:
@@ -333,7 +349,7 @@ def _iter_files(root: Path):
 def fingerprint_workspace_multi(
     root: Path,
     suffixes: Iterable[str] = (".xml", ".bsl"),
-    strict: bool = False,
+    strict: bool | None = None,
 ) -> tuple[dict[str, str], dict]:
     """
     Считает fingerprint'ы сразу по нескольким расширениям за ОДИН обход дерева.
@@ -341,6 +357,9 @@ def fingerprint_workspace_multi(
     Раньше индексер вызывал `fingerprint_workspace_files` дважды — по .xml и
     по .bsl, — то есть дважды обходил те же 56 тысяч файлов. Здесь обход
     один, файлы раскладываются по расширениям на лету.
+
+    `strict=None` (дефолт) — content-режим, stat — opt-out через
+    METADATA_FINGERPRINT_STAT (см. PERF-3 выше).
 
     Возвращает `({suffix: hexdigest}, meta)`, где meta содержит:
       mode          — FP_MODE_STAT | FP_MODE_CONTENT
@@ -352,6 +371,7 @@ def fingerprint_workspace_multi(
                       случая «скопировали выгрузку, mtime у всех одинаковый»)
     """
     t0 = time.monotonic()
+    content_mode = _fp_strict_from_env(strict)
     norm = [(s if s.startswith(".") else "." + s).lower() for s in suffixes]
     items: dict[str, list[str]] = {s: [] for s in norm}
     total_bytes = 0
@@ -367,7 +387,7 @@ def fingerprint_workspace_multi(
                     continue
                 total_bytes += st.st_size
                 newest_mtime = max(newest_mtime, st.st_mtime)
-                if strict:
+                if content_mode:
                     items[suf].append(f"{rel}\t{_sha256_file(Path(entry.path))}")
                 else:
                     # st_mtime_ns, а не st_mtime: float-секунды на некоторых
@@ -376,7 +396,7 @@ def fingerprint_workspace_multi(
                     items[suf].append(f"{rel}\t{st.st_size}\t{st.st_mtime_ns}")
                 break
 
-    mode = FP_MODE_CONTENT if strict else FP_MODE_STAT
+    mode = FP_MODE_CONTENT if content_mode else FP_MODE_STAT
     digests = {}
     for suf, lines in items.items():
         lines.sort()
@@ -394,19 +414,20 @@ def fingerprint_workspace_multi(
     return digests, meta
 
 
-def fingerprint_workspace_files(root: Path, suffix: str, strict: bool = False) -> str:
+def fingerprint_workspace_files(root: Path, suffix: str,
+                                strict: bool | None = None) -> str:
     """
     Fingerprint по одному расширению. Обёртка над `fingerprint_workspace_multi`.
 
-    Сигнатура сохранена ради существующих вызовов; `strict=True` возвращает
-    прежнее поведение (sha256 по содержимому).
+    Сигнатура сохранена ради существующих вызовов; `strict=None` — режим по
+    умолчанию (content, см. PERF-3), `False` — stat, `True` — content явно.
     """
     digests, _ = fingerprint_workspace_multi(root, [suffix], strict=strict)
     key = suffix if suffix.startswith(".") else "." + suffix
     return digests[key.lower()]
 
 
-def fingerprint_workspace(root: Path, strict: bool = False) -> str:
+def fingerprint_workspace(root: Path, strict: bool | None = None) -> str:
     """Backward-compat: fingerprint по всем XML. См. fingerprint_workspace_files."""
     return fingerprint_workspace_files(root, ".xml", strict=strict)
 

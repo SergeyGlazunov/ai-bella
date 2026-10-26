@@ -91,8 +91,9 @@ class PhaseCase(unittest.TestCase):
         for name in ("Neo4j", "run_xml_phase", "run_bsl_phase",
                      "fingerprint_write", "fingerprint_workspace_multi",
                      "fingerprint_get_meta", "fingerprint_matches",
-                     "check_ownership", "relations_snapshot_write"):
-            self.saved[name] = getattr(indexer, name)
+                     "check_ownership", "relations_snapshot_write",
+                     "scan_workspace", "write_stored"):
+            self.saved[name] = getattr(indexer, name, None)
 
         indexer.Neo4j = FakeNeo
         indexer.run_xml_phase = self._xml_phase
@@ -122,7 +123,8 @@ class PhaseCase(unittest.TestCase):
 
     def tearDown(self):
         for name, value in self.saved.items():
-            setattr(indexer, name, value)
+            if value is not None:
+                setattr(indexer, name, value)
         os.environ.pop("METADATA_SRC_DIR", None)
         for var in ("METADATA_FORCE_XML", "METADATA_FORCE_BSL",
                     "METADATA_SKIP_BSL", "METADATA_FORCE_REINDEX"):
@@ -237,6 +239,67 @@ class TestFingerprintOrder(PhaseCase):
         """PERF-12: снимок счётчиков рёбер обновляется в конце прогона."""
         self.run_main()
         self.assertIn("relations_snapshot", self.events)
+
+
+class TestPartialStateSeeded(PhaseCase):
+    """
+    P2-2 (2026-10-26). Полный прогон обязан сохранять частичные отпечатки
+    (partial_owners_*). Их писал только частичный путь (apply_changes), поэтому
+    база после FULL навечно теряла инкрементальность: «сохранённого состояния
+    нет» каждую ночь → снова FULL. KB на стенде жил в этой петле с 18.10; UBD
+    спасалась разовым ручным сеедом cutover-скрипта.
+    """
+
+    def _patch_partial(self, calls):
+        def fake_scan(root, **kw):
+            calls["scan_kwargs"] = kw
+            return ({"Catalog.К": "h1", "_root": "h0"},
+                    {"mode": "content", "owners": 2, "files": 3})
+
+        def fake_write(neo, digests, chunk_size=5000):
+            calls["written"] = dict(digests)
+            return {"written": len(digests), "chunks": 1}
+
+        indexer.scan_workspace = fake_scan
+        indexer.write_stored = fake_write
+
+    def test_healthy_no_work_run_still_seeds_partial_state(self):
+        """
+        Лечащий случай: граф свеж, работы нет, но частичного состояния нет
+        (его снесли/никто не сеял). Прогон без работы обязан его создать —
+        ровно так KB выходит из вечной петли «первая индексация».
+        """
+        calls = {}
+        self._patch_partial(calls)
+        rc = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls.get("written"),
+                         {"Catalog.К": "h1", "_root": "h0"})
+        # Режим скана — тот же, что у индексера (content по умолчанию).
+        self.assertIsNone(calls["scan_kwargs"].get("strict"))
+
+    def test_full_reindex_run_seeds_partial_state(self):
+        calls = {}
+        self._patch_partial(calls)
+        self.xml_same = False
+        self.bsl_same = False
+        rc = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertIn("phase1", self.events)
+        self.assertIn("phase2", self.events)
+        self.assertEqual(calls.get("written"),
+                         {"Catalog.К": "h1", "_root": "h0"})
+
+    def test_failed_phase2_leaves_no_partial_state(self):
+        """Сорванный прогон не должен сеять состояние «успешной» nights:
+        частичный путь увидел бы его и пропустил работу над битым графом."""
+        calls = {}
+        self._patch_partial(calls)
+        self.xml_same = False
+        self.bsl_rc = 1
+        rc = self.run_main()
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("written", calls)
 
 
 class TestSkipBslLeavesNoLandmine(PhaseCase):

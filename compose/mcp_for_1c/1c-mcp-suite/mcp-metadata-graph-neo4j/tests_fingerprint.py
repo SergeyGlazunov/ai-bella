@@ -131,8 +131,15 @@ class TestFingerprintModes(unittest.TestCase):
 
     # ─ Базовое поведение ─
 
-    def test_stat_mode_is_default(self):
+    def test_content_mode_is_default(self):
+        """Дефолт — по содержимому: mtime ненадёжен там, где дерево
+        перестейдживается (git clone / копия) — contour делает это каждую
+        ночь. Stat-режим остаётся opt-out для легаси «дерево на месте»."""
         _, meta = fingerprint_workspace_multi(self.root)
+        self.assertEqual(meta["mode"], FP_MODE_CONTENT)
+
+    def test_stat_mode_opt_out(self):
+        _, meta = fingerprint_workspace_multi(self.root, strict=False)
         self.assertEqual(meta["mode"], FP_MODE_STAT)
 
     def test_strict_mode_reports_content(self):
@@ -221,14 +228,14 @@ class TestFingerprintModes(unittest.TestCase):
         """
         p = self.root / "CommonModules/Общий/Ext/Module.bsl"
         st = os.stat(p)
-        stat_before, _ = fingerprint_workspace_multi(self.root)
+        stat_before, _ = fingerprint_workspace_multi(self.root, strict=False)
         strict_before, _ = fingerprint_workspace_multi(self.root, strict=True)
 
         text = p.read_text(encoding="utf-8")
         p.write_text(text.replace("1", "9"), encoding="utf-8")
         os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
 
-        stat_after, _ = fingerprint_workspace_multi(self.root)
+        stat_after, _ = fingerprint_workspace_multi(self.root, strict=False)
         strict_after, _ = fingerprint_workspace_multi(self.root, strict=True)
 
         self.assertEqual(stat_before[".bsl"], stat_after[".bsl"],

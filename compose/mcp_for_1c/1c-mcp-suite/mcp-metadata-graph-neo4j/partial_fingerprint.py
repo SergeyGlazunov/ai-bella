@@ -55,6 +55,45 @@ log = logging.getLogger(__name__)
 # сигнал «частичным обновлением не обойтись».
 ROOT_KEY = "_root"
 
+# ─── Режимы отпечатка (PERF-3; двойник в graph_writer — форматы строк
+#     обязаны совпадать, это контролирует test_matches_indexer_exactly) ───
+#
+# FP_MODE_CONTENT — по sha256 содержимого. Дефолт с 2026-10-26: mtime
+#                   ненадёжен там, где дерево перестейджируется (git clone
+#                   --no-hardlinks / копирование) — contour делает это
+#                   каждую ночь, и stat-режим превращался в «изменились
+#                   корневые файлы» → FULL ~3 ч на неизменных данных.
+# FP_MODE_STAT    — по (путь, размер, mtime_ns). Opt-out для легаси
+#                   «дерево лежит на месте» + windows bind-mount, где
+#                   чтение гигабайта стоило 12 минут.
+FP_MODE_STAT = "stat"
+FP_MODE_CONTENT = "content"
+
+_STAT_TRUTHY = ("1", "true", "yes", "y", "on")
+
+
+def _fp_strict_from_env(strict: Optional[bool]) -> bool:
+    """Свести (strict, env) в один флаг: True=content, False=stat.
+
+    None → контент по умолчанию, stat только при METADATA_FINGERPRINT_STAT.
+    Явный strict форсирует режим поверх env — как в graph_writer.
+    """
+    if strict is not None:
+        return bool(strict)
+    env = os.environ.get("METADATA_FINGERPRINT_STAT", "")
+    return env.strip().lower() not in _STAT_TRUTHY
+
+
+def _sha256_file(p, chunk: int = 65536) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
 
 def owner_of(rel_path: str) -> Optional[str]:
     """
@@ -135,12 +174,15 @@ def is_upsertable(rel_path: str) -> bool:
     return len(parts) == 2 and parts[0] in KIND_BY_DIR
 
 
-def scan_workspace(root: Path, keep_files: bool = False) -> tuple[dict[str, str], dict]:
+def scan_workspace(root: Path, keep_files: bool = False,
+                   strict: Optional[bool] = None
+                   ) -> tuple[dict[str, str], dict]:
     """
     Один обход дерева → отпечаток на каждого владельца.
 
-    Возвращает `({owner_id: sha256}, meta)`. Стоимость — ровно один `stat`
-    на файл, как у обычного fingerprint: обход общий, а не дополнительный.
+    Возвращает `({owner_id: sha256}, meta)`. `strict`/env задают режим
+    (content/stat, см. FP_MODE_*): по умолчанию content — stat-кортеж с
+    mtime ломается на рестейджинге дерева (clone/копия каждую ночь).
 
     `keep_files=True` дополнительно кладёт в meta раскладку
     `{owner_id: [relpath, …]}`. Нужна применению плана: чтобы обновить
@@ -149,6 +191,8 @@ def scan_workspace(root: Path, keep_files: bool = False) -> tuple[dict[str, str]
     несопоставимо дешевле.
     """
     t0 = time.monotonic()
+    content_mode = _fp_strict_from_env(strict)
+    mode = FP_MODE_CONTENT if content_mode else FP_MODE_STAT
     per_owner: dict[str, list[str]] = {}
     # PERF-8b. Заодно копим строки для ОБЩЕГО fingerprint'а по расширениям —
     # того самого, на который смотрит indexer.py.
@@ -194,7 +238,16 @@ def scan_workspace(root: Path, keep_files: bool = False) -> tuple[dict[str, str]
             except OSError:
                 continue
 
-            line = f"{rel}\t{st.st_size}\t{st.st_mtime_ns}"
+            if content_mode:
+                try:
+                    token = _sha256_file(entry.path)
+                except OSError:
+                    continue
+                line = f"{rel}\t{token}"
+            else:
+                # st_mtime_ns, а не st_mtime: float-секунды на некоторых
+                # файловых системах теряют наносекунды.
+                line = f"{rel}\t{st.st_size}\t{st.st_mtime_ns}"
             global_lines[suffix].append(line)
 
             if owner is None:
@@ -217,6 +270,7 @@ def scan_workspace(root: Path, keep_files: bool = False) -> tuple[dict[str, str]
             "\n".join(lines).encode("utf-8")).hexdigest()
 
     meta = {
+        "mode":        mode,
         "owners":      len(digests),
         "files":       files,
         "skipped":     skipped,
