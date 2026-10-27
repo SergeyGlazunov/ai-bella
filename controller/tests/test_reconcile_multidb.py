@@ -45,6 +45,9 @@ def _v2_config(tmp_path: Path, *, disable: frozenset[str] = frozenset()) -> obje
     raw["runtime"]["lock_path"] = str(tmp_path / "sync.lock")
     raw["runtime"]["logs_path"] = str(tmp_path / "logs")
     raw["runtime"]["backups_path"] = str(tmp_path / "backups")
+    # Hermetic: host disk fill must not fail reconcile wiring tests that hit
+    # the real database runner (default threshold is 5 GiB; must be > 0).
+    raw["runtime"]["min_free_gb"] = 0.000001
     for name in disable:
         raw["databases"][name]["enabled"] = False
     # Point UBD git at a temp path so accidental real work cannot hit live repos.

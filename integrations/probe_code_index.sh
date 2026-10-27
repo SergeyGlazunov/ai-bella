@@ -2,6 +2,12 @@
 # Content probe for BSL code-index (R02 / F02).
 # Usage: probe_code_index.sh present|absent <rel-path>
 # Exit 0 confirmed; 1 wrong presence; 2 control / uncertain (never "absent success").
+#
+# 2026-10-28: queries a THROWAWAY container mounting the daemon's /repos/SRC
+# bind source. The daemon container's bind pins the inode from its start;
+# after activation rotates the published dir, exec-ing the daemon would
+# probe the pre-rotation tree (added files invisible → false verify
+# failures). A fresh container resolves the current directory entry.
 set -eu
 
 MODE="${1:?mode present|absent}"
@@ -12,8 +18,19 @@ SRC="${BSL_SRC_PATH:-/repos/SRC}"
 REL=$(printf '%s' "$REL" | tr '\\' '/')
 
 set +e
-out="$(docker exec -e CODE_INDEX_HOME=/data/code-index-home "$CONTAINER" \
-  bsl-indexer get-file-summary "$REL" --path "$SRC" 2>&1)"
+IMG=$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null)
+SRCBIND=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/repos/SRC"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+set -e
+if [ -z "$IMG" ] || [ -z "$SRCBIND" ]; then
+  echo "probe_code_index: cannot resolve bsl image/bind for $CONTAINER" >&2
+  exit 2
+fi
+
+set +e
+out="$(docker run --rm --network none \
+  -e CODE_INDEX_HOME=/tmp/probe-cih \
+  -v "$SRCBIND:/repos/SRC:ro" \
+  "$IMG" bsl-indexer get-file-summary "$REL" --path "$SRC" 2>&1)"
 rc=$?
 set -e
 

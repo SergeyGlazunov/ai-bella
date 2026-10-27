@@ -40,6 +40,8 @@ class FakeReadsDocker:
     calls: list[list[str]] = field(default_factory=list)
     conn: sqlite3.Connection | None = None
     meta_at_first_mutation: str | None = None
+    bsl_stopped: bool = False
+    bsl_started: bool = False
 
     def idle_probe(self) -> bool:
         self.probe_calls += 1
@@ -70,11 +72,18 @@ class FakeReadsDocker:
 
         if cmd[:2] == ["docker", "stop"] and len(cmd) >= 3:
             if cmd[2] == "bsl-indexer":
-                raise AssertionError("must not docker stop the BSL container")
+                # 2026-10-28 stale-bind fix: the daemon container now stops at
+                # code_index close so the /repos/SRC mount re-resolves after
+                # activation rotation. Track it instead of forbidding it.
+                self.bsl_stopped = True
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             self.graph_status = "exited"
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         if cmd[:2] == ["docker", "start"] and len(cmd) >= 3:
+            if cmd[2] == "bsl-indexer":
+                self.bsl_started = True
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             self.graph_status = "running"
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -133,6 +142,12 @@ class FakeReadsDocker:
 
         if "daemon" in cmd and "stop" in cmd:
             raise AssertionError("must not daemon stop")
+
+        if cmd[:2] == ["docker", "exec"] and "daemon" in cmd and "status" in cmd:
+            # _wait_bsl_daemon_ready readiness probe (stale-bind fix).
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='{"status": "running"}', stderr=""
+            )
 
         raise AssertionError(f"unexpected command: {cmd}")
 
@@ -391,6 +406,11 @@ class FlexibleReadsDocker:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=self.graph_status + "\n", stderr=""
             )
+        if cmd[:2] == ["docker", "exec"] and "daemon" in cmd and "status" in cmd:
+            # _wait_bsl_daemon_ready readiness probe (stale-bind fix).
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='{"status": "running"}', stderr=""
+            )
         if cmd and cmd[0] == "iptables":
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         raise AssertionError(cmd)
@@ -414,7 +434,13 @@ def test_opl_read_controller_never_touches_graph(tmp_path: Path):
     ctrl = DatabaseReadController(opl, conn, docker)
     ctrl.close()
     assert ctrl.is_closed() is True
-    assert not any(c[:2] == ["docker", "stop"] for c in docker.calls)
+    # OPL never touches the GRAPH container; stopping its own BSL daemon
+    # (stale-bind fix, 2026-10-28) is expected and must not count.
+    graph_container = opl.services.graph_mcp
+    assert not any(
+        c[:2] == ["docker", "stop"] and c[2] == graph_container
+        for c in docker.calls
+    )
     assert get_meta(
         conn, scoped_read_key("reads_closed", "klon_opl", "code_index")
     ) == "1"
@@ -510,3 +536,63 @@ def test_watcher_stays_paused_during_active_job(tmp_path: Path):
     with pytest.raises(RuntimeError, match="active writer"):
         ctrl.open_layer("code_index")
     assert "path = \"/repos/SRC\"" not in toml.read_text(encoding="utf-8")
+
+
+def test_close_code_index_stops_bsl_container_after_disconnect(tmp_path: Path):
+    """Stale-bind fix: the daemon container restarts while reads are closed."""
+    from contour.reads import DatabaseReadController
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    conn = _init_conn(tmp_path)
+    docker = FakeReadsDocker()
+    docker.idle_after = 1
+    ctrl = DatabaseReadController(ubd, conn, docker)
+    ctrl.close_layer("code_index")
+
+    assert docker.bsl_stopped is True
+    stop_idx = next(
+        i for i, c in enumerate(docker.calls) if c[:2] == ["docker", "stop"]
+    )
+    disc_idx = next(
+        i
+        for i, c in enumerate(docker.calls)
+        if c[:3] == ["docker", "network", "disconnect"]
+    )
+    assert disc_idx < stop_idx, "network must be disconnected before container stop"
+
+
+def test_open_code_index_starts_bsl_container_before_reconnect(tmp_path: Path):
+    from contour.reads import DatabaseReadController
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    conn = _init_conn(tmp_path)
+    docker = FakeReadsDocker()
+    docker.idle_after = 1
+    ctrl = DatabaseReadController(ubd, conn, docker)
+    ctrl.close_layer("code_index")
+    docker.calls.clear()
+    ctrl.open_layer("code_index")
+
+    assert docker.bsl_started is True
+    start_idx = next(
+        i for i, c in enumerate(docker.calls) if c[:2] == ["docker", "start"]
+    )
+    conn_idx = next(
+        i
+        for i, c in enumerate(docker.calls)
+        if c[:3] == ["docker", "network", "connect"]
+    )
+    assert start_idx < conn_idx, "container must start before network reconnect"
+    assert "path = \"/repos/SRC\"" in toml.read_text(encoding="utf-8")

@@ -245,8 +245,8 @@ def test_git_recovery_branch_alerts_and_skips_fetch_of_provider(
     )
 
     # The real build_source_provider would create the sources root; the
-    # monkeypatched fake does not — create the runtime root so the free
-    # space preflight (disk_usage) does not trip on a missing path.
+    # monkeypatched fake does not — create the runtime root so disk_usage
+    # has a path. min_free_gb=0 comes from _v2_config (hermetic vs host fill).
     Path(cfg.runtime.root).mkdir(parents=True, exist_ok=True)
 
     alerts: list[str] = []

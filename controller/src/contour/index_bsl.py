@@ -9,13 +9,22 @@ from contour.db import get_meta, set_meta
 from contour.dockerutil import (
     DockerRunner,
     SubprocessRunner,
-    create_exec,
-    start_exec,
-    wait_exec,
+    image_id,
+    wait,
 )
 
 CODE_INDEX_HOME = "/data/code-index-home"
+CODE_INDEX_HOME_THROWAWAY = "/tmp/contour-cih"
 SRC_PATH = "/repos/SRC"
+
+# 2026-10-28 stand incident: BSL stages ran via `docker exec` in the daemon
+# container whose /repos/SRC bind pins the inode captured at container start.
+# Activation rotates the published directory by rename, so the daemon (and
+# every exec into it) kept seeing the pre-rotation tree: added files never
+# reached the index and verify probes failed. Stages now run in throwaway
+# containers with a fresh mount. The marker below invalidates attempt records
+# written by the legacy exec runner so resume re-runs BSL stages once.
+_RUNNER_MARKER = "#bsl-runner-v2"
 
 
 def _runner(runner: DockerRunner | None) -> DockerRunner:
@@ -116,7 +125,7 @@ def _capture_live_identity(
     image = dockerutil.image_id(cfg.services.bsl_container, runner=docker)
     if not storage or not image:
         raise RuntimeError("cannot record BSL attempt identity from live storage")
-    return storage, image
+    return storage, image + _RUNNER_MARKER
 
 
 def _insert_exec_job(
@@ -153,19 +162,58 @@ def _mark_exec_running(conn: sqlite3.Connection, job_id: int) -> None:
 
 
 def _finish_exec_job(
-    conn: sqlite3.Connection, job_id: int, exit_code: int
+    conn: sqlite3.Connection, job_id: int, exit_code: int, log_path: str | None = None
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     status = "ok" if exit_code == 0 else "failed"
     conn.execute(
         """
         UPDATE jobs
-        SET exit_code = ?, status = ?, finished_at = ?
+        SET exit_code = ?, status = ?, finished_at = ?, log_path = ?
         WHERE id = ?
         """,
-        (exit_code, status, now, job_id),
+        (exit_code, status, now, log_path, job_id),
     )
     conn.commit()
+
+
+def _published_src_host_path(cfg) -> str:
+    """Host path of the published src tree (post-activation: the new tree)."""
+    from pathlib import Path
+
+    from contour.config import GitSourceConfig
+
+    from contour.sources import published_path_for
+
+    root = Path(published_path_for(cfg))
+    source = getattr(cfg, "source", None)
+    sub = ""
+    if isinstance(source, GitSourceConfig):
+        sub = source.workspace_subdir or ""
+    path = root / sub if sub else root
+    return str(path)
+
+
+def _capture_container_logs(
+    docker: DockerRunner, name: str, stage: str, logs_path: str | None
+) -> str | None:
+    """Best-effort copy of throwaway container output into the logs dir."""
+    if not logs_path:
+        return None
+    try:
+        result = docker.run(["docker", "logs", name])
+        text = (getattr(result, "stdout", "") or "") + (
+            getattr(result, "stderr", "") or ""
+        )
+        from pathlib import Path
+
+        directory = Path(logs_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"contour-bsl-{stage}-{name.split('-')[-1]}.log"
+        target.write_text(text, encoding="utf-8")
+        return str(target)
+    except Exception:
+        return None
 
 
 def _run_exec(
@@ -178,9 +226,34 @@ def _run_exec(
     *,
     observe_cap: float | None = None,
     on_observe=None,
+    logs_path: str | None = None,
+    container_runner: bool = False,
 ) -> None:
-    """Create exec → INSERT job → start → wait (R04: no race on ExecIDs)."""
+    """Dispatch a BSL stage.
+
+    ``container_runner=True`` (v2 staged pipeline): run in a throwaway
+    container mounting the CURRENT published tree — see
+    ``_run_stage_container`` for why exec-ing the daemon is wrong there.
+    ``container_runner=False`` (legacy in-place pipeline, no activation
+    rotation): keep the exec-based runner; the daemon's /repos/SRC bind
+    tracks the live tree because the published dir is never renamed.
+    """
+    if container_runner:
+        _run_stage_container(
+            cfg,
+            conn,
+            run_id,
+            stage,
+            args,
+            docker,
+            observe_cap=observe_cap,
+            on_observe=on_observe,
+            logs_path=logs_path,
+        )
+        return
     container = cfg.services.bsl_container
+    from contour.dockerutil import create_exec, start_exec, wait_exec
+
     env = [f"CODE_INDEX_HOME={CODE_INDEX_HOME}"]
     cmd = ["bsl-indexer", *args]
     exec_id = create_exec(container, cmd, env=env, runner=docker)
@@ -198,6 +271,70 @@ def _run_exec(
         on_observe=on_observe,
     )
     _finish_exec_job(conn, job_id, exit_code)
+    if exit_code != 0:
+        raise RuntimeError(f"{stage} failed with exit {exit_code}")
+
+
+def _run_stage_container(
+    cfg,
+    conn: sqlite3.Connection,
+    run_id: int,
+    stage: str,
+    args: list[str],
+    docker: DockerRunner,
+    *,
+    observe_cap: float | None = None,
+    on_observe=None,
+    logs_path: str | None = None,
+) -> None:
+    """Run a BSL stage in a throwaway container mounting the CURRENT tree.
+
+    The daemon container's ``/repos/SRC`` bind pins the inode captured when
+    the container started; activation rotates the published directory by
+    rename, so ``docker exec`` into the daemon keeps seeing the pre-rotation
+    tree (2026-10-28: added BusinessProcesses files never reached the index
+    and verify probes failed on runs 68/71). A fresh container resolves the
+    mount against the current directory entry, so every stage — and the
+    index it builds inside the tree — always sees the activated revision.
+    """
+    docker_runner = docker
+    image = image_id(cfg.services.bsl_container, runner=docker_runner)
+    src_host = _published_src_host_path(cfg)
+    name = f"contour-bsl-{stage}-{run_id}"
+    create_cmd = [
+        "docker",
+        "create",
+        "--name",
+        name,
+        "--network",
+        "none",
+        "-e",
+        f"CODE_INDEX_HOME={CODE_INDEX_HOME_THROWAWAY}",
+        "-v",
+        f"{src_host}:{SRC_PATH}",
+        image,
+        "bsl-indexer",
+        *args,
+    ]
+    docker_runner.run(create_cmd)
+    database = _database_for_run(cfg, conn, run_id)
+    job_id = _insert_exec_job(
+        conn, run_id, stage, name, name, database=database
+    )
+    docker_runner.run(["docker", "start", name])
+    _mark_exec_running(conn, job_id)
+    exit_code = wait(
+        name,
+        runner=docker_runner,
+        observe_cap=observe_cap,
+        on_observe=on_observe,
+    )
+    log_path = _capture_container_logs(docker_runner, name, stage, logs_path)
+    try:
+        docker_runner.run(["docker", "rm", "-f", name])
+    except Exception:
+        pass
+    _finish_exec_job(conn, job_id, exit_code, log_path)
     if exit_code != 0:
         raise RuntimeError(f"{stage} failed with exit {exit_code}")
 
@@ -304,6 +441,8 @@ def index_bsl(
     resume: bool | None = None,
     observe_cap: float | None = None,
     on_observe=None,
+    logs_path: str | None = None,
+    container_runner: bool = False,
 ) -> None:
     docker = _runner(runner)
     database = _database_for_run(cfg, conn, run_id)
@@ -339,7 +478,8 @@ def index_bsl(
             )
         _run_exec(
             cfg, conn, run_id, "bsl_index", ["index", "--path", SRC_PATH], docker,
-            observe_cap=observe_cap, on_observe=on_observe,
+            observe_cap=observe_cap, on_observe=on_observe, logs_path=logs_path,
+            container_runner=container_runner,
         )
     if may_write is not None:
         decision = may_write()
@@ -351,7 +491,8 @@ def index_bsl(
     if revision is None:
         _run_exec(
             cfg, conn, run_id, "bsl_clean", ["clean", "--path", SRC_PATH], docker,
-            observe_cap=observe_cap, on_observe=on_observe,
+            observe_cap=observe_cap, on_observe=on_observe, logs_path=logs_path,
+            container_runner=container_runner,
         )
     else:
         recorded = _read_bsl_attempt(conn, database)
@@ -368,4 +509,6 @@ def index_bsl(
                 docker,
                 observe_cap=observe_cap,
                 on_observe=on_observe,
+                logs_path=logs_path,
+                container_runner=container_runner,
             )

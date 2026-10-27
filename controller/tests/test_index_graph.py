@@ -118,6 +118,11 @@ class FakeDockerRunner:
             )
         if cmd[:2] == ["docker", "logs"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=self.log_text, stderr="")
+        if cmd[:2] == ["docker", "create"]:
+            # Throwaway BSL stage containers (stale-bind fix, 2026-10-28).
+            return subprocess.CompletedProcess(cmd, 0, stdout="created-id\n", stderr="")
+        if cmd[:2] == ["docker", "rm"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected docker command: {cmd}")
 
 

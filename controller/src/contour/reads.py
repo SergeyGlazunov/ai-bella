@@ -293,6 +293,12 @@ class DatabaseReadController:
                         services.bsl_container,
                     ]
                 )
+            # 2026-10-28 stale-bind fix: the daemon container's /repos/SRC
+            # bind pins the inode from container start; activation rotates
+            # the published dir by rename, so the daemon would keep serving
+            # (and rescanning) the pre-rotation tree. Restart it while reads
+            # are closed so the mount re-resolves to the current tree.
+            self.docker.run(["docker", "stop", services.bsl_container])
         else:
             raise ValueError(f"unknown layer: {layer}")
         if not self._layer_verify_closed(layer):
@@ -314,6 +320,8 @@ class DatabaseReadController:
                 raise RuntimeError(
                     f"refusing to restore watcher for {name}: active writer"
                 )
+            self.docker.run(["docker", "start", services.bsl_container])
+            self._wait_bsl_daemon_ready()
             if services.webui_network not in self._network_names():
                 self.docker.run(
                     [
@@ -423,6 +431,34 @@ class DatabaseReadController:
                 )
             except _FW_ERRORS:
                 return
+
+    def _wait_bsl_daemon_ready(self, *, attempts: int = 5, interval: float = 2.0) -> None:
+        """Bounded wait for the daemon inside the restarted container.
+
+        The watcher-restore exec below needs the daemon HTTP endpoint up;
+        ``docker start`` returns before the daemon finishes booting.
+        """
+        last_error: Exception | None = None
+        for _ in range(attempts):
+            try:
+                self.docker.run(
+                    [
+                        "docker",
+                        "exec",
+                        self.database.services.bsl_container,
+                        "bsl-indexer",
+                        "daemon",
+                        "status",
+                    ]
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - retry any transport error
+                last_error = exc
+                if interval > 0:
+                    time.sleep(interval)
+        raise RuntimeError(
+            f"bsl daemon not ready after restart: {last_error}"
+        )
 
     def _pause_watcher(self) -> None:
         toml_path = self.database.services.bsl_daemon_toml

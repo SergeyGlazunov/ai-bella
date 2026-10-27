@@ -52,6 +52,7 @@ def run_bsl_layer(
     *,
     observe_cap: float | None = None,
     on_observe=None,
+    logs_path: str | None = None,
 ) -> LayerResult:
     """Run the code_index layer for ``database`` and return a verified result."""
     _ensure_run_revision(conn, run_id, database.name, revision)
@@ -67,6 +68,8 @@ def run_bsl_layer(
         resume=resume,
         observe_cap=observe_cap,
         on_observe=on_observe,
+        logs_path=logs_path,
+        container_runner=True,
     )
     storage_id = dockerutil.volume_identity(
         database.storage.code_index_volume, runner=runner
@@ -194,6 +197,7 @@ def run_required_layers(
                     may_write=may_write,
                     observe_cap=observe_cap,
                     on_observe=on_observe,
+                    logs_path=logs_path,
                 )
             elif layer == "graph":
                 item = run_graph_layer(
