@@ -361,6 +361,8 @@ class FlexibleReadsDocker:
     connected_networks: set[str] = field(default_factory=lambda: {"ai-stack_default"})
     calls: list[list[str]] = field(default_factory=list)
     fail_on_network_disconnect: bool = False
+    published_src: Path | None = None
+    bsl_count: str = "1"
 
     def idle_probe(self) -> bool:
         return True
@@ -393,7 +395,33 @@ class FlexibleReadsDocker:
             )
         if cmd and cmd[0] == "iptables":
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        joined = " ".join(cmd)
+        if "mountinfo" in joined and self.published_src is not None:
+            line = (
+                f"1 2 8:48 {self.published_src.as_posix()} /repos/SRC "
+                "rw - ext4 /dev/sdd rw\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=line, stderr="")
+        if "find" in joined and "bsl" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=self.bsl_count + "\n", stderr=""
+            )
         raise AssertionError(cmd)
+
+
+def _seed_open_gates(tmp_path: Path) -> Path:
+    """Create a non-empty code index tree for open-gate tests."""
+    src = tmp_path / "gate-src"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "a.bsl").write_text("// x", encoding="utf-8")
+    db_dir = src / ".code-index"
+    db_dir.mkdir(exist_ok=True)
+    conn = sqlite3.connect(str(db_dir / "index.db"))
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT)")
+    conn.execute("INSERT INTO files(path) VALUES ('a.bsl')")
+    conn.commit()
+    conn.close()
+    return src
 
 
 def test_opl_read_controller_never_touches_graph(tmp_path: Path):
@@ -432,8 +460,11 @@ def test_partial_close_restores_previous_availability(tmp_path: Path):
 
     ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
     conn = _init_conn(tmp_path)
-    docker = FlexibleReadsDocker(fail_on_network_disconnect=True)
-    ctrl = DatabaseReadController(ubd, conn, docker)
+    gate_src = _seed_open_gates(tmp_path)
+    docker = FlexibleReadsDocker(
+        fail_on_network_disconnect=True, published_src=gate_src
+    )
+    ctrl = DatabaseReadController(ubd, conn, docker, open_gate_src=gate_src)
     with pytest.raises(RuntimeError, match="network disconnect"):
         ctrl.close()
     # Graph may already be stopped; restore what this attempt closed when safe.
@@ -475,8 +506,9 @@ def test_graph_failure_keeps_verified_bsl_available(tmp_path: Path):
 
     ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
     conn = _init_conn(tmp_path)
-    docker = FlexibleReadsDocker()
-    ctrl = DatabaseReadController(ubd, conn, docker)
+    gate_src = _seed_open_gates(tmp_path)
+    docker = FlexibleReadsDocker(published_src=gate_src)
+    ctrl = DatabaseReadController(ubd, conn, docker, open_gate_src=gate_src)
     ctrl.close()
     # Graph failed verification — leave graph closed, reopen verified BSL.
     ctrl.open_layer("code_index")
@@ -484,6 +516,36 @@ def test_graph_failure_keeps_verified_bsl_available(tmp_path: Path):
     assert ctrl.is_closed("graph") is True
     assert get_meta(conn, scoped_read_key("reads_closed", "ubd", "graph")) == "1"
     assert ubd.services.webui_network in docker.connected_networks
+
+
+def test_open_code_index_refuses_empty_index(tmp_path: Path):
+    from contour.reads import DatabaseReadController
+    from contour.remount_bsl import BslMountError
+
+    cfg = _make_config(tmp_path)
+    ubd = cfg.databases["ubd"]
+    toml = tmp_path / "daemon.toml"
+    toml.write_text('[[paths]]\npath = "/repos/SRC"\n', encoding="utf-8")
+    from dataclasses import replace
+
+    ubd = replace(ubd, services=replace(ubd.services, bsl_daemon_toml=str(toml)))
+    src = tmp_path / "empty-src"
+    src.mkdir()
+    (src / "a.bsl").write_text("x", encoding="utf-8")
+    db_dir = src / ".code-index"
+    db_dir.mkdir()
+    conn_db = sqlite3.connect(str(db_dir / "index.db"))
+    conn_db.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT)")
+    conn_db.commit()
+    conn_db.close()
+    conn = _init_conn(tmp_path)
+    docker = FlexibleReadsDocker(published_src=src, connected_networks=set())
+    ctrl = DatabaseReadController(ubd, conn, docker, open_gate_src=src)
+    ctrl.close_layer("code_index")
+    with pytest.raises((BslMountError, RuntimeError), match="empty|files"):
+        ctrl.open_layer("code_index")
+    assert ctrl.is_closed("code_index") is True
+    assert ubd.services.webui_network not in docker.connected_networks
 
 
 def test_watcher_stays_paused_during_active_job(tmp_path: Path):

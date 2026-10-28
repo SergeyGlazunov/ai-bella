@@ -425,10 +425,13 @@ def _preflight_free_space(cfg) -> None:
     maintenance.check_free_space(root, min_free_gb=float(min_free_gb))
 
 
-def _prune_after_publish(cfg, database, conn: sqlite3.Connection, state, send) -> None:
+def _prune_after_publish(
+    cfg, database, conn: sqlite3.Connection, state, send, docker=None
+) -> None:
     """Post-publish retention (review 1.2). Never fails the published result."""
     from contour import maintenance
     from contour.config import PackageSourceConfig
+    from contour.remount_bsl import list_bsl_mount_roots
     from contour.sources import published_path_for
 
     runtime = getattr(cfg, "runtime", None)
@@ -454,7 +457,14 @@ def _prune_after_publish(cfg, database, conn: sqlite3.Connection, state, send) -
                 published_revision=published_revision,
                 keep=_int_knob("retain_packages", 3),
             )
-        maintenance.prune_previous_sources(published_path_for(database), keep=1)
+        mounted_roots: list[str] = []
+        if docker is not None and "code_index" in database.required_layers:
+            mounted_roots = list_bsl_mount_roots(
+                docker, [database.services.bsl_container]
+            )
+        maintenance.prune_previous_sources(
+            published_path_for(database), keep=1, mounted_roots=mounted_roots
+        )
         maintenance.prune_run_history(conn, days=_int_knob("retain_runs_days", 90))
     except Exception as exc:
         _safe_send(send, cfg, f"{database.name}: retention prune failed: {exc}")
@@ -669,6 +679,7 @@ def _default_v2_database_runner(
         probes,
         conn=conn,
         may_write=may_write,
+        docker_runner=docker,
     )
     # Belt-and-suspenders: covers fast pipelines whose stages finished before
     # any observation chunk expired. Idempotent via the warn_key flag.
@@ -679,7 +690,7 @@ def _default_v2_database_runner(
     if status == "success":
         # Review 1.2: retention runs only after a verified publish and never
         # fails the published result.
-        _prune_after_publish(cfg, database, conn, state, send)
+        _prune_after_publish(cfg, database, conn, state, send, docker=docker)
     return status
 
 

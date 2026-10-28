@@ -99,11 +99,52 @@ def prune_accepted_packages(
     return removed
 
 
-def prune_previous_sources(published_path: Path, *, keep: int = 1) -> list[str]:
+def _normalize_mount_text(path: Path | str) -> str:
+    return str(path).replace("\\", "/").rstrip("/")
+
+
+def mount_blocks_previous_delete(
+    previous: Path, mounted_roots: list[str] | tuple[str, ...] | None
+) -> bool:
+    """True when a BSL container still has ``previous`` (or its src) bind-mounted."""
+    if not mounted_roots:
+        return False
+    prev_text = _normalize_mount_text(previous)
+    prev_name = previous.name
+    for raw in mounted_roots:
+        root_text = _normalize_mount_text(raw)
+        if not root_text:
+            continue
+        if prev_name and prev_name in root_text:
+            return True
+        if root_text == prev_text or root_text.startswith(prev_text + "/"):
+            return True
+        try:
+            root_resolved = _normalize_mount_text(Path(raw).resolve())
+            prev_resolved = _normalize_mount_text(previous.resolve())
+        except OSError:
+            continue
+        if root_resolved == prev_resolved or root_resolved.startswith(
+            prev_resolved + "/"
+        ):
+            return True
+    return False
+
+
+def prune_previous_sources(
+    published_path: Path,
+    *,
+    keep: int = 1,
+    mounted_roots: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
     """Delete older ``<name>.prev-*`` snapshots, keeping the newest ``keep``.
 
     The newest previous snapshot is the documented rollback handle; older
     ones are dead weight once a newer revision published successfully.
+
+    Snapshots still visible in a BSL container's ``/repos/SRC`` mount are
+    skipped (Docker bind keeps the inode after rename-activate; deleting it
+    empties the mount and the watcher wipes the code index).
     """
     published = Path(published_path)
     parent = published.parent
@@ -116,6 +157,8 @@ def prune_previous_sources(published_path: Path, *, keep: int = 1) -> list[str]:
     )
     removed: list[str] = []
     for path in prevs[max(keep, 0) :]:
+        if mount_blocks_previous_delete(path, mounted_roots):
+            continue
         shutil.rmtree(path)
         removed.append(path.name)
     return removed

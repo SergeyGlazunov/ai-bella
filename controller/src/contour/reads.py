@@ -10,6 +10,14 @@ from typing import Protocol, runtime_checkable
 
 from contour.config import DatabaseConfig
 from contour.db import get_meta, set_meta
+from contour.remount_bsl import (
+    DEFAULT_MIN_BSL_FILES,
+    DEFAULT_MIN_INDEX_FILES,
+    assert_bsl_mount_healthy,
+    assert_code_index_nonempty,
+    published_workspace,
+)
+from contour.sources import published_path_for
 from contour.watch_bsl import pause_watch, restore_watch, watch_is_paused
 
 # Host DROP on bsl_publish_port is optional (ADM-SAPHX-TECH: no host/LAN MCP
@@ -193,6 +201,9 @@ class DatabaseReadController:
         watch_reload: Callable[[], None] | None = None,
         active_writer: bool = False,
         index_mutated: bool = False,
+        open_gate_src: Path | None = None,
+        min_bsl_files: int = DEFAULT_MIN_BSL_FILES,
+        min_index_files: int = DEFAULT_MIN_INDEX_FILES,
     ) -> None:
         self.database = database
         self.conn = conn
@@ -200,6 +211,9 @@ class DatabaseReadController:
         self.watch_reload = watch_reload or (lambda: None)
         self.active_writer = active_writer
         self.index_mutated = index_mutated
+        self.open_gate_src = open_gate_src
+        self.min_bsl_files = min_bsl_files
+        self.min_index_files = min_index_files
         self.required_layers = tuple(
             layer for layer in _LAYER_ORDER if layer in database.required_layers
         )
@@ -211,6 +225,24 @@ class DatabaseReadController:
         self._closed_on_entry = {
             layer: self._layer_flag_closed(layer) for layer in self.required_layers
         }
+
+    def _code_open_src(self) -> Path:
+        if self.open_gate_src is not None:
+            return Path(self.open_gate_src)
+        return published_workspace(
+            self.database, published_path_for(self.database)
+        )
+
+    def _assert_code_open_gates(self) -> None:
+        """Refuse to restore watcher / expose BSL MCP on a wiped or stale index."""
+        src = self._code_open_src()
+        assert_bsl_mount_healthy(
+            self.docker,
+            self.database.services.bsl_container,
+            published_src=src,
+            min_bsl_files=self.min_bsl_files,
+        )
+        assert_code_index_nonempty(src, min_files=self.min_index_files)
 
     def _migrate_legacy_ubd_flags(self) -> None:
         """Copy legacy UBD global closed flag into per-layer keys once."""
@@ -314,6 +346,7 @@ class DatabaseReadController:
                 raise RuntimeError(
                     f"refusing to restore watcher for {name}: active writer"
                 )
+            self._assert_code_open_gates()
             if services.webui_network not in self._network_names():
                 self.docker.run(
                     [

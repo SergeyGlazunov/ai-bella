@@ -16,7 +16,9 @@
 
 | Поле | По умолчанию | Смысл |
 |------|----------------|-------|
-| `packageInbox` | `workdir/inbox/kb` | корень inbox для `ready-*` пакетов |
+| `packageInbox` | `workdir/inbox/kb` | корень inbox для `ready-*` пакетов (на стенде: `\\wsl$\Ubuntu\srv\ai-contour\inbox\kb`) |
+
+После publish в `\\wsl$\...` экспортёр вызывает `Set-WslPackageOwner.ps1` (`chown -R ai-contour`). Иначе contour (`ai-contour`) получит Permission denied на claim: Linux требует write на сам каталог пакета при cross-dir rename.
 | `exportStaging` | `workdir/kb-export` | временная выгрузка DumpConfigToFiles |
 | `platformVersion` | из `exePath` | поле `platform_version` в `manifest.json` |
 

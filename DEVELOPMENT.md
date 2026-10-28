@@ -8,6 +8,20 @@
 
 ---
 
+## 2026-10-28 — in-place activate (стабильный inode)
+
+**Задача.** Убрать rename-activate (`published.replace(previous)`), из‑за которого Docker bind оставался на старом inode / `//deleted`, а watcher сносил SQLite code-index.
+
+**Причина.** Bind монтирует inode; `.code-index` жил внутри published. Rename + prune prev = пустое дерево → wipe индекса. Ночь «успешна» по graph при мёртвом code-слое.
+
+**Решение.** `activate_source` зеркалит staged → published in-place (`_mirror_tree_into`), preserve `.code-index`; digest игнорирует top-level `.code-index`. Remount BSL только если mount unhealthy. Open-gates на пустой index сохранены. Rollback — in-place mirror legacy prev или re-prepare.
+
+**Проверка.** `pytest` controller (sources/pipeline/remount/task5/reads/maintenance).
+
+**Откат.** Вернуть rename-activate из git history (нежелательно без remount-gates).
+
+---
+
 ## Сводка (2026-09-21, F01–F05 закрыты в пакете)
 
 **Стенд:** живой контур **не** переключён. Stand gates watch pause + close reads — **PASS**. Cutover ждёт drill бэкапа чат-слоя / явный runbook в [USER.md](USER.md).

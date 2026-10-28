@@ -75,6 +75,24 @@ def test_is_dirty_false_when_clean(tmp_path: Path):
     assert gitutil.is_dirty(repo) is False
 
 
+def test_is_dirty_false_when_only_code_index_untracked(tmp_path: Path):
+    remote = _init_bare_remote(tmp_path)
+    repo = _clone_with_initial_commit(tmp_path, remote)
+    code_index = repo / "src" / ".code-index"
+    code_index.mkdir(parents=True)
+    (code_index / "index.db").write_text("local", encoding="utf-8")
+    (repo / ".contour-revision").write_text("abc", encoding="utf-8")
+    assert gitutil.is_dirty(repo) is False
+
+
+def test_is_dirty_true_when_code_index_plus_other_untracked(tmp_path: Path):
+    remote = _init_bare_remote(tmp_path)
+    repo = _clone_with_initial_commit(tmp_path, remote)
+    (repo / "src" / ".code-index").mkdir(parents=True)
+    (repo / "scratch.tmp").write_text("local", encoding="utf-8")
+    assert gitutil.is_dirty(repo) is True
+
+
 def test_ff_only_moves_head_on_clean_fast_forward(tmp_path: Path):
     remote = _init_bare_remote(tmp_path)
     repo = _clone_with_initial_commit(tmp_path, remote)

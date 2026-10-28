@@ -164,7 +164,7 @@ def test_invalid_previous_handle_is_rejected_before_mutation(tmp_path):
     assert not missing.exists()
 
 
-def test_failed_activation_with_known_backup_restores_entry_state(tmp_path):
+def test_activation_with_known_backup_publishes_in_place(tmp_path):
     root, staging = layout(tmp_path)
     published = root / "kb"
     previous = root / "kb.prev-r1"
@@ -172,6 +172,7 @@ def test_failed_activation_with_known_backup_restores_entry_state(tmp_path):
     tree(published, "r2", "current")
     tree(previous, "r1", "previous")
     tree(staged, "r3", "next")
+    published_inode = published.stat().st_ino
     prepared = PreparedSource(
         "kb",
         "r3",
@@ -182,9 +183,9 @@ def test_failed_activation_with_known_backup_restores_entry_state(tmp_path):
         kind="package",
         content_digest=compute_staged_tree_digest(staged),
     )
-    with pytest.raises(SourceError):
-        activate_source(prepared, published)
-    assert (published / "data.txt").read_text(encoding="utf-8") == "current"
+    assert activate_source(prepared, published) is None
+    assert published.stat().st_ino == published_inode
+    assert (published / "data.txt").read_text(encoding="utf-8") == "next"
     assert (previous / "data.txt").read_text(encoding="utf-8") == "previous"
 
 
@@ -242,6 +243,7 @@ def test_published_marker_alone_does_not_skip_activation(tmp_path):
     staged = staging / "kb" / "r2"
     tree(published, "r2", "stale")
     tree(staged, "r2", "fresh")
+    published_inode = published.stat().st_ino
     prepared = PreparedSource(
         "kb",
         "r2",
@@ -252,10 +254,9 @@ def test_published_marker_alone_does_not_skip_activation(tmp_path):
         kind="package",
         content_digest=compute_staged_tree_digest(staged),
     )
-    previous = activate_source(prepared, published)
+    assert activate_source(prepared, published) is None
+    assert published.stat().st_ino == published_inode
     assert (published / "data.txt").read_text(encoding="utf-8") == "fresh"
-    assert previous is not None
-    assert (previous / "data.txt").read_text(encoding="utf-8") == "stale"
 
 
 def test_unrelated_previous_is_rejected_before_mutation(tmp_path):
@@ -328,23 +329,18 @@ def test_git_failure_does_not_leak_remote_userinfo(tmp_path, monkeypatch):
     assert caught.value.__cause__ is None
 
 
-def test_activation_compensation_failure_reports_recovery_path(tmp_path, monkeypatch):
+def test_activation_mirror_failure_keeps_published(tmp_path, monkeypatch):
     root, staging = layout(tmp_path)
     published = root / "kb"
     staged = staging / "kb" / "r2"
     tree(published, "r1", "current")
     tree(staged, "r2", "next")
-    real = Path.replace
-    calls: list[tuple[Path, Path]] = []
 
-    def boom(self, target):
-        calls.append((Path(self), Path(target)))
-        if len(calls) >= 2:
-            raise OSError("injected activate failure")
-        return real(self, target)
+    def boom(*_args, **_kwargs):
+        raise OSError("injected activate failure")
 
-    monkeypatch.setattr(Path, "replace", boom)
-    with pytest.raises(SourceError, match="kb.prev-") as caught:
+    monkeypatch.setattr("contour.sources._mirror_tree_into", boom)
+    with pytest.raises(OSError, match="injected"):
         activate_source(
             PreparedSource(
                 "kb",
@@ -358,11 +354,9 @@ def test_activation_compensation_failure_reports_recovery_path(tmp_path, monkeyp
             ),
             published,
         )
-    assert "s3cret" not in str(caught.value)
-    recovery = root / next(path.name for path in root.iterdir() if path.name.startswith("kb.prev-"))
-    assert (recovery / "data.txt").read_text(encoding="utf-8") == "current"
-    assert not published.exists()
+    assert (published / "data.txt").read_text(encoding="utf-8") == "current"
     assert (staged / "data.txt").read_text(encoding="utf-8") == "next"
+    assert not any(path.name.startswith("kb.prev-") for path in root.iterdir())
 
 
 def test_package_reparse_planted_after_validation_is_not_copied(tmp_path, monkeypatch):

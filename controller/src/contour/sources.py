@@ -18,6 +18,8 @@ from contour.config import DatabaseConfig, GitSourceConfig, PackageSourceConfig
 from contour.packages import ValidatedPackage, validate_package
 
 REVISION_MARKER = ".contour-revision"
+# Local indexer state must survive in-place publish (Docker bind + delta index).
+_PUBLISH_PRESERVE = frozenset({".code-index"})
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 SourceKind = Literal["git", "package"]
 
@@ -230,7 +232,11 @@ def _redact(text: str) -> str:
 
 
 def compute_staged_tree_digest(root: Path) -> str:
-    """Digest snapshot bytes, excluding the service marker and volatile Git files."""
+    """Digest snapshot bytes, excluding the service marker and volatile Git files.
+
+    Top-level ``.code-index`` is excluded so in-place publish that preserves the
+    local indexer DB still matches the staged content digest.
+    """
     if not root.is_dir() or _is_reparse_point(root):
         raise SourceError(f"staged tree must be a real directory: {root}")
     root_resolved = _resolve(root)
@@ -244,6 +250,8 @@ def compute_staged_tree_digest(root: Path) -> str:
             if _is_reparse_point(entry):
                 raise SourceError(f"unsupported staged entry: {rel}")
             if rel in _GIT_DIGEST_SKIP_DIRS:
+                continue
+            if rel in _PUBLISH_PRESERVE:
                 continue
             kept_dirs.append(name)
         dirnames[:] = kept_dirs
@@ -285,6 +293,76 @@ def _copy_source_tree(src: Path, dst: Path) -> None:
             shutil.copyfile(entry, target)
         else:
             raise SourceError(f"unsupported source entry: {entry}")
+
+
+def _force_writable(path: Path) -> None:
+    """Clear read-only so Windows Git object files can be replaced/removed."""
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode | stat.S_IWRITE)
+    except OSError:
+        return
+
+
+def _remove_tree_entry(path: Path) -> None:
+    if _is_reparse_point(path):
+        raise SourceError(f"refusing to remove reparse point: {path}")
+    if path.is_dir() and not path.is_symlink():
+
+        def _onexc(func, p, _exc):
+            _force_writable(Path(p))
+            func(p)
+
+        shutil.rmtree(path, onexc=_onexc)
+    else:
+        _force_writable(path)
+        path.unlink()
+
+
+def _mirror_tree_into(
+    src: Path,
+    dst: Path,
+    *,
+    preserve: frozenset[str] = frozenset(),
+) -> None:
+    """Update ``dst`` to match ``src`` in place (same directory inode).
+
+    Entries named in ``preserve`` at this level are left untouched and are not
+    deleted when absent from ``src``. Nested calls use an empty preserve set.
+    """
+    if _is_reparse_point(src) or not src.is_dir():
+        raise SourceError(f"refusing to mirror reparse or non-directory: {src}")
+    if dst.exists() and _is_reparse_point(dst):
+        raise SourceError(f"refusing to mirror into reparse point: {dst}")
+    dst.mkdir(parents=True, exist_ok=True)
+    staged_names: set[str] = set()
+    for entry in src.iterdir():
+        if _is_reparse_point(entry):
+            raise SourceError(f"refusing to mirror reparse point: {entry}")
+        staged_names.add(entry.name)
+        target = dst / entry.name
+        if entry.is_dir():
+            if target.exists() and target.is_file():
+                _force_writable(target)
+                target.unlink()
+            _mirror_tree_into(entry, target, preserve=frozenset())
+        elif entry.is_file():
+            if target.exists() and target.is_dir() and not target.is_symlink():
+                if _is_reparse_point(target):
+                    raise SourceError(f"refusing to replace reparse point: {target}")
+                _remove_tree_entry(target)
+            elif target.exists():
+                _force_writable(target)
+                target.unlink()
+            shutil.copyfile(entry, target)
+            shutil.copystat(entry, target, follow_symlinks=False)
+        else:
+            raise SourceError(f"unsupported source entry: {entry}")
+    for entry in list(dst.iterdir()):
+        if entry.name in preserve:
+            continue
+        if entry.name not in staged_names:
+            _remove_tree_entry(entry)
 
 
 def _unexpected_git_changes(repo: Path) -> str | None:
@@ -460,11 +538,13 @@ def _snapshot_matches(prepared: PreparedSource, path: Path) -> bool:
 
 
 def activate_source(prepared: PreparedSource, published_path: Path) -> Path | None:
-    """Publish staged snapshot onto ``published_path`` via rename.
+    """Publish staged snapshot into ``published_path`` in place (stable inode).
 
-    Returns the previous published directory when one was moved aside or when a
-    known ``prepared.previous_path`` remains the recovery handle. Same-revision
-    retries preserve that handle.
+    Mirrors ``staged`` into the existing published directory so Docker bind
+    mounts and ``.code-index`` survive. Does not rename published aside to
+    ``.prev-*``. Returns ``None`` (no rename-prev handle). Rollback is a
+    re-prepare of the desired revision plus another in-place activate, or
+    ``rollback_source`` mirroring a legacy prev tree.
     """
     sources_root = _resolve(prepared.sources_root)
     published = ensure_under_sources_root(published_path, sources_root)
@@ -482,7 +562,8 @@ def activate_source(prepared: PreparedSource, published_path: Path) -> Path | No
         staged = ensure_under_sources_root(staged_raw, sources_root)
         _assert_disjoint(staged, published)
 
-    known_previous = _validate_known_previous(
+    # Validate optional legacy previous handle; it is not used for rename.
+    _validate_known_previous(
         Path(prepared.previous_path) if prepared.previous_path is not None else None,
         sources_root=sources_root,
         published=published,
@@ -492,54 +573,23 @@ def activate_source(prepared: PreparedSource, published_path: Path) -> Path | No
     # Idempotent only when published bytes match the prepared snapshot.
     # A forged revision marker must not skip publishing the staged tree.
     if published.exists() and _snapshot_matches(prepared, published):
-        return known_previous
+        return None
 
     if staged is None:
         raise SourceError(f"staged path missing: {staged_raw}")
 
     _verify_staged_snapshot(prepared, staged)
 
-    if not published.exists():
-        # Fresh install / resume with optional known previous backup handle.
-        try:
-            staged.replace(published)
-        except Exception:
-            raise
-        return known_previous
-
-    if _is_reparse_point(published):
+    if published.exists() and _is_reparse_point(published):
         raise SourceError("published path must not be a reparse point")
 
-    if known_previous is not None:
-        # Live published plus a separate known previous is an unsupported state:
-        # compensating from previous would silently lose the entry published tree.
-        raise SourceError(
-            "cannot activate: live published with known previous handle"
-        )
+    if not published.exists():
+        published.mkdir(parents=True, exist_ok=False)
 
-    old_rev = read_revision(published) or "unknown"
-    previous = published.parent / f"{published.name}.prev-{safe_revision_token(old_rev)}"
-    if previous.exists():
-        raise SourceError(f"previous source already exists: {previous}")
-    published.replace(previous)
-
-    try:
-        if not staged.exists():
-            raise SourceError(f"staged path missing: {staged}")
-        staged.replace(published)
-    except Exception as exc:
-        # Compensate from the aside created above. If that also fails, name
-        # every recovery path — do not leave the entry tree anonymous.
-        if previous.exists() and not published.exists():
-            try:
-                previous.replace(published)
-            except Exception:
-                raise SourceError(
-                    f"activation failed; entry tree remains at {previous}; "
-                    f"staged at {staged}"
-                ) from None
-        raise exc
-    return previous
+    _mirror_tree_into(staged, published, preserve=_PUBLISH_PRESERVE)
+    # Staging is consumed after a successful publish (same as rename-activate).
+    _remove_tree_entry(staged)
+    return None
 
 
 def rollback_source(
@@ -548,7 +598,7 @@ def rollback_source(
     *,
     sources_root: Path,
 ) -> None:
-    """Restore ``previous_path`` as the published source directory."""
+    """Restore ``previous_path`` into ``published_path`` via in-place mirror."""
     root = _resolve(sources_root)
     published = ensure_under_sources_root(published_path, root)
     previous = ensure_under_sources_root(previous_path, root)
@@ -559,30 +609,13 @@ def rollback_source(
         raise SourceError("rollback refuses reparse/symlink paths")
     if not previous.exists():
         raise SourceError(f"previous source missing: {previous}")
+    if not previous.is_dir():
+        raise SourceError(f"previous source is not a directory: {previous}")
 
-    failed = published.parent / f"{published.name}.failed-rollback"
-    moved_current = False
-    if published.exists():
-        if failed.exists():
-            raise SourceError(f"failed-rollback path already exists: {failed}")
-        published.replace(failed)
-        moved_current = True
-
-    try:
-        previous.replace(published)
-    except Exception:
-        if moved_current and failed.exists() and not published.exists():
-            try:
-                failed.replace(published)
-            except Exception as compensate_exc:
-                raise SourceError(
-                    f"rollback failed; current at {failed}, previous at {previous}: "
-                    f"{compensate_exc}"
-                ) from compensate_exc
-        raise
-
-    if failed.exists():
-        shutil.rmtree(failed)
+    if not published.exists():
+        published.mkdir(parents=True, exist_ok=False)
+    _mirror_tree_into(previous, published, preserve=_PUBLISH_PRESERVE)
+    shutil.rmtree(previous)
 
 
 class GitSourceProvider:

@@ -471,5 +471,12 @@ def claim_package(package: ValidatedPackage, accepted_root: Path) -> Path:
             raise PackageError(
                 "cross-filesystem rename is not supported"
             ) from exc
+        if getattr(exc, "errno", None) == errno.EACCES:
+            # Cross-dir directory rename needs write on the package dir itself
+            # (update ".."). root:root 755 from Windows \\wsl$ drops fails here.
+            raise PackageError(
+                "claim rename permission denied (need write on package "
+                f"directory for cross-dir rename): {package.path} -> {dest}"
+            ) from exc
         raise
     return dest

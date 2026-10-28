@@ -95,6 +95,28 @@ def test_prune_previous_sources_keeps_newest_handle(tmp_path: Path):
     assert published.exists()
 
 
+def test_prune_previous_sources_skips_mounted_inode(tmp_path: Path):
+    parent = tmp_path / "sources"
+    parent.mkdir()
+    published = parent / "ubd"
+    published.mkdir()
+    old_prev = parent / "ubd.prev-old"
+    new_prev = parent / "ubd.prev-new"
+    for path in (old_prev, new_prev):
+        path.mkdir()
+        (path / "src").mkdir()
+    past = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp()
+    os.utime(old_prev, (past, past))
+
+    mounted = [str(old_prev / "src")]
+    removed = maintenance.prune_previous_sources(
+        published, keep=1, mounted_roots=mounted
+    )
+    assert removed == []
+    assert old_prev.exists()
+    assert new_prev.exists()
+
+
 def test_prune_run_history_protects_unfinished_runs(tmp_path: Path):
     db_path = tmp_path / "state.db"
     conn = init_db(str(db_path))

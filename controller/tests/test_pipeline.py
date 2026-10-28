@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable  # noqa: F401 — used by FakeLayers annotations
 
 import pytest  # noqa: F401 — used by pytest discovery
 
@@ -17,11 +17,18 @@ from contour.config import (
 )
 from contour.db import init_db
 from contour.index_graph import graph_full_needed_key, set_graph_full_needed
-from contour.pipeline import PipelineResult, run_database_pipeline
+from contour.pipeline import PipelineResult
+from contour.pipeline import run_database_pipeline as _run_database_pipeline
 from contour.profiles import LayerResult
 from contour.sources import PreparedSource, write_revision
 from contour.state import StateStore
 from contour.verify import Samples
+
+
+def run_database_pipeline(*args, **kwargs):
+    """Unit tests skip live docker remount; production uses the real hook."""
+    kwargs.setdefault("after_activate", lambda *_: None)
+    return _run_database_pipeline(*args, **kwargs)
 
 
 def _services() -> ServicesConfig:
@@ -249,6 +256,7 @@ def test_pipeline_transition_order_to_published(tmp_path: Path):
         "validated",
         "staged",
         "reads_closed",
+        "bsl_remounted",
         "indexing",
         "verified",
         "published",
@@ -455,3 +463,58 @@ def test_pipeline_uses_saved_graph_full_flag(tmp_path: Path):
     assert dict(conn.execute("SELECT key, value FROM meta")).get(
         graph_full_needed_key("kb")
     ) == "1"
+
+
+def test_pipeline_remounts_after_activate_before_index(tmp_path: Path):
+    conn, state, database, prepared = _setup(
+        tmp_path, "ubd", frozenset({"code_index", "graph"})
+    )
+    events: list[str] = []
+
+    def after_activate(db, published: Path) -> None:
+        del db
+        events.append(f"remount:{published.name}")
+
+    class OrderedLayers(FakeLayers):
+        def run(self, database, revision, run_id, **kwargs):
+            events.append("index")
+            return super().run(database, revision, run_id, **kwargs)
+
+    result = _run_database_pipeline(
+        database,
+        FakeSource(prepared),
+        state,
+        RecordingReads(),
+        OrderedLayers(),
+        FakeProbes(),
+        conn=conn,
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
+        after_activate=after_activate,
+    )
+    assert result.result == "published"
+    assert events == ["remount:ubd", "index"]
+
+
+def test_pipeline_remount_failure_leaves_reads_closed(tmp_path: Path):
+    conn, state, database, prepared = _setup(
+        tmp_path, "ubd", frozenset({"code_index", "graph"})
+    )
+    reads = RecordingReads()
+
+    def boom(_db, _path: Path) -> None:
+        raise RuntimeError("stale bind after activate")
+
+    result = _run_database_pipeline(
+        database,
+        FakeSource(prepared),
+        state,
+        reads,
+        FakeLayers(),
+        FakeProbes(),
+        conn=conn,
+        samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
+        after_activate=boom,
+    )
+    assert result.result == "failed"
+    assert "stale bind" in result.message
+    assert reads.is_closed() is True
