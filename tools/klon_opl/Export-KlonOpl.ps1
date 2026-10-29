@@ -150,6 +150,8 @@ $manifest = New-ExportManifest `
     -StartedAt $startedAt `
     -FinishedAt $finishedAt
 
-$null = Publish-ExportPackage -SourcePath $staging -DestinationRoot $packageInbox -Manifest $manifest
+$readyPath = Publish-ExportPackage -SourcePath $staging -DestinationRoot $packageInbox -Manifest $manifest
+# \\wsl$ drops are root:root 755; contour claim rename needs write on the package dir.
+& (Join-Path $scriptDir "..\common\Set-WslPackageOwner.ps1") -WinPath $readyPath
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="

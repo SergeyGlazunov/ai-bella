@@ -133,19 +133,16 @@ def test_git_two_upstream_cycles(tmp_path):
     assert (published / "data.txt").read_text(encoding="utf-8") == "r2"
 
 
-def test_rollback_failure_restores_current_published_tree(tmp_path, monkeypatch):
+def test_rollback_failure_keeps_published_when_mirror_fails(tmp_path, monkeypatch):
     root, staging = layout(tmp_path)
     published, previous = root / "kb", root / "kb.prev-r1"
     tree(published, "r2", "current")
     tree(previous, "r1", "previous")
-    real = Path.replace
 
-    def fail_old(self, target):
-        if self == previous:
-            raise OSError("injected restore failure")
-        return real(self, target)
+    def fail_mirror(*_args, **_kwargs):
+        raise OSError("injected restore failure")
 
-    monkeypatch.setattr(Path, "replace", fail_old)
+    monkeypatch.setattr("contour.sources._mirror_tree_into", fail_mirror)
     with pytest.raises(OSError):
         rollback_source(published, previous, sources_root=root)
     assert (published / "data.txt").read_text(encoding="utf-8") == "current"
@@ -228,18 +225,20 @@ def test_repeat_prepare_preserves_existing_staging_on_copy_failure(
     assert (prepared.staged_path / "Configuration.xml").read_bytes() == old
 
 
-def test_activation_retry_keeps_known_previous_path(tmp_path):
+def test_activation_with_known_previous_still_publishes_in_place(tmp_path):
     root, staging = layout(tmp_path)
     published, previous, staged = root / "kb", root / "kb.prev-r1", staging / "kb" / "r2"
     tree(previous, "r1", "previous")
     tree(staged, "r2", "next")
     prepared = sealed("kb", "r2", staged, previous, root, published)
-    assert activate_source(prepared, published) == previous
+    assert activate_source(prepared, published) is None
+    assert (published / "data.txt").read_text(encoding="utf-8") == "next"
+    assert previous.exists()
 
 
-def test_same_revision_activation_retry_returns_existing_backup(tmp_path):
+def test_same_revision_activation_retry_is_idempotent(tmp_path):
     root, staging = layout(tmp_path)
-    published, previous, staged = root / "kb", root / "kb.prev-r1", staging / "kb" / "r2"
+    published, staged = root / "kb", staging / "kb" / "r2"
     tree(published, "r1", "previous")
     tree(staged, "r2", "next")
     digest = compute_staged_tree_digest(staged)
@@ -253,18 +252,19 @@ def test_same_revision_activation_retry_returns_existing_backup(tmp_path):
         kind="package",
         content_digest=digest,
     )
-    actual_previous = activate_source(prepared, published)
+    assert activate_source(prepared, published) is None
     retry = PreparedSource(
         "kb",
         "r2",
         staged,
-        actual_previous,
+        None,
         sources_root=root,
         published_path=published,
         kind="package",
         content_digest=digest,
     )
-    assert activate_source(retry, published) == actual_previous
+    assert activate_source(retry, published) is None
+    assert (published / "data.txt").read_text(encoding="utf-8") == "next"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows package revision path")
@@ -275,26 +275,26 @@ def test_second_package_activation_handles_revision_colon(tmp_path):
     tree(published, package.revision, "previous")
     staged = staging / "kb" / "next"
     tree(staged, "next-revision", "next")
-    previous = activate_source(
-        sealed("kb", "next-revision", staged, None, root, published),
-        published,
+    assert (
+        activate_source(
+            sealed("kb", "next-revision", staged, None, root, published),
+            published,
+        )
+        is None
     )
-    assert previous is not None and previous.is_dir()
+    assert (published / "data.txt").read_text(encoding="utf-8") == "next"
 
 
-def test_failed_activation_restores_previous_tree(tmp_path, monkeypatch):
+def test_failed_activation_keeps_published_tree(tmp_path, monkeypatch):
     root, staging = layout(tmp_path)
     published, staged = root / "kb", staging / "kb" / "r2"
     tree(published, "r1", "previous")
     tree(staged, "r2", "next")
-    real = Path.replace
 
-    def fail_stage(self, target):
-        if self == staged:
-            raise OSError("injected activation failure")
-        return real(self, target)
+    def fail_mirror(*_args, **_kwargs):
+        raise OSError("injected activation failure")
 
-    monkeypatch.setattr(Path, "replace", fail_stage)
+    monkeypatch.setattr("contour.sources._mirror_tree_into", fail_mirror)
     with pytest.raises(OSError):
         activate_source(
             sealed("kb", "r2", staged, None, root, published),

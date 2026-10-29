@@ -123,6 +123,39 @@ class TestScan(unittest.TestCase):
     def test_stable_across_runs(self):
         self.assertEqual(scan_workspace(self.root)[0], scan_workspace(self.root)[0])
 
+    def test_restage_with_fresh_mtimes_is_invisible(self):
+        """
+        contour перестейджирует дерево каждую ночь (git clone --no-hardlinks
+        или копирование): байты те же, mtime у всех файлов новые. Отпечаток
+        обязан это не замечать — иначе «изменились корневые файлы» и ночная
+        FULL на неизменных данных (инцидент 2026-10-26: ~3 ч Neo4j-загрузки
+        каждую ночь при замороженном источнике).
+        """
+        import shutil
+        before, _ = scan_workspace(self.root)
+        copy = Path(str(self.root) + "-restaged")
+        shutil.copytree(self.root, copy)
+        after, _ = scan_workspace(copy)
+        self.assertEqual(before, after)
+
+    def test_touch_only_change_is_invisible(self):
+        """Явный вариант того же: mtime тронули, содержимое — нет."""
+        import os as _os
+        before, _ = scan_workspace(self.root)
+        for path in self.root.rglob("*"):
+            if path.is_file():
+                _os.utime(path, ns=(0, 0))
+        after, _ = scan_workspace(self.root)
+        self.assertEqual(before, after)
+
+    def test_root_file_content_change_is_seen(self):
+        """Страж от пересжатия в другую сторону: правка Configuration.xml
+        обязана менять _root — именно она легитимно требует FULL."""
+        before, _ = scan_workspace(self.root)
+        self._write("Configuration.xml", "<config/>")
+        after, _ = scan_workspace(self.root)
+        self.assertNotEqual(before.get(ROOT_KEY), after.get(ROOT_KEY))
+
     def test_change_touches_only_its_owner(self):
         """
         Смысл всей задачи: правка одного модуля не должна выглядеть как

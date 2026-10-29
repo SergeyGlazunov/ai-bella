@@ -79,9 +79,12 @@ ready =
 2. Адаптеры probes/idle **до** close.
 3. **Close reads (обязательное):** graph `docker stop` до not running; BSL — `docker network disconnect` от WebUI-сети; контейнер BSL и `serve` живы. Host firewall DROP на publish-порт **optional** (best-effort); `verify_closed` = graph + network. IdleProbe: `integrations/idle_bsl.sh`. Не `daemon stop` / не `docker stop bsl-indexer`.
 4. Pause BSL watch: убрать `/repos/SRC` из `daemon.toml`, reload (`integrations/reload_bsl_watch.sh`; fallback SIGHUP).
-5. Git FF на target; BSL index без `--force` из лога; graph FULL только exit **3**.
-6. Verify по diff `applied_commit..target` каждого индекса + content probes; затем open + verify open.
-7. Успех только при согласованных индексах; иначе чтение закрыто + алерт.
+5. **Activate = in-place mirror** staged → published (тот же inode каталога). Не `published.replace(previous)`. Preserve `.code-index`. Откат — повторный prepare нужной revision + activate (или mirror legacy `.prev-*`).
+6. После activate: assert mount `/repos/SRC` = published `…/src` и `.bsl` ≥ порога; **`docker restart` только если assert упал** (аварийный stale bind), не каждую ночь.
+7. Index на стабильном дереве; BSL без `--force` из лога; graph FULL только exit **3**.
+8. Verify; перед open code_index — mount healthy + `index.db` не пустой (`files` ≥ 1); иначе fail closed + алерт.
+9. Prune legacy `*.prev-*` только если inode не смонтирован в BSL.
+10. Успех только при согласованных индексах; иначе чтение закрыто + алерт.
 
 ## 7. Запреты
 

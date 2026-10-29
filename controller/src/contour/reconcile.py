@@ -334,6 +334,40 @@ def _published_needs_recovery(
     return status in {"not_ready", "changed"}
 
 
+def _recovery_source_note(
+    database: DatabaseConfig,
+    published_revision: str,
+    git=None,
+) -> str:
+    """Alert text for a git-source database that updates from recovery.
+
+    Recovery republishes the local tree and never fetches upstream. Without
+    this note an upstream that moved ahead stays invisible behind green
+    "published" runs (2026-10-26 incident: UBD frozen on a 10-day-old
+    revision for eight green nights). Best-effort: the upstream check must
+    never break the recovery run itself — a failed fetch degrades to a
+    shorter note.
+    """
+    git = git if git is not None else _GitutilOps()
+    source = database.source
+    prefix = f"{database.name}: recovery from published {published_revision[:12]}; "
+    if not isinstance(source, GitSourceConfig):
+        return prefix + "source check skipped (not a git source)"
+    try:
+        git.fetch(Path(source.path))
+        origin_rev = git.rev_parse(
+            Path(source.path), f"origin/{source.branch}"
+        )
+    except Exception as exc:  # noqa: BLE001 — visibility only, never fatal
+        return prefix + f"source check skipped (fetch failed: {type(exc).__name__})"
+    if origin_rev == published_revision:
+        return prefix + f"upstream {source.branch} unchanged"
+    return (
+        prefix
+        + f"upstream {source.branch} is ahead: {origin_rev[:12]} != published"
+    )
+
+
 def _docker_for_database(database: DatabaseConfig, base_docker):
     """Wrap ``base_docker`` with this database's idle_probe when configured."""
     adapters = getattr(database, "adapters", None)
@@ -391,10 +425,13 @@ def _preflight_free_space(cfg) -> None:
     maintenance.check_free_space(root, min_free_gb=float(min_free_gb))
 
 
-def _prune_after_publish(cfg, database, conn: sqlite3.Connection, state, send) -> None:
+def _prune_after_publish(
+    cfg, database, conn: sqlite3.Connection, state, send, docker=None
+) -> None:
     """Post-publish retention (review 1.2). Never fails the published result."""
     from contour import maintenance
     from contour.config import PackageSourceConfig
+    from contour.remount_bsl import list_bsl_mount_roots
     from contour.sources import published_path_for
 
     runtime = getattr(cfg, "runtime", None)
@@ -420,7 +457,14 @@ def _prune_after_publish(cfg, database, conn: sqlite3.Connection, state, send) -
                 published_revision=published_revision,
                 keep=_int_knob("retain_packages", 3),
             )
-        maintenance.prune_previous_sources(published_path_for(database), keep=1)
+        mounted_roots: list[str] = []
+        if docker is not None and "code_index" in database.required_layers:
+            mounted_roots = list_bsl_mount_roots(
+                docker, [database.services.bsl_container]
+            )
+        maintenance.prune_previous_sources(
+            published_path_for(database), keep=1, mounted_roots=mounted_roots
+        )
         maintenance.prune_run_history(conn, days=_int_knob("retain_runs_days", 90))
     except Exception as exc:
         _safe_send(send, cfg, f"{database.name}: retention prune failed: {exc}")
@@ -568,7 +612,23 @@ def _default_v2_database_runner(
     else:
         if _published_needs_recovery(database, conn, state, docker):
             published = published_path_for(database)
-            if published.is_dir() and read_revision(published):
+            published_revision = (
+                read_revision(published) if published.is_dir() else None
+            )
+            if published_revision:
+                if (
+                    send is not None
+                    and isinstance(database.source, GitSourceConfig)
+                ):
+                    # Fix 3 (2026-10-26): recovery never fetches upstream;
+                    # make that visible instead of hiding behind green runs.
+                    _safe_send(
+                        send,
+                        cfg,
+                        _recovery_source_note(
+                            database, published_revision
+                        ),
+                    )
                 provider = build_source_provider(database, cfg, recovery=True)
             else:
                 provider = build_source_provider(database, cfg)
@@ -619,6 +679,7 @@ def _default_v2_database_runner(
         probes,
         conn=conn,
         may_write=may_write,
+        docker_runner=docker,
     )
     # Belt-and-suspenders: covers fast pipelines whose stages finished before
     # any observation chunk expired. Idempotent via the warn_key flag.
@@ -629,7 +690,7 @@ def _default_v2_database_runner(
     if status == "success":
         # Review 1.2: retention runs only after a verified publish and never
         # fails the published result.
-        _prune_after_publish(cfg, database, conn, state, send)
+        _prune_after_publish(cfg, database, conn, state, send, docker=docker)
     return status
 
 

@@ -79,9 +79,14 @@ Windows: подтвердить, что indexing tasks disabled; export-only tas
 Disable-ScheduledTask -TaskName 'UBD Config Sync'
 Get-ScheduledTask -TaskName 'UBD Config Sync' | Select-Object TaskName, State
 # Keep KB / klon_opl *export* tasks if they only publish packages to inbox
+
+# Prefer direct GitLab remote in contour.yaml (token in /srv/ai-contour/secrets/git-credentials).
+# Only if remote is still a Windows path mirror, register git-only sync:
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\MCP\ubd_index\Register-UbdGitSync.ps1
 ```
 
 Disable запрещает **будущие** старты. Уже бегущий PS/indexer продолжит работу — см. wait.
+**Обязательно:** `databases.ubd.source.remote` = GitLab URL (или свежий Windows-клон + Git Sync). Без этого contour индексирует застывший tip.
 
 ### 1b. Wait for idle writers (обязательно)
 

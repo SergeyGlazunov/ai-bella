@@ -269,6 +269,7 @@ def test_saved_graph_full_flag_is_passed_into_layers(tmp_path: Path):
         FakeProbes(),
         conn=conn,
         samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
+        after_activate=lambda *_: None,
     )
     try:
         assert result.result == "published"

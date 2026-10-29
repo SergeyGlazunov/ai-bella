@@ -25,7 +25,8 @@ Env:
   METADATA_FORCE_REINDEX    false                игнорировать ОБА fingerprint'а
   METADATA_FORCE_XML        false                форс только фазы 1 (CFG-3)
   METADATA_FORCE_BSL        false                форс только фазы 2 (CFG-3)
-  METADATA_FINGERPRINT_STRICT false              fingerprint по содержимому (PERF-3)
+  METADATA_FINGERPRINT_STRICT false              форс fingerprint по содержимому
+  METADATA_FINGERPRINT_STAT   false              opt-out: stat-режим (легаси, mtime)
   METADATA_CONFIG_NAME      Конфигурация        имя для узла :Configuration
   METADATA_SKIP_BSL         false                пропустить фазу 2 (R&D-режим)
   METADATA_BSL_LOG_LEVEL    (наследует)          отдельный log level для BSL-фазы
@@ -57,6 +58,7 @@ from graph_writer import (
     fingerprint_get_meta, fingerprint_matches, fingerprint_workspace_multi,
     fingerprint_write, relations_snapshot_write, write_code_graph, write_graph,
 )
+from partial_fingerprint import scan_workspace, write_stored
 from progress_log import human_bytes, human_sec
 from bsl_parser import walk_workspace_bsl
 from bsl_resolver import build_call_graph, build_index_from_neo4j
@@ -328,6 +330,33 @@ def check_ownership(neo: Neo4j) -> dict:
 # ─── Main pipeline ────────────────────────────────────────────────────────
 
 
+def _seed_partial_state(neo, src_dir, fp_strict) -> None:
+    """P2-2: сохранить частичные отпечатки (partial_owners_*).
+
+    Их раньше писал только частичный путь (apply_changes), поэтому после
+    любой FULL база теряла способность к инкрементальности — «сохранённого
+    состояния нет» каждую ночь (KB на стенде: вечная FULL с 18.10; UBD
+    держалась ручным сеедом cutover-скрипта). Вызывается на каждом успешном
+    выходе полного индексера — включая «данные актуальны, выход»: именно так
+    затираемая петля закрывается без отдельного лечащего прогона.
+
+    Сбой сееда не роняет прогон: честнее оставить «первую индексацию» на
+    следующую ночь, чем соврать про успех. Режим скана — fp_strict, тот же,
+    каким считали глобальные отпечатки.
+    """
+    try:
+        partial_digests, partial_meta = scan_workspace(
+            src_dir, strict=fp_strict)
+        seed = write_stored(neo, partial_digests)
+        log.info("Частичные отпечатки сохранены: %d владельцев в %d кусках "
+                 "(режим %s) — следующий прогон может быть частичным",
+                 len(partial_digests), seed.get("chunks", 0),
+                 partial_meta.get("mode"))
+    except Exception as e:  # сеед — возможность, не условие успеха
+        log.warning("Частичные отпечатки не сохранены (%s) — следующий "
+                    "прогон снова потребует полной индексации", e)
+
+
 def main() -> int:
     src_dir   = Path(os.environ.get("METADATA_SRC_DIR", "/data/1c-src"))
     neo4j_url = os.environ.get("NEO4J_URL",  "http://neo4j:7474")
@@ -343,6 +372,10 @@ def main() -> int:
     force_xml = force_all or _env_bool("METADATA_FORCE_XML", False)
     force_bsl = force_all or _env_bool("METADATA_FORCE_BSL", False)
     strict_fp = _env_bool("METADATA_FINGERPRINT_STRICT", False)
+    stat_fp = _env_bool("METADATA_FINGERPRINT_STAT", False)
+    # content — дефолт (PERF-3, 2026-10-26): mtime ломается на рестейджинге.
+    # Явные env лишь выбирают режим поверх дефолта.
+    fp_strict: bool | None = True if strict_fp else (False if stat_fp else None)
     skip_bsl  = _env_bool("METADATA_SKIP_BSL", False)
     cfg_name  = os.environ.get("METADATA_CONFIG_NAME", "Конфигурация")
     bsl_log_level = os.environ.get("METADATA_BSL_LOG_LEVEL", "").strip().upper()
@@ -358,7 +391,8 @@ def main() -> int:
     log.info("Neo4j:           %s", neo4j_url)
     log.info("METADATA_FORCE_REINDEX: %s (XML: %s, BSL: %s)",
              force_all, force_xml, force_bsl)
-    log.info("METADATA_FINGERPRINT_STRICT: %s", strict_fp)
+    log.info("METADATA_FINGERPRINT_STRICT: %s (STAT: %s; default=content)",
+             strict_fp, stat_fp)
     # Имя переменной в подписи полное: короткое `SKIP_BSL` в логе
     # провоцировало передавать `-e SKIP_BSL=true`, что не работает —
     # проверено на боевом прогоне, где фаза 2 запустилась вопреки намерению.
@@ -383,7 +417,7 @@ def main() -> int:
     # ─ Считаем оба fingerprint'а за один обход дерева (PERF-3) ──────
     log.info("Считаем fingerprint workspace…")
     digests, fp_meta = fingerprint_workspace_multi(
-        src_dir, (".xml", ".bsl"), strict=strict_fp,
+        src_dir, (".xml", ".bsl"), strict=fp_strict,
     )
     fp_mode = fp_meta["mode"]
     fp_xml_new = digests[".xml"]
@@ -436,6 +470,7 @@ def main() -> int:
             log_ownership(ownership, log)
             log.info("Для принудительной переиндексации: METADATA_FORCE_REINDEX=true "
                      "(обе фазы), METADATA_FORCE_XML / METADATA_FORCE_BSL (по одной)")
+            _seed_partial_state(neo, src_dir, fp_strict)
             return 0
         log.warning("Оба fingerprint совпали, но граф не в порядке:")
         log_ownership(ownership, log)
@@ -537,6 +572,10 @@ def main() -> int:
                       "а отпечаток XML остался несохранённым. Граф без слоя "
                       "владения; запустите прогон заново.")
             return 4
+
+    # P2-2 (2026-10-26): частичные отпечатки после успешного полного
+    # прогона — см. _seed_partial_state.
+    _seed_partial_state(neo, src_dir, fp_strict)
 
     # PERF-12. Снимок счётчиков рёбер: обход всех рёбер платит индексация,
     # раз за прогон, а не `metadata_stats` на каждом вызове.

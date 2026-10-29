@@ -3,15 +3,18 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 from contour.config import DatabaseConfig, GitSourceConfig, PackageSourceConfig
+from contour.dockerutil import DockerRunner
 from contour.index_graph import is_graph_full_needed
 from contour.profiles import (
     LayerResult,
     profile_from_config,
     run_required_layers,
 )
+from contour.remount_bsl import remount_after_activate
 from contour.sources import PreparedSource, SourceProvider, activate_source
 from contour.state import StateStore
 from contour.runtime_policy import WriteWindowClosed, WriterStillAlive
@@ -111,11 +114,18 @@ def run_database_pipeline(
     may_write: Callable[[], str] | None = None,
     samples: Samples | None = None,
     transitions: list[str] | None = None,
+    docker_runner: DockerRunner | None = None,
+    after_activate: Callable[[DatabaseConfig, Path], None] | None = None,
+    min_bsl_files: int = 1,
 ) -> PipelineResult:
-    """Run one database through prepare → activate → index → verify → publish.
+    """Run one database through prepare → activate → remount → index → verify → publish.
 
     Scheduling and the global writer lock stay outside. Graph FULL recovery
     reads the saved per-database meta flag and passes it as ``full_needed``.
+
+    After rename-activate, BSL containers must remount ``/repos/SRC`` before
+    index/open (Docker bind keeps the old inode otherwise). Pass
+    ``after_activate`` only in tests; production uses ``remount_after_activate``.
     """
     name = database.name
     revision = ""
@@ -154,6 +164,18 @@ def run_database_pipeline(
 
         activate_source(prepared, prepared.published_path)
         activated = True
+
+        if "code_index" in database.required_layers:
+            if after_activate is not None:
+                after_activate(database, Path(prepared.published_path))
+            else:
+                remount_after_activate(
+                    database,
+                    Path(prepared.published_path),
+                    runner=docker_runner,
+                    min_bsl_files=min_bsl_files,
+                )
+            note("bsl_remounted")
 
         note("indexing")
         full_needed = is_graph_full_needed(conn, name)

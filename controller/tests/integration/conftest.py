@@ -269,6 +269,7 @@ def run_publish_cycle(
         probes,
         conn=conn,
         samples=Samples(bsl_paths=["a.bsl"], xml_paths=["a.xml"], deletions=[]),
+        after_activate=lambda *_: None,
     )
     return conn, state, database, prepared, reads, probes, result
 

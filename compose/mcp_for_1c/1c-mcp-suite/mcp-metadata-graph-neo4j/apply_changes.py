@@ -54,6 +54,7 @@ from incremental import (                               # noqa: E402
     _clear_meta_object_slice, _clear_module_code_slice, upsert_file,
 )
 from partial_fingerprint import (                       # noqa: E402
+    FP_MODE_CONTENT, FP_MODE_STAT, _fp_strict_from_env,
     build_plan, dependent_owners, is_upsertable, read_stored, scan_workspace,
     stale_debt, write_stored,
 )
@@ -151,7 +152,8 @@ def main() -> int:
         return 2
 
     log.info("Обходим выгрузку: %s", src)
-    current, meta = scan_workspace(src, keep_files=True)
+    strict = _fp_strict_from_env(None)
+    current, meta = scan_workspace(src, keep_files=True, strict=strict)
     files_by_owner = meta["files_by_owner"]
     log.info("  ✓ единиц %d, файлов %d, за %s",
              meta["owners"], meta["files"], human_sec(meta["elapsed_sec"]))
@@ -264,28 +266,22 @@ def main() -> int:
     # indexer.py при старте контейнеров.
     #
     # Без этого частичное обновление отменялось само собой: индексер видел
-    # расхождение и запускал полную двухчасовую переиндексацию при первом
-    # же `docker compose up`. Экономия в 3 минуты превращалась в лишние два
+    # расхождение и запускал полную двухчасовую переиндексацию при первом же
+    # `docker compose up`. Экономия в 3 минуты превращалась в лишние два
     # часа — то есть режим был бы хуже, чем его отсутствие.
     #
-    # Режим ставим stat: обход считает по (путь, размер, mtime), как и
-    # индексер по умолчанию. Если у вас включён METADATA_FINGERPRINT_STRICT,
-    # индексер увидит смену режима и один раз переиндексирует полностью —
-    # он честно об этом скажет в логе.
-    strict = os.environ.get("METADATA_FINGERPRINT_STRICT", "").lower() in (
-        "1", "true", "yes", "y", "on")
+    # Режим тот же, каким считал scan_workspace (content по умолчанию,
+    # stat — opt-out через METADATA_FINGERPRINT_STAT): глобальные ключи и
+    # частичные отпечатки обязаны жить в одном режиме, иначе расхождение
+    # стало бы вечным. При смене режима на уже сохранённом состоянии
+    # индексер честно увидит расхождение и сделает одну полную пересборку.
     mode = FP_MODE_CONTENT if strict else FP_MODE_STAT
     gd = meta.get("global_digests") or {}
-    if gd and not strict:
+    if gd:
         fingerprint_write(neo, gd[".xml"], "metadata_xml", mode=mode)
         fingerprint_write(neo, gd[".bsl"], "bsl_source", mode=mode)
-        log.info("Fingerprint индексера обновлён — полной переиндексации "
-                 "при следующем старте не будет")
-    elif strict:
-        log.warning("METADATA_FINGERPRINT_STRICT=true: общий fingerprint "
-                    "считается по содержимому, а частичный обход — по stat. "
-                    "Обновить его отсюда нельзя, и следующий старт индексера "
-                    "запустит полную переиндексацию.")
+        log.info("Fingerprint индексера обновлён (режим %s) — полной "
+                 "переиндексации при следующем старте не будет", mode)
 
     # PERF-12: снимок счётчиков рёбер устарел — граф только что менялся.
     try:

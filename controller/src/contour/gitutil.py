@@ -31,6 +31,21 @@ def fetch(repo: str | Path) -> None:
     _run_git(repo, "fetch", "--prune", "origin")
 
 
+# Local indexer / contour markers that must not block FF updates.
+_IGNORE_UNTRACKED_NAMES = frozenset({".code-index", ".contour-revision"})
+
+
+def _is_ignored_untracked(path: str) -> bool:
+    """True for known local-only artifacts under a published source tree."""
+    normalized = path.replace("\\", "/").strip().strip("/")
+    if not normalized:
+        return False
+    parts = normalized.split("/")
+    if any(part in _IGNORE_UNTRACKED_NAMES for part in parts):
+        return True
+    return False
+
+
 def is_dirty(repo: str | Path) -> bool:
     repo_path = str(repo)
     working_tree = subprocess.run(
@@ -47,7 +62,12 @@ def is_dirty(repo: str | Path) -> bool:
         capture_output=True,
         text=True,
     )
-    has_untracked = bool((untracked.stdout or "").strip())
+    extras = [
+        line
+        for line in (untracked.stdout or "").splitlines()
+        if line.strip() and not _is_ignored_untracked(line.strip())
+    ]
+    has_untracked = bool(extras)
     return working_tree.returncode != 0 or index.returncode != 0 or has_untracked
 
 

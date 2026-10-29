@@ -8,6 +8,20 @@
 
 ---
 
+## 2026-10-28 — in-place activate (стабильный inode)
+
+**Задача.** Убрать rename-activate (`published.replace(previous)`), из‑за которого Docker bind оставался на старом inode / `//deleted`, а watcher сносил SQLite code-index.
+
+**Причина.** Bind монтирует inode; `.code-index` жил внутри published. Rename + prune prev = пустое дерево → wipe индекса. Ночь «успешна» по graph при мёртвом code-слое.
+
+**Решение.** `activate_source` зеркалит staged → published in-place (`_mirror_tree_into`), preserve `.code-index`; digest игнорирует top-level `.code-index`. Remount BSL только если mount unhealthy. Open-gates на пустой index сохранены. Rollback — in-place mirror legacy prev или re-prepare.
+
+**Проверка.** `pytest` controller (sources/pipeline/remount/task5/reads/maintenance).
+
+**Откат.** Вернуть rename-activate из git history (нежелательно без remount-gates).
+
+---
+
 ## Сводка (2026-09-21, F01–F05 закрыты в пакете)
 
 **Стенд:** живой контур **не** переключён. Stand gates watch pause + close reads — **PASS**. Cutover ждёт drill бэкапа чат-слоя / явный runbook в [USER.md](USER.md).
@@ -36,6 +50,62 @@
 - Согласованные копии томов WebUI/OmniRoute **не** сделаны. R08 архив — отдельно.
 
 **Ближайший шаг:** положить выгрузку 1С в `/srv/ai2/ubd/src`, индекс ai2; contour на ai2 — позже. Prod не трогать.
+
+---
+
+### 2026-10-26 — Graph-identity гейт: симметрия образов + видимость recovery для git-источника
+
+**Задача.** Устранить заморозку git-источника в вечном recovery (UBD на стенде простоял 8 «зелёных» ночей на ревизии от 2026-10-16 при уехавшем апстриме) и сделать остаточную ветку recovery видимой.
+
+**Причина.** `run_graph_layer` записывал в `layer_state.indexer_version` образ **writer-джобы** (`contour-graph-*`), а гейт `_live_layer_identities` сравнивает записанное с образом **обслуживающего** контейнера `graph_mcp`. Это разные контейнеры: после пересборки `ai2-mcp-metadata-graph` (2026-10-18, MCP-фиксы) сравнение расходилось навсегда → `_live_storage_status="changed"` каждую ночь → git-ветка `_default_v2_database_runner` выбирала `PublishedRecoveryProvider`, который не делает `git fetch` и не смотрит `origin/main` → ревизия не менялась, прогоны честно публиковали старое дерево («published ok»). Цикл не сходился: writer продолжал исполняться на записанном образе и перезаписывал его же. Побочно: ночь 21→22 упала об «previous source already exists» (нет автоочистки в установленной версии; фикс в main уже есть, не задеплоен).
+
+**Решение.** (1) Симметрия identity: graph-слой записывает образ `database.services.graph_mcp` — тот же объект, который читает гейт; после первой успешной публикации записанное и живое сходятся, пересборка MCP-образа даёт ограниченный цикл (одна recovery-ночь), а не вечный. Для `code_index` семантика не менялась (там bsl-контейнер и писатель, и сервер). (2) Видимость: при входе git-источника в recovery отправляется алерт `_recovery_source_note` — best-effort fetch + сравнение `origin/<branch>` с опубликованной ревизией («upstream ahead» / «unchanged» / «fetch failed»); отказ проверки никогда не роняет прогон.
+
+**Отвергнуто.** Игнорировать `indexer_version` в гейте для graph (теряется сигнал «обслуживающий стек сменился»); fetch внутри recovery-провайдера как путь обновления (recovery существует из-за сбоя — не время тянуть новые данные).
+
+**Изменено.** `controller/src/contour/profiles.py` (образ graph-слоя), `controller/src/contour/reconcile.py` (`_recovery_source_note` + отправка в recovery-ветке git-источника), `controller/tests/test_graph_identity_gate.py` (6 тестов: источник identity, сходимость гейта, три состояния note, wiring-тест ветки), этот журнал.
+
+**Проверено.** TDD: новые тесты наблюдались в RED (включая воспроизведение бага `img:writer != img:mcp`), затем GREEN; полный suite в изолированном worktree: **341 passed, 8 skipped** (база 334/8 + 6 новых + 1 параметризация), регрессий нет. На стенде не развёрнуто и не запускалось — после мержа нужен bootstrap/upgrade `/opt` (см. ниже).
+
+**Откат.** `git revert` одного коммита; состояние state.db не менялось (старые записи `indexer_version` легаси-значениями безопасны: после revert гейт вернётся к прежней семантике, заморозка вернётся до ре-пина вручную).
+
+**Дальше.** PR → мерж → redeploy `/opt` → первая ночь после деплоя пройдёт в recovery С алертом «upstream ahead» и запишет новый identity; следующая ночь обязана взять GitSourceProvider и опубликовать свежую ревизию УБД. Контроль: `target_revision` в runs и `origin/main` в reflog.
+
+### 2026-10-26 — FULL-индексер сохраняет частичные отпечатки (P2-2: KB «сохранённого состояния нет» каждую ночь)
+
+**Задача.** Разорвать вечную петлю KB: graph-этап каждую ночь exit 3 «сохранённого состояния нет — первая индексация» → FULL (~2,5 мин) → состояние снова нет.
+
+**Причина.** Частичные отпечатки (`partial_owners_*` в `:Fingerprint`) писал только частичный путь (`apply_changes.write_stored`); `indexer.py` (FULL) сохранял лишь глобальные ключи (`metadata_xml`/`bsl_source`). Любая база после FULL теряла инкрементальность навсегда. Стенд-факты: в Neo4j KB узлов `partial_owners_*` нет вообще (только глобальные ключи); в Neo4j UBD они есть (6 чанков, ~3 МБ) — но это разовый ручной сеед cutover-скрипта `.tmp-after-full-finish-t12.sh` от 18.10 («Seed partial fingerprints»), nightly FULL их не перезаписывал. UBD спаслась ручной операцией, KB — нет: идеальный chicken-and-egg.
+
+**Решение.** `_seed_partial_state(neo, src, fp_strict)` в indexer.py: scan_workspace+write_stored тем же режимом, что глобальные отпечатки; вызывается на КАЖДОМ успешном выходе полного индексера — включая ранний «данные актуальны, выход» (лечащий случай: состояние снесли, работы нет) и конец полного прогона. Выход `METADATA_SKIP_BSL` намеренно не сеет (FIX-27: граф без слоя владения не должен получать состояние «всё учтено»). Сбой сееда — warning, не провал прогона.
+
+**Отвергнуто.** Сеед только в contour-обвязке после job (лечит стенд, но ломает вендора везде вне contour); сеед перед фазами (сорванный прогон получил бы состояние успешного).
+
+**Изменено.** `compose/mcp_for_1c/1c-mcp-suite/mcp-metadata-graph-neo4j/indexer.py` (импорт, хелпер, 2 вызова), `tests_indexer_phases.py` (3 теста: здоровый-выход сеет, полный прогон сеет, сорванная фаза 2 не сеет; setUp/tearDown — сохранение новых имён), этот журнал.
+
+**Проверено.** TDD: RED (2 сеед-теста падали: written=None) → GREEN. Сюит метаданных целиком: 12 файлов OK (частичные скипы — Neo4j, существовали до). Ветка стакнута на `fix/fingerprint-content-hash` (использует fp_strict) — мерж по порядку. На стенде не развёрнуто.
+
+**Откат.** `git revert` коммита; поведение возвращается к «FULL не сеет» (петля KB возвращается).
+
+**Дальше.** Мерж P2-1 → этот PR → пересборка образа + /srv-синк. Ожидание по ночам KB: ночь 1 — FULL с сеедом (конверсия режима заодно), ночь 2+ — частичный путь («изменений нет» или точечные правки). Совместно с P2-1/P1-2 ночная картина УБД: fetch свежей ревизии → частичный граф вместо 3-часовой FULL.
+
+### 2026-10-26 — Graph-fingerprint: контент вместо mtime (P2-1: ночная FULL на неизменных данных)
+
+**Задача.** Убрать еженощную полную пересборку графа УБД (~3 ч Neo4j) при неизменном источнике: graph-этап каждую ночь падал exit 3 «изменились корневые файлы конфигурации» → graph_full.
+
+**Причина.** Отпечатки в `partial_fingerprint.scan_workspace` и `graph_writer.fingerprint_workspace_multi` строились из кортежа (путь, размер, **st_mtime_ns**) — содержимое не читалось вовсе. Оркестратор перестейджирует дерево каждую ночь (git clone --no-hardlinks / копирование published): байты те же, mtime у всех файлов новые → `_root` всегда «изменён» → FULL. Воспроизведено замером на стенде: published и staged (байт-в-байт) дали разные digest `_root` (`efb0bd61` vs `71afcd9b`) — разница только в mtime. Дефолт stat был обоснован легаси-условиями (дерево на месте + windows bind-mount, 26 мс/файл → 12 мин чтения), в contour-пайплайне предпосылка неверна структурно. Отягчающее: `scan_workspace` не имел контентного режима вообще — `METADATA_FINGERPRINT_STRICT=true` не чинил частичный путь (apply_changes в strict даже отказывался обновлять глобальные ключи).
+
+**Решение.** Content-режим (sha256 содержимого) — умолчание в обоих модулях; stat — opt-out через `METADATA_FINGERPRINT_STAT=true` для легаси. `scan_workspace(strict=None|True|False)` зеркалит `fingerprint_workspace_multi`; режим пишется в `meta["mode"]`; apply_changes передаёт единый режим в скан и всегда обновляет глобальные ключи (metadata_xml/bsl_source) с честной меткой режима; смена режима на сохранённом состоянии даёт одну полную пересборку (несравнимые значения — индексер пишет об этом в лог, режим в `:Fingerprint.mode`). Обёртки fingerprint_workspace/files — strict=None. Цена: чтение ~1,2 ГБ за скан — десятки секунд на ext4.
+
+**Отвергнуто.** Сохранение/нормализация mtime при стейджинге (git clone mtime не сохраняет; любой touch извне снова даёт ложный FULL); индексация из published вместо staged (меняет контракт пайплайна).
+
+**Изменено.** `compose/mcp_for_1c/1c-mcp-suite/mcp-metadata-graph-neo4j/`: partial_fingerprint.py (режимы+sha256+meta.mode), graph_writer.py (дефолт content, резолвер, обёртки), apply_changes.py (единый режим, запись глобальных ключей), indexer.py (env-резолв, лог, таблица env), tests_partial_fingerprint.py (3 новых), tests_fingerprint.py (дефолт content, stat opt-out, stat-тесты на strict=False), docker-compose.yml + .env.example (METADATA_FINGERPRINT_STAT), этот журнал.
+
+**Проверено.** TDD: RED зафиксирован (touch-only менял digest; mode='stat' != 'content'), затем GREEN. Сюит метаданных на хосте: partial_fingerprint, fingerprint, graph_writer (4 skip — Neo4j), incremental (2 skip), indexer_phases — OK; полный список в коммит-сообщении. На стенде не развёрнуто: после мержа — синхронизация /srv-копии сюита и пересборка job-образа (иначе ночи продолжат идти на stat-коде).
+
+**Откат.** `git revert` коммита; либо на стенде `METADATA_FINGERPRINT_STAT=true` (без отката кода) возвращает stat-семантику ценой возврата P2-1.
+
+**Дальше.** PR → мерж → пересборка образа графа + /srv-синк → первая ночь: одна конверсионная FULL (смена режима), со второй ночи при неизменном источнике ожидаем «изменений нет» вместо graph-этапа. P2-2 (KB: «сохранённого состояния нет») чинится следующим — там состояние вообще не переживает ночь.
 
 ---
 

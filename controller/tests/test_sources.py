@@ -16,6 +16,7 @@ from contour.sources import (
     activate_source,
     compute_staged_tree_digest,
     rollback_source,
+    safe_revision_token,
 )
 
 
@@ -147,7 +148,65 @@ def test_package_prepare_does_not_write_published(tmp_path: Path):
     assert not (published / "Configuration.xml").exists()
 
 
-def test_activate_uses_replace_and_preserves_previous_on_failure(
+def test_activate_mirrors_in_place_same_directory(tmp_path: Path):
+    sources_root, staging, published = _layout(tmp_path)
+    published.mkdir()
+    (published / ".contour-revision").write_text("old", encoding="utf-8")
+    (published / "old.txt").write_text("old", encoding="utf-8")
+    published_inode = published.stat().st_ino
+
+    staged = staging / "ubd" / "new"
+    staged.mkdir(parents=True)
+    (staged / ".contour-revision").write_text("new", encoding="utf-8")
+    (staged / "new.txt").write_text("new", encoding="utf-8")
+
+    prepared = PreparedSource(
+        database="ubd",
+        revision="new",
+        staged_path=staged,
+        previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
+        kind="package",
+        content_digest=compute_staged_tree_digest(staged),
+    )
+    assert activate_source(prepared, published) is None
+    assert published.stat().st_ino == published_inode
+    assert (published / "new.txt").read_text(encoding="utf-8") == "new"
+    assert not (published / "old.txt").exists()
+    assert not staged.exists()
+
+
+def test_activate_preserves_code_index(tmp_path: Path):
+    sources_root, staging, published = _layout(tmp_path)
+    published.mkdir()
+    (published / ".contour-revision").write_text("old", encoding="utf-8")
+    (published / "old.txt").write_text("old", encoding="utf-8")
+    code_index = published / ".code-index"
+    code_index.mkdir()
+    (code_index / "index.db").write_bytes(b"sqlite-keep")
+
+    staged = staging / "ubd" / "new"
+    staged.mkdir(parents=True)
+    (staged / ".contour-revision").write_text("new", encoding="utf-8")
+    (staged / "new.txt").write_text("new", encoding="utf-8")
+
+    prepared = PreparedSource(
+        database="ubd",
+        revision="new",
+        staged_path=staged,
+        previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
+        kind="package",
+        content_digest=compute_staged_tree_digest(staged),
+    )
+    activate_source(prepared, published)
+    assert (published / ".code-index" / "index.db").read_bytes() == b"sqlite-keep"
+    assert (published / "new.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_activate_failure_keeps_published_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     sources_root, staging, published = _layout(tmp_path)
@@ -171,22 +230,16 @@ def test_activate_uses_replace_and_preserves_previous_on_failure(
         content_digest=compute_staged_tree_digest(staged),
     )
 
-    real_replace = Path.replace
-    calls: list[tuple[Path, Path]] = []
+    def boom(*_args, **_kwargs):
+        raise OSError("injected activate failure")
 
-    def boom(self: Path, target: Path):
-        calls.append((self, Path(target)))
-        if len(calls) == 2:
-            raise OSError("injected activate failure")
-        return real_replace(self, target)
-
-    monkeypatch.setattr(Path, "replace", boom)
+    monkeypatch.setattr("contour.sources._mirror_tree_into", boom)
     with pytest.raises(OSError, match="injected"):
         activate_source(prepared, published)
 
     assert published.exists()
     assert (published / "old.txt").read_text(encoding="utf-8") == "old"
-    assert calls, "activation must use Path.replace"
+    assert staged.exists()
 
 
 def test_activate_same_revision_is_idempotent(tmp_path: Path):
@@ -216,11 +269,46 @@ def test_activate_same_revision_is_idempotent(tmp_path: Path):
     assert staged.exists()
 
 
+def test_activate_ignores_leftover_prev_directory(tmp_path: Path):
+    """In-place activate does not rename published; leftover .prev-* is ignored."""
+    sources_root, staging, published = _layout(tmp_path)
+    published.mkdir()
+    (published / ".contour-revision").write_text("rev-old", encoding="utf-8")
+    (published / "old.txt").write_text("old", encoding="utf-8")
+
+    stuck = sources_root / f"ubd.prev-{safe_revision_token('rev-old')}"
+    stuck.mkdir()
+    (stuck / ".contour-revision").write_text("rev-old", encoding="utf-8")
+    (stuck / "stale.txt").write_text("stale", encoding="utf-8")
+
+    staged = staging / "ubd" / "rev-new"
+    staged.mkdir(parents=True)
+    (staged / ".contour-revision").write_text("rev-new", encoding="utf-8")
+    (staged / "new.txt").write_text("new", encoding="utf-8")
+
+    prepared = PreparedSource(
+        database="ubd",
+        revision="rev-new",
+        staged_path=staged,
+        previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
+        kind="package",
+        content_digest=compute_staged_tree_digest(staged),
+    )
+    assert activate_source(prepared, published) is None
+    assert (published / "new.txt").read_text(encoding="utf-8") == "new"
+    assert not (published / "old.txt").exists()
+    assert stuck.exists()
+    assert (stuck / "stale.txt").read_text(encoding="utf-8") == "stale"
+
+
 def test_rollback_restores_previous(tmp_path: Path):
     sources_root, staging, published = _layout(tmp_path)
     published.mkdir()
     (published / ".contour-revision").write_text("new", encoding="utf-8")
     (published / "new.txt").write_text("new", encoding="utf-8")
+    published_inode = published.stat().st_ino
 
     previous = sources_root / "ubd.prev-old"
     previous.mkdir()
@@ -228,7 +316,9 @@ def test_rollback_restores_previous(tmp_path: Path):
     (previous / "old.txt").write_text("old", encoding="utf-8")
 
     rollback_source(published, previous, sources_root=sources_root)
+    assert published.stat().st_ino == published_inode
     assert (published / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not (published / "new.txt").exists()
     assert not previous.exists()
 
 
