@@ -1,5 +1,7 @@
 # STATUS
 
+> С 2026-10-29 действует [порядок работы со стендом и Git](docs/production-workflow.md). Сводка ниже датирована 2026-10-18 и требует повторной проверки. Изменение правил работы не обновляет факты о сервисах; текущие SHA, образы и результаты ночей здесь пока не подтверждены.
+
 **Updated:** 2026-10-18  
 **Horizon:** linux-first / `contour` on stand (Task 12 cutover)  
 **Repo:** https://github.com/SergeyGlazunov/ai-bella  

@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-12  
 **Updated:** 2026-10-14  
-**Status:** accepted for implementation (operational priority)  
+**Status:** historical migration design; current workflow: [production and Git](../docs/production-workflow.md)
 **Scope:** migrate orchestration and indexing from Windows-managed execution to WSL/Linux while keeping Windows as a temporary 1C exporter.
 
 ## 1. Purpose

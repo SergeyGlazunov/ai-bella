@@ -1,10 +1,10 @@
 # AI-Contour — для агента
 
-Контракт продукта, вектор и алгоритм правки — **[docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md)**. Его читают до кода. Для новой работы он выше этого файла и `For Cursor/LINUX-FIRST-DESIGN.md`.
+Действующий порядок: **[Работа со стендом и Git](docs/production-workflow.md)**. Приоритет — работающий контур и сохранение его изменений в Git. Требования будущего установщика текущую работу не ограничивают.
 
-Этот файл — источник правды по **текущему живому стенду** (PS/ai2 nightly, УБД-first) и общим запретам cutover. Состояние стенда/пакета и журнал решений — **[DEVELOPMENT.md](DEVELOPMENT.md)**. Эксплуатация и установка для человека — **[USER.md](USER.md)**.
+Этот файл содержит технические правила и исторические сведения о стенде. Факты нужно сверять с запущенными сервисами и датой проверки в [STATUS.md](STATUS.md). Журнал изменений — [DEVELOPMENT.md](DEVELOPMENT.md); эксплуатационные инструкции — [USER.md](USER.md).
 
-Linux-first / оркестратор `contour` — **[For Cursor/LINUX-FIRST-DESIGN.md](For%20Cursor/LINUX-FIRST-DESIGN.md)** §1.1 и **[For Cursor/AGENT.md](For%20Cursor/AGENT.md)**. Оба ниже контракта продукта. При расхождении разделов этого файла про «только УБД / fail-closed на всё чтение» с For Cursor для kit-работы следуй For Cursor; с контрактом продукта — контракту.
+Linux-first / оркестратор `contour`: [For Cursor/LINUX-FIRST-DESIGN.md](For%20Cursor/LINUX-FIRST-DESIGN.md) и [For Cursor/AGENT.md](For%20Cursor/AGENT.md). Это технические материалы миграции. Применять относящиеся к текущему стенду разделы; планы не считать доказательством внедрения.
 
 Не называть код пакета внедрённым, пока он не переключён на стенде. Живой стенд не переключать без явного разрешения. История чата не нужна.
 

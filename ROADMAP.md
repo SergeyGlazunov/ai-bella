@@ -1,6 +1,6 @@
 # ROADMAP
 
-Продукт дальше — [docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md). Горизонты A и B ниже — пройденный путь к оркестратору, не список следующей работы. Факты стенда — [STATUS.md](STATUS.md).
+Текущий приоритет — стабилизация рабочего контура и сохранение его изменений в Git: [порядок работы](docs/production-workflow.md). Мониторинг и универсальный установщик отложены. Горизонты ниже — исторический план миграции; их статусы не заменяют свежую проверку стенда.
 
 ## Horizon A — PS/ai2 stable (current)
 

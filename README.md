@@ -1,10 +1,10 @@
 # AI-Contour
 
-Установочный **комплект** (исходники + рецепты). Живые MCP/индексы крутятся в Docker и `/srv/ai2` / `C:\MCP`, не внутри этой папки.
+Репозиторий рабочего AI-контура: исходники, конфигурации без секретов и история изменений стенда. Текущий приоритет — стабильная работа продакшена. Универсальный установщик отложен.
 
 | Документ | Содержание |
 |----------|------------|
-| [docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md) | Контракт продукта: что ставим, вектор, алгоритм правки |
+| [Работа со стендом и Git](docs/production-workflow.md) | Действующий порядок изменений и фиксации продакшена |
 | [STATUS.md](STATUS.md) | Текущий runtime, блокеры, следующий шаг |
 | [ROADMAP.md](ROADMAP.md) | PS/ai2 stable → linux-first / contour |
 | [VENDOR.md](VENDOR.md) | Vendor trees и неизвестные upstream pin |
@@ -32,4 +32,4 @@ C:\AI-contour\
   logs/ workdir/ secrets/   локальный мусор стенда (gitignore)
 ```
 
-Контракт продукта — [устанавливаемый контур](docs/superpowers/specs/2026-10-18-installable-contour-design.md). Факты стенда — [STATUS.md](STATUS.md). Живой стенд не переустанавливать без явного разрешения.
+Состояние стенда сверять с датой проверки в [STATUS.md](STATUS.md). [Будущие доработки](docs/future-work/README.md) не являются текущими требованиями.
