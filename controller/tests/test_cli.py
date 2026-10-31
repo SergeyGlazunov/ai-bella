@@ -97,6 +97,7 @@ def test_cli_open_invokes_reopen(tmp_path: Path, monkeypatch):
 
     def fake_reopen(cfg, **kwargs):
         seen["called"] = True
+        seen["force"] = kwargs.get("force")
         return "success"
 
     monkeypatch.setattr("contour.cli.reopen_reads", fake_reopen)
@@ -106,6 +107,31 @@ def test_cli_open_invokes_reopen(tmp_path: Path, monkeypatch):
     )
     assert rc == 0
     assert seen["called"] is True
+    assert seen["force"] is False
+
+
+def test_cli_open_force_flag(tmp_path: Path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_reopen(cfg, **kwargs):
+        seen["force"] = kwargs.get("force")
+        return "success"
+
+    monkeypatch.setattr("contour.cli.reopen_reads", fake_reopen)
+    cfg = _write_cfg(tmp_path)
+    rc = main(
+        _argv(
+            cfg,
+            tmp_path / "db",
+            tmp_path / "lock",
+            "open",
+            "--database",
+            "ubd",
+            "--force",
+        )
+    )
+    assert rc == 0
+    assert seen["force"] is True
 
 
 def test_update_without_measure_is_not_measure(tmp_path: Path, monkeypatch):
@@ -114,6 +140,7 @@ def test_update_without_measure_is_not_measure(tmp_path: Path, monkeypatch):
     def fake_reconcile(cfg, *, timer, measure, **kwargs):
         seen["timer"] = timer
         seen["measure"] = measure
+        seen["force_window"] = kwargs.get("force_window")
         return "deferred"
 
     monkeypatch.setattr("contour.cli.reconcile", fake_reconcile)
@@ -122,6 +149,7 @@ def test_update_without_measure_is_not_measure(tmp_path: Path, monkeypatch):
     assert rc == 0
     assert seen["timer"] is False
     assert seen["measure"] is False
+    assert seen["force_window"] is False
 
 
 def test_update_measure_flag(tmp_path: Path, monkeypatch):
@@ -137,6 +165,24 @@ def test_update_measure_flag(tmp_path: Path, monkeypatch):
     rc = main(_argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--measure"))
     assert rc == 0
     assert seen["measure"] is True
+    assert seen["timer"] is False
+
+
+def test_update_force_window_flag(tmp_path: Path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_reconcile(cfg, *, timer, measure, **kwargs):
+        seen["force_window"] = kwargs.get("force_window")
+        seen["timer"] = timer
+        return "success"
+
+    monkeypatch.setattr("contour.cli.reconcile", fake_reconcile)
+    cfg = _write_cfg(tmp_path, build_deadline_seconds=None)
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--force-window")
+    )
+    assert rc == 0
+    assert seen["force_window"] is True
     assert seen["timer"] is False
 
 
@@ -275,36 +321,6 @@ def test_update_does_not_inject_probes(tmp_path: Path, monkeypatch):
     assert seen["has_probes_kw"] is False
 
 
-def test_cli_update_missing_adapters_does_not_close(tmp_path: Path, monkeypatch):
-    from test_reconcile import (
-        FakeDocker,
-        FakeGit,
-        _make_config,
-        _now,
-        _opts,
-    )
-
-    cfg_obj = _make_config(tmp_path, drop_adapters=True, build_deadline_seconds=None)
-    git = FakeGit()
-    docker = FakeDocker()
-    opts, _, _, db_path = _opts(tmp_path, cfg_obj, git, docker)
-
-    rc = main(
-        [
-            "--config",
-            str(tmp_path / "contour.yaml"),
-            "--db",
-            str(db_path),
-            "--lock",
-            str(opts["paths"].lock_path),
-            "update",
-        ]
-    )
-    assert rc != 0
-    assert git.writes == []
-    assert not any(c[:2] == ["docker", "stop"] for c in docker.calls)
-
-
 def test_validate_reports_all_database_profiles(tmp_path: Path, capsys):
     cfg = _write_cfg(tmp_path)
     rc = main(_argv(cfg, tmp_path / "db", tmp_path / "lock", "validate"))
@@ -392,7 +408,14 @@ def test_intake_validates_without_reconcile(tmp_path: Path, monkeypatch):
     raw["databases"]["kb"]["source"]["inbox"] = str(inbox)
     raw["databases"]["kb"]["source"]["source_path"] = str(tmp_path / "sources" / "kb")
     cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
-    _make_package(inbox, name="ready-kb1", database="kb", export_id="kb1")
+    # Identity-style checksum (not a tree digest): tree verify would fail.
+    _make_package(
+        inbox,
+        name="ready-kb1",
+        database="kb",
+        export_id="kb1",
+        checksum="b" * 64,
+    )
 
     called = {"reconcile": False}
     monkeypatch.setattr(

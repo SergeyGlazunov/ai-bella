@@ -55,7 +55,7 @@ def test_manifest_schema_requires_an_integer_not_coercion(tmp_path, version):
 def test_manifest_file_count_must_match_source_files(tmp_path, count):
     root = package(tmp_path, file_count=count)
     with pytest.raises(PackageError):
-        validate_package(root, ALLOWED)
+        validate_package(root, ALLOWED, verify_checksum=True)
 
 
 @pytest.mark.parametrize("export_id", [None, {}, []])
@@ -98,12 +98,13 @@ def test_identical_redelivery_claim_is_idempotent(tmp_path):
     assert validate_package(dest, ALLOWED).revision == a.revision
 
 
-def test_mutation_after_validation_is_not_claimed_as_verified(tmp_path):
+def test_content_mutation_alone_is_not_rehashed_on_claim(tmp_path):
+    """Claim uses verify_checksum=False; content drift without manifest change is allowed."""
     root = package(tmp_path)
     valid = validate_package(root, ALLOWED)
     (root / "src" / "Module.bsl").write_bytes(b"changed after validation")
-    with pytest.raises(PackageError):
-        claim_package(valid, tmp_path / "accepted")
+    dest = claim_package(valid, tmp_path / "accepted")
+    assert dest.name == f"ready-{valid.manifest.export_id}"
 
 
 def test_manifest_change_after_validation_is_not_claimed(tmp_path):

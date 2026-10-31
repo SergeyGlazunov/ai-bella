@@ -9,7 +9,7 @@ from dataclasses import dataclass
 class RuntimePolicy:
     """Operational budgets for inspect/info and writer observation."""
 
-    docker_command_timeout_seconds: float = 30.0
+    docker_command_timeout_seconds: float = 120.0
     docker_transient_retries: int = 2
     docker_transient_pause_seconds: float = 1.0
     # Chunk for one `docker wait` / exec-inspect poll cycle. Expiry alone does

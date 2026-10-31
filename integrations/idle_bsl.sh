@@ -2,13 +2,22 @@
 # Fail-closed idle probe for bsl-indexer (R03 / F04).
 set -eu
 CONTAINER="${BSL_CONTAINER:-bsl-indexer}"
+# Prefer python3: throwaway update runners often install python3 without `python`.
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  echo "idle_bsl: python3/python not found" >&2
+  exit 1
+fi
 
 if ! status="$(docker exec "$CONTAINER" bsl-indexer daemon status --json 2>/dev/null)"; then
   echo "idle_bsl: cannot reach daemon status" >&2
   exit 1
 fi
 
-printf '%s' "$status" | python -c '
+printf '%s' "$status" | "$PYTHON" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)

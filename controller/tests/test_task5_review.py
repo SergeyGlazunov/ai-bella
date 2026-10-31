@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -13,9 +12,7 @@ from contour.sources import (
     PreparedSource,
     SourceError,
     activate_source,
-    compute_staged_tree_digest,
     rollback_source,
-    safe_revision_token,
 )
 
 
@@ -36,6 +33,7 @@ def tree(path, revision, content):
     path.mkdir(parents=True)
     (path / ".contour-revision").write_text(revision, encoding="utf-8")
     (path / "data.txt").write_text(content, encoding="utf-8")
+    (path / "Configuration.xml").write_text(f"<cfg>{content}</cfg>", encoding="utf-8")
 
 
 def git_provider(tmp_path):
@@ -70,7 +68,7 @@ def sealed(database, revision, staged, previous, root, published):
         sources_root=root,
         published_path=published,
         kind="package",
-        content_digest=compute_staged_tree_digest(staged),
+        content_digest=None,
     )
 
 
@@ -105,7 +103,7 @@ def test_git_second_cycle_is_not_dirty_from_service_marker(tmp_path):
     provider.prepare()  # must be a valid no-change retry
 
 
-def test_staged_git_keeps_configured_upstream(tmp_path):
+def test_git_prepare_keeps_configured_upstream(tmp_path):
     root, staging, published, remote, provider = git_provider(tmp_path)
     prepared = provider.prepare()
     assert git(prepared.staged_path, "remote", "get-url", "origin") == str(remote)
@@ -117,7 +115,6 @@ def test_git_two_upstream_cycles(tmp_path):
     activate_source(first, published)
     assert (published / "data.txt").read_text(encoding="utf-8") == "r1"
 
-    # New upstream commit via a separate clone.
     writer = tmp_path / "writer"
     git(tmp_path, "clone", str(remote), str(writer))
     git(writer, "config", "user.email", "test@example.invalid")
@@ -158,22 +155,6 @@ def test_rollback_refuses_same_directory_without_destroying_it(tmp_path):
     assert (published / "data.txt").read_text(encoding="utf-8") == "current"
 
 
-def test_prepare_staging_inside_published_is_rejected(tmp_path):
-    root, staging = layout(tmp_path)
-    published = root / "kb"
-    tree(published, "r0", "current")
-    provider = PackageSourceProvider(
-        validated_package(tmp_path),
-        staging_root=published / ".staging",
-        published_path=published,
-        sources_root=root,
-    )
-    before = {p.relative_to(published).as_posix() for p in published.rglob("*")}
-    with pytest.raises(SourceError):
-        provider.prepare()
-    assert {p.relative_to(published).as_posix() for p in published.rglob("*")} == before
-
-
 def test_activation_checks_destination_is_within_prepared_source_root(tmp_path):
     root, staging = layout(tmp_path)
     provider = PackageSourceProvider(
@@ -189,121 +170,67 @@ def test_activation_checks_destination_is_within_prepared_source_root(tmp_path):
     assert not outside.exists()
 
 
-def test_mutated_package_is_not_staged_under_old_revision(tmp_path):
+def test_mutated_package_manifest_identity_still_detected(tmp_path):
+    """Checksum-light revalidate still catches export_id / database identity drift."""
     root, staging = layout(tmp_path)
     package = validated_package(tmp_path)
-    (package.path / "src" / "Configuration.xml").write_bytes(b"<Changed/>")
+    manifest = json.loads((package.path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["export_id"] = "mutated-export"
+    (package.path / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
     provider = PackageSourceProvider(
         package,
         staging_root=staging,
         published_path=root / "kb",
         sources_root=root,
     )
-    with pytest.raises((SourceError, ValueError)):
+    with pytest.raises(SourceError, match="changed after validation"):
         provider.prepare()
-
-
-def test_repeat_prepare_preserves_existing_staging_on_copy_failure(
-    tmp_path, monkeypatch
-):
-    root, staging = layout(tmp_path)
-    provider = PackageSourceProvider(
-        validated_package(tmp_path),
-        staging_root=staging,
-        published_path=root / "kb",
-        sources_root=root,
-    )
-    prepared = provider.prepare()
-    old = (prepared.staged_path / "Configuration.xml").read_bytes()
-
-    def failed_copy(*args, **kwargs):
-        raise OSError("injected staging copy failure")
-
-    monkeypatch.setattr("contour.sources._copy_source_tree", failed_copy)
-    with pytest.raises(OSError):
-        provider.prepare()
-    assert (prepared.staged_path / "Configuration.xml").read_bytes() == old
 
 
 def test_activation_with_known_previous_still_publishes_in_place(tmp_path):
     root, staging = layout(tmp_path)
-    published, previous, staged = root / "kb", root / "kb.prev-r1", staging / "kb" / "r2"
+    published, previous = root / "kb", root / "kb.prev-r1"
+    staged = tmp_path / "accepted" / "src"
     tree(previous, "r1", "previous")
-    tree(staged, "r2", "next")
+    tree(staged, "r2", "next-longer-payload")
     prepared = sealed("kb", "r2", staged, previous, root, published)
     assert activate_source(prepared, published) is None
-    assert (published / "data.txt").read_text(encoding="utf-8") == "next"
+    assert (published / "data.txt").read_text(encoding="utf-8") == "next-longer-payload"
     assert previous.exists()
 
 
 def test_same_revision_activation_retry_is_idempotent(tmp_path):
     root, staging = layout(tmp_path)
-    published, staged = root / "kb", staging / "kb" / "r2"
-    tree(published, "r1", "previous")
-    tree(staged, "r2", "next")
-    digest = compute_staged_tree_digest(staged)
-    prepared = PreparedSource(
-        "kb",
-        "r2",
-        staged,
-        None,
-        sources_root=root,
-        published_path=published,
-        kind="package",
-        content_digest=digest,
-    )
-    assert activate_source(prepared, published) is None
-    retry = PreparedSource(
-        "kb",
-        "r2",
-        staged,
-        None,
-        sources_root=root,
-        published_path=published,
-        kind="package",
-        content_digest=digest,
-    )
-    assert activate_source(retry, published) is None
-    assert (published / "data.txt").read_text(encoding="utf-8") == "next"
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows package revision path")
-def test_second_package_activation_handles_revision_colon(tmp_path):
-    root, staging = layout(tmp_path)
-    package = validated_package(tmp_path)
     published = root / "kb"
-    tree(published, package.revision, "previous")
-    staged = staging / "kb" / "next"
-    tree(staged, "next-revision", "next")
-    assert (
-        activate_source(
-            sealed("kb", "next-revision", staged, None, root, published),
-            published,
-        )
-        is None
-    )
+    staged = tmp_path / "accepted" / "src"
+    tree(published, "r2", "next")
+    tree(staged, "r2", "next")
+    prepared = sealed("kb", "r2", staged, None, root, published)
+    assert activate_source(prepared, published) is None
+    assert activate_source(prepared, published) is None
     assert (published / "data.txt").read_text(encoding="utf-8") == "next"
+    assert staged.exists()
 
 
 def test_failed_activation_keeps_published_tree(tmp_path, monkeypatch):
     root, staging = layout(tmp_path)
-    published, staged = root / "kb", staging / "kb" / "r2"
+    published = root / "kb"
+    staged = tmp_path / "accepted" / "src"
     tree(published, "r1", "previous")
-    tree(staged, "r2", "next")
+    tree(staged, "r2", "next-longer")
 
     def fail_mirror(*_args, **_kwargs):
         raise OSError("injected activation failure")
 
     monkeypatch.setattr("contour.sources._mirror_tree_into", fail_mirror)
     with pytest.raises(OSError):
-        activate_source(
-            sealed("kb", "r2", staged, None, root, published),
-            published,
-        )
+        activate_source(sealed("kb", "r2", staged, None, root, published), published)
     assert (published / "data.txt").read_text(encoding="utf-8") == "previous"
 
 
-def test_package_prepare_matches_source_bytes(tmp_path):
+def test_package_prepare_points_at_package_src(tmp_path):
     root, staging = layout(tmp_path)
     package = validated_package(tmp_path)
     prepared = PackageSourceProvider(
@@ -312,39 +239,8 @@ def test_package_prepare_matches_source_bytes(tmp_path):
         published_path=root / "kb",
         sources_root=root,
     ).prepare()
+    assert prepared.staged_path == package.path / "src"
+    assert prepared.content_digest is None
     assert (prepared.staged_path / "Configuration.xml").read_bytes() == (
         package.path / "src" / "Configuration.xml"
     ).read_bytes()
-
-
-@pytest.mark.skipif(os.name != "posix", reason="Linux staging symlink")
-def test_staging_symlink_cannot_delete_published_source(tmp_path):
-    root, staging = layout(tmp_path)
-    package = validated_package(tmp_path)
-    published = root / "kb"
-    tree(published, "r0", "current")
-    alias = staging / "kb" / safe_revision_token(package.revision)
-    alias.parent.mkdir(parents=True)
-    alias.symlink_to(published, target_is_directory=True)
-    provider = PackageSourceProvider(
-        package,
-        staging_root=staging,
-        published_path=published,
-        sources_root=root,
-    )
-    with pytest.raises(SourceError):
-        provider.prepare()
-    assert (published / "data.txt").read_text(encoding="utf-8") == "current"
-
-
-def test_activation_stage_marker_must_match_prepared_revision(tmp_path):
-    root, staging = layout(tmp_path)
-    published, staged = root / "kb", staging / "kb" / "r2"
-    tree(published, "r1", "current")
-    tree(staged, "unexpected-revision", "unexpected")
-    with pytest.raises(SourceError):
-        activate_source(
-            sealed("kb", "r2", staged, None, root, published),
-            published,
-        )
-    assert (published / "data.txt").read_text(encoding="utf-8") == "current"

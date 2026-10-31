@@ -3,6 +3,14 @@
 set -eu
 CONTAINER="${BSL_CONTAINER:-bsl-indexer}"
 export CODE_INDEX_HOME="${CODE_INDEX_HOME:-/data/code-index-home}"
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  echo "reload_bsl_watch: python3/python not found" >&2
+  exit 1
+fi
 
 out="$(docker exec -e CODE_INDEX_HOME="$CODE_INDEX_HOME" "$CONTAINER" \
   bsl-indexer daemon reload 2>&1)" || {
@@ -12,7 +20,7 @@ out="$(docker exec -e CODE_INDEX_HOME="$CODE_INDEX_HOME" "$CONTAINER" \
 }
 printf '%s\n' "$out"
 
-printf '%s' "$out" | python -c '
+printf '%s' "$out" | "$PYTHON" -c '
 import json, sys
 text = sys.stdin.read()
 start, end = text.find("{"), text.rfind("}")
