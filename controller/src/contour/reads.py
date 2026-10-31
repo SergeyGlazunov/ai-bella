@@ -18,7 +18,6 @@ from contour.remount_bsl import (
     published_workspace,
 )
 from contour.sources import published_path_for
-from contour.watch_bsl import pause_watch, restore_watch, watch_is_paused
 
 # Host DROP on bsl_publish_port is optional (ADM-SAPHX-TECH: no host/LAN MCP
 # clients; updates off-hours). Required close = graph stop + WebUI network cut.
@@ -458,28 +457,47 @@ class DatabaseReadController:
                 return
 
     def _pause_watcher(self) -> None:
+        """Do not strip [[paths]] from daemon.toml; isolate via webui_network only.
+
+        If the working file already lost [[paths]] but a non-empty .bak still has
+        them, restore from .bak so close does not leave a permanently broken toml.
+        """
         toml_path = self.database.services.bsl_daemon_toml
         path = Path(toml_path)
         if not path.is_file():
             raise RuntimeError(
                 f"daemon.toml missing for {self.database.name}: {toml_path}"
             )
-        backup = toml_path + ".bak"
-        if not Path(backup).is_file():
-            shutil.copy2(path, backup)
-        self._watch_backup = backup
-        if not watch_is_paused(lambda: path.read_text(encoding="utf-8")):
-            pause_watch(toml_path, self.watch_reload)
+        backup = Path(toml_path + ".bak")
+        self._watch_backup = str(backup)
+        text = path.read_text(encoding="utf-8")
+        if "[[paths]]" in text:
+            return
+        if (
+            backup.is_file()
+            and backup.stat().st_size > 0
+            and "[[paths]]" in backup.read_text(encoding="utf-8")
+        ):
+            shutil.copy2(backup, path)
+            self.watch_reload()
 
     def _restore_watcher(self) -> None:
+        """Heal a damaged daemon.toml from .bak; never rewrite a healthy file."""
         if self.active_writer:
             raise RuntimeError(
                 f"refusing watcher restore for {self.database.name}: active writer"
             )
         toml_path = self.database.services.bsl_daemon_toml
-        backup = self._watch_backup or (toml_path + ".bak")
+        backup = Path(self._watch_backup or (toml_path + ".bak"))
         path = Path(toml_path)
-        if not path.is_file() or not Path(backup).is_file():
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        damaged = "[[paths]]" not in text
+        if not damaged:
             return
-        if watch_is_paused(lambda: path.read_text(encoding="utf-8")):
-            restore_watch(toml_path, backup, self.watch_reload)
+        if (
+            backup.is_file()
+            and backup.stat().st_size > 0
+            and "[[paths]]" in backup.read_text(encoding="utf-8")
+        ):
+            shutil.copy2(backup, path)
+            self.watch_reload()

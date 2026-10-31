@@ -63,7 +63,7 @@ def test_incomplete_package_without_ready_is_ignored_by_intake(tmp_path: Path):
     assert accepted == []
 
 
-def test_crash_after_source_activation_keeps_reads_closed(tmp_path: Path):
+def test_crash_after_source_activation_reopens_reads(tmp_path: Path):
     conn, state, _db, prepared, reads, _probes, result = run_publish_cycle(
         tmp_path,
         "kb",
@@ -72,7 +72,7 @@ def test_crash_after_source_activation_keeps_reads_closed(tmp_path: Path):
     )
     try:
         assert result.result == "failed"
-        assert reads.is_closed() is True
+        assert reads.is_closed() is False
         assert prepared.published_path.is_dir()
         assert (prepared.published_path / "data.txt").is_file()
         assert state.get_database("kb")["published_revision"] is None
@@ -191,7 +191,7 @@ def test_failed_mandatory_bsl_stage_blocks_publish(tmp_path: Path):
         assert result.result == "failed"
         assert "code_index" in result.message
         assert state.get_database("klon_opl")["published_revision"] is None
-        assert reads.is_closed() is True
+        assert reads.is_closed() is False
         assert probes.ran is False
         row = conn.execute(
             "SELECT status FROM layer_state WHERE database=? AND layer=?",
@@ -234,7 +234,7 @@ def test_reads_do_not_reopen_before_probes_pass(tmp_path: Path):
         conn.close()
 
 
-def test_probe_failure_keeps_reads_closed_and_unpublished(tmp_path: Path):
+def test_probe_failure_reopens_reads_and_stays_unpublished(tmp_path: Path):
     conn, state, _db, _prepared, reads, probes, result = run_publish_cycle(
         tmp_path,
         "kb",
@@ -243,7 +243,7 @@ def test_probe_failure_keeps_reads_closed_and_unpublished(tmp_path: Path):
     )
     try:
         assert result.result == "failed"
-        assert reads.is_closed() is True
+        assert reads.is_closed() is False
         assert state.get_database("kb")["published_revision"] is None
         assert probes.ran is True
     finally:

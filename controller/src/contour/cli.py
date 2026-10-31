@@ -448,6 +448,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="run a single database profile (schema_version 2)",
     )
+    update.add_argument(
+        "--force-window",
+        action="store_true",
+        help="ignore schedule window for manual daytime runs",
+    )
     intake = sub.add_parser(
         "intake",
         help="validate and claim the newest inbox package without indexing",
@@ -475,6 +480,11 @@ def main(argv: list[str] | None = None) -> int:
         "--database",
         default=None,
         help="reopen one v2 database; required when multiple profiles are enabled",
+    )
+    open_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="reopen even when layer_state is not ready / graph FULL still needed",
     )
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--dry-run", action="store_true")
@@ -582,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
             docker=docker,
             watch_reload=_reload,
             database=database,
+            force_window=bool(args.force_window),
         )
         return 0 if result in {"success", "deferred"} else 1
 
@@ -612,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
             paths=paths,
             watch_reload=_reload_open,
             database=database,
+            force=bool(getattr(args, "force", False)),
         )
         return 0 if result == "success" else 1
 

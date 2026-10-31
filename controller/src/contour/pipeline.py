@@ -256,6 +256,11 @@ def run_database_pipeline(
         if entry_read_error:
             message = f"{message}; also could not read prior reads state: {entry_read_error}"
         if activated:
+            # Keep run/lifecycle failed, but restore MCP reads for operators/users.
+            try:
+                reads.open()
+            except Exception as open_exc:
+                message = f"{message}; also failed to reopen reads: {open_exc}"
             _finish_failed(state, name, run_id, message)
             return PipelineResult(
                 name, revision or "unknown", "failed", message, run_id=run_id

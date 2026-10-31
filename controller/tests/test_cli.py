@@ -97,6 +97,7 @@ def test_cli_open_invokes_reopen(tmp_path: Path, monkeypatch):
 
     def fake_reopen(cfg, **kwargs):
         seen["called"] = True
+        seen["force"] = kwargs.get("force")
         return "success"
 
     monkeypatch.setattr("contour.cli.reopen_reads", fake_reopen)
@@ -106,6 +107,31 @@ def test_cli_open_invokes_reopen(tmp_path: Path, monkeypatch):
     )
     assert rc == 0
     assert seen["called"] is True
+    assert seen["force"] is False
+
+
+def test_cli_open_force_flag(tmp_path: Path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_reopen(cfg, **kwargs):
+        seen["force"] = kwargs.get("force")
+        return "success"
+
+    monkeypatch.setattr("contour.cli.reopen_reads", fake_reopen)
+    cfg = _write_cfg(tmp_path)
+    rc = main(
+        _argv(
+            cfg,
+            tmp_path / "db",
+            tmp_path / "lock",
+            "open",
+            "--database",
+            "ubd",
+            "--force",
+        )
+    )
+    assert rc == 0
+    assert seen["force"] is True
 
 
 def test_update_without_measure_is_not_measure(tmp_path: Path, monkeypatch):
@@ -114,6 +140,7 @@ def test_update_without_measure_is_not_measure(tmp_path: Path, monkeypatch):
     def fake_reconcile(cfg, *, timer, measure, **kwargs):
         seen["timer"] = timer
         seen["measure"] = measure
+        seen["force_window"] = kwargs.get("force_window")
         return "deferred"
 
     monkeypatch.setattr("contour.cli.reconcile", fake_reconcile)
@@ -122,6 +149,7 @@ def test_update_without_measure_is_not_measure(tmp_path: Path, monkeypatch):
     assert rc == 0
     assert seen["timer"] is False
     assert seen["measure"] is False
+    assert seen["force_window"] is False
 
 
 def test_update_measure_flag(tmp_path: Path, monkeypatch):
@@ -137,6 +165,24 @@ def test_update_measure_flag(tmp_path: Path, monkeypatch):
     rc = main(_argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--measure"))
     assert rc == 0
     assert seen["measure"] is True
+    assert seen["timer"] is False
+
+
+def test_update_force_window_flag(tmp_path: Path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_reconcile(cfg, *, timer, measure, **kwargs):
+        seen["force_window"] = kwargs.get("force_window")
+        seen["timer"] = timer
+        return "success"
+
+    monkeypatch.setattr("contour.cli.reconcile", fake_reconcile)
+    cfg = _write_cfg(tmp_path, build_deadline_seconds=None)
+    rc = main(
+        _argv(cfg, tmp_path / "db", tmp_path / "lock", "update", "--force-window")
+    )
+    assert rc == 0
+    assert seen["force_window"] is True
     assert seen["timer"] is False
 
 

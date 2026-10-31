@@ -1506,6 +1506,7 @@ def reopen_reads(
     git=None,
     probes=None,
     database: str | None = None,
+    force: bool = False,
 ) -> str:
     """Operator reopen: open_reads + verify-open; clear flags only if verify succeeds."""
     runtime = resolve_runtime_paths(
@@ -1527,6 +1528,7 @@ def reopen_reads(
                 docker=docker,
                 watch_reload=reload_fn,
                 send=send,
+                force=force,
             )
 
     held = acquire(runtime.lock_path, backend=lock_backend)
@@ -1548,11 +1550,11 @@ def reopen_reads(
                 send(cfg, "reopen refused: indexer still running")
                 _alert_if_reads_closed(cfg, conn, send)
                 return "failed"
-            if get_meta(conn, "graph_full_needed") == "1":
+            if not force and get_meta(conn, "graph_full_needed") == "1":
                 send(cfg, "reopen refused: graph FULL still needed")
                 _alert_if_reads_closed(cfg, conn, send)
                 return "failed"
-            if not _indexes_consistent(conn, cfg, docker, _enabled(cfg)):
+            if not force and not _indexes_consistent(conn, cfg, docker, _enabled(cfg)):
                 send(cfg, "reopen refused: indexes mixed or not ready")
                 _alert_if_reads_closed(cfg, conn, send)
                 return "failed"
@@ -1591,6 +1593,7 @@ def _reopen_reads_v2_database(
     docker,
     watch_reload,
     send,
+    force: bool = False,
 ) -> str:
     """Reopen one v2 database using its own services/layers (not primary UBD)."""
     from contour.index_graph import is_graph_full_needed
@@ -1612,32 +1615,41 @@ def _reopen_reads_v2_database(
             if writer == "busy":
                 _safe_send(send, cfg, f"reopen refused: {db.name} indexer still running")
                 return "failed"
-            if writer == "unknown":
-                _safe_send(send, cfg, f"reopen refused: {db.name} writer state unknown")
-                return "failed"
-            if is_graph_full_needed(conn, db.name):
-                _safe_send(send, cfg, f"reopen refused: {db.name} graph FULL still needed")
-                return "failed"
-            all_profiles = list((cfg.databases or {}).values())
-            block = writer_blocks_database(conn, db, all_profiles, docker, cfg=cfg)
-            if block is not None:
-                _safe_send(send, cfg, f"reopen refused: {block}")
-                return "failed"
-            for layer in db.required_layers:
-                row = conn.execute(
-                    """
-                    SELECT status, applied_revision FROM layer_state
-                    WHERE database = ? AND layer = ?
-                    """,
-                    (db.name, layer),
-                ).fetchone()
-                if row is None or str(row["status"] or "") != "ready":
+            if not force:
+                if writer == "unknown":
+                    _safe_send(
+                        send, cfg, f"reopen refused: {db.name} writer state unknown"
+                    )
+                    return "failed"
+                if is_graph_full_needed(conn, db.name):
                     _safe_send(
                         send,
                         cfg,
-                        f"reopen refused: {db.name} layer {layer} not ready",
+                        f"reopen refused: {db.name} graph FULL still needed",
                     )
                     return "failed"
+                all_profiles = list((cfg.databases or {}).values())
+                block = writer_blocks_database(
+                    conn, db, all_profiles, docker, cfg=cfg
+                )
+                if block is not None:
+                    _safe_send(send, cfg, f"reopen refused: {block}")
+                    return "failed"
+                for layer in db.required_layers:
+                    row = conn.execute(
+                        """
+                        SELECT status, applied_revision FROM layer_state
+                        WHERE database = ? AND layer = ?
+                        """,
+                        (db.name, layer),
+                    ).fetchone()
+                    if row is None or str(row["status"] or "") != "ready":
+                        _safe_send(
+                            send,
+                            cfg,
+                            f"reopen refused: {db.name} layer {layer} not ready",
+                        )
+                        return "failed"
             ctrl = DatabaseReadController(
                 db, conn, docker, watch_reload=watch_reload
             )
@@ -1720,6 +1732,7 @@ def reconcile(
     probes=None,
     database: str | None = None,
     database_runner: DatabaseRunner | None = None,
+    force_window: bool = False,
 ) -> str:
     if timer:
         measure = False
@@ -1758,6 +1771,7 @@ def reconcile(
                     probes=probes,
                     database=database,
                     database_runner=database_runner,
+                    force_window=force_window,
                 )
             if database is not None:
                 send(cfg, f"database filter requires schema_version 2: {database}")
@@ -1792,6 +1806,7 @@ def _reconcile_v2_locked(
     probes,
     database: str | None,
     database_runner: DatabaseRunner | None,
+    force_window: bool = False,
 ) -> str:
     del git, probes  # optional hooks for specialized runners
     state = StateStore(conn)
@@ -1815,6 +1830,8 @@ def _reconcile_v2_locked(
     all_profiles = list((cfg.databases or {}).values())
 
     def _fresh_may_write() -> str:
+        if force_window:
+            return "ok"
         return may_write(
             now=clock(), cfg=cfg, is_timer=timer, measure=measure
         )

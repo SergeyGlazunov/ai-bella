@@ -287,7 +287,7 @@ def test_failure_before_activation_leaves_reads_open(tmp_path: Path):
     assert state.get_database("ubd")["published_revision"] is None
 
 
-def test_failure_after_activation_leaves_reads_closed(tmp_path: Path):
+def test_failure_after_activation_reopens_reads(tmp_path: Path):
     conn, state, database, prepared = _setup(
         tmp_path, "ubd", frozenset({"code_index", "graph"})
     )
@@ -303,7 +303,8 @@ def test_failure_after_activation_leaves_reads_closed(tmp_path: Path):
         samples=Samples(bsl_paths=["a.bsl"], xml_paths=[], deletions=[]),
     )
     assert result.result == "failed"
-    assert reads.is_closed() is True
+    assert reads.is_closed() is False
+    assert "open" in reads.events
     assert prepared.published_path.is_dir()
     assert (prepared.published_path / "data.txt").read_text(encoding="utf-8") == "next"
     assert state.get_database("ubd")["published_revision"] is None
@@ -495,7 +496,7 @@ def test_pipeline_remounts_after_activate_before_index(tmp_path: Path):
     assert events == ["remount:ubd", "index"]
 
 
-def test_pipeline_remount_failure_leaves_reads_closed(tmp_path: Path):
+def test_pipeline_remount_failure_reopens_reads(tmp_path: Path):
     conn, state, database, prepared = _setup(
         tmp_path, "ubd", frozenset({"code_index", "graph"})
     )
@@ -517,4 +518,5 @@ def test_pipeline_remount_failure_leaves_reads_closed(tmp_path: Path):
     )
     assert result.result == "failed"
     assert "stale bind" in result.message
-    assert reads.is_closed() is True
+    assert reads.is_closed() is False
+    assert "open" in reads.events

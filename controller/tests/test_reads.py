@@ -569,6 +569,8 @@ def test_watcher_stays_paused_during_active_job(tmp_path: Path):
         active_writer=True,
     )
     ctrl.close_layer("code_index")
+    # Close must not strip [[paths]] from daemon.toml (network isolation only).
+    assert 'path = "/repos/SRC"' in toml.read_text(encoding="utf-8")
     with pytest.raises(RuntimeError, match="active writer"):
         ctrl.open_layer("code_index")
-    assert "path = \"/repos/SRC\"" not in toml.read_text(encoding="utf-8")
+    assert 'path = "/repos/SRC"' in toml.read_text(encoding="utf-8")
