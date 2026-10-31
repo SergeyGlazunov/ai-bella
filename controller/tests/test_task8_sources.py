@@ -103,6 +103,8 @@ def test_choose_newest_valid_ready_package(tmp_path: Path):
         export_id="export-bad",
         checksum="0" * 64,
     )
+    # Light validation ignores checksum; break required structure instead.
+    (broken / "src" / "Configuration.xml").unlink()
     inbox = tmp_path / "inbox"
     inbox.mkdir()
     for pkg in (older, newer, broken):
@@ -130,7 +132,8 @@ def test_recovery_works_without_remote(tmp_path: Path):
     )
     prepared = provider.prepare()
     assert prepared.revision == "rev-local"
-    assert prepared.staged_path != prepared.published_path
+    assert prepared.staged_path == prepared.published_path
+    assert prepared.content_digest is None
     assert read_revision(prepared.staged_path) == "rev-local"
     assert (prepared.staged_path / "Module.bsl").is_file()
 

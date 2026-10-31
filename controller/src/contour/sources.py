@@ -327,8 +327,10 @@ def _mirror_tree_into(
 ) -> None:
     """Update ``dst`` to match ``src`` in place (same directory inode).
 
-    Entries named in ``preserve`` at this level are left untouched and are not
-    deleted when absent from ``src``. Nested calls use an empty preserve set.
+    Entries named in ``preserve`` at *every* directory level are left untouched
+    and are not deleted when absent from ``src``. This keeps
+    ``workspace_subdir/.code-index`` across git activates (BSL index lives under
+    ``src/``, not the repo root).
     """
     if _is_reparse_point(src) or not src.is_dir():
         raise SourceError(f"refusing to mirror reparse or non-directory: {src}")
@@ -339,18 +341,32 @@ def _mirror_tree_into(
     for entry in src.iterdir():
         if _is_reparse_point(entry):
             raise SourceError(f"refusing to mirror reparse point: {entry}")
+        if entry.name in preserve:
+            # Do not overwrite local indexer state from staged (usually absent).
+            staged_names.add(entry.name)
+            continue
         staged_names.add(entry.name)
         target = dst / entry.name
         if entry.is_dir():
             if target.exists() and target.is_file():
                 _force_writable(target)
                 target.unlink()
-            _mirror_tree_into(entry, target, preserve=frozenset())
+            _mirror_tree_into(entry, target, preserve=preserve)
         elif entry.is_file():
             if target.exists() and target.is_dir() and not target.is_symlink():
                 if _is_reparse_point(target):
                     raise SourceError(f"refusing to replace reparse point: {target}")
                 _remove_tree_entry(target)
+            elif target.exists() and target.is_file():
+                src_st = entry.stat()
+                dst_st = target.stat()
+                if (
+                    src_st.st_size == dst_st.st_size
+                    and int(src_st.st_mtime) == int(dst_st.st_mtime)
+                ):
+                    continue
+                _force_writable(target)
+                target.unlink()
             elif target.exists():
                 _force_writable(target)
                 target.unlink()
@@ -537,14 +553,21 @@ def _snapshot_matches(prepared: PreparedSource, path: Path) -> bool:
     return True
 
 
-def activate_source(prepared: PreparedSource, published_path: Path) -> Path | None:
-    """Publish staged snapshot into ``published_path`` in place (stable inode).
+def _staged_under_staging(staged: Path, sources_root: Path) -> bool:
+    staging_root = _resolve(sources_root) / ".staging"
+    try:
+        _resolve(staged).relative_to(staging_root)
+        return True
+    except ValueError:
+        return False
 
-    Mirrors ``staged`` into the existing published directory so Docker bind
-    mounts and ``.code-index`` survive. Does not rename published aside to
-    ``.prev-*``. Returns ``None`` (no rename-prev handle). Rollback is a
-    re-prepare of the desired revision plus another in-place activate, or
-    ``rollback_source`` mirroring a legacy prev tree.
+
+def activate_source(prepared: PreparedSource, published_path: Path) -> Path | None:
+    """Publish into ``published_path`` in place (stable inode).
+
+    Git updates fast-forward the published checkout. Package/recovery mirrors
+    ``staged`` (often ``accepted/.../src``) into published without a second
+    full-tree digest. Does not rename published aside to ``.prev-*``.
     """
     sources_root = _resolve(prepared.sources_root)
     published = ensure_under_sources_root(published_path, sources_root)
@@ -554,41 +577,69 @@ def activate_source(prepared: PreparedSource, published_path: Path) -> Path | No
             f"published path mismatch: got {published}, expected {intended}"
         )
 
-    staged_raw = Path(prepared.staged_path)
-    staged: Path | None = None
-    if staged_raw.exists():
-        if _is_reparse_point(staged_raw):
-            raise SourceError(f"staged path must not be a reparse point: {staged_raw}")
-        staged = ensure_under_sources_root(staged_raw, sources_root)
-        _assert_disjoint(staged, published)
-
     # Validate optional legacy previous handle; it is not used for rename.
     _validate_known_previous(
         Path(prepared.previous_path) if prepared.previous_path is not None else None,
         sources_root=sources_root,
         published=published,
-        staged=staged,
+        staged=None,
     )
-
-    # Idempotent only when published bytes match the prepared snapshot.
-    # A forged revision marker must not skip publishing the staged tree.
-    if published.exists() and _snapshot_matches(prepared, published):
-        return None
-
-    if staged is None:
-        raise SourceError(f"staged path missing: {staged_raw}")
-
-    _verify_staged_snapshot(prepared, staged)
 
     if published.exists() and _is_reparse_point(published):
         raise SourceError("published path must not be a reparse point")
+
+    if prepared.kind == "git":
+        if not published.is_dir() or _is_reparse_point(published):
+            raise SourceError(f"published git tree missing: {published}")
+        try:
+            # In-place update to the prepared tip (no staging clone).
+            subprocess.run(
+                ["git", "checkout", "--force", "--quiet", prepared.revision],
+                cwd=str(published),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = _redact((exc.stderr or "").strip())
+            raise SourceError(f"git activate failed: {detail}") from None
+        head = gitutil.rev_parse(published, "HEAD")
+        if head != prepared.revision:
+            raise SourceError(
+                f"published HEAD {head} does not match prepared {prepared.revision}"
+            )
+        _exclude_revision_marker_from_git(published)
+        write_revision(published, prepared.revision)
+        return None
+
+    if prepared.kind != "package":
+        raise SourceError(f"unsupported prepared kind: {prepared.kind}")
+
+    staged_raw = Path(prepared.staged_path)
+    if not staged_raw.exists() or not staged_raw.is_dir() or _is_reparse_point(staged_raw):
+        raise SourceError(f"staged path missing: {staged_raw}")
+    staged = staged_raw
+    if _resolve(staged) == _resolve(published):
+        # Recovery / already-published: nothing to mirror.
+        if read_revision(published) == prepared.revision:
+            return None
+        write_revision(published, prepared.revision)
+        return None
+
+    if (
+        published.exists()
+        and read_revision(published) == prepared.revision
+        and (published / "Configuration.xml").is_file()
+    ):
+        return None
 
     if not published.exists():
         published.mkdir(parents=True, exist_ok=False)
 
     _mirror_tree_into(staged, published, preserve=_PUBLISH_PRESERVE)
-    # Staging is consumed after a successful publish (same as rename-activate).
-    _remove_tree_entry(staged)
+    write_revision(published, prepared.revision)
+    if _staged_under_staging(staged, sources_root):
+        _remove_tree_entry(staged)
     return None
 
 
@@ -619,7 +670,7 @@ def rollback_source(
 
 
 class GitSourceProvider:
-    """Stage a Git revision without mutating the published source tree."""
+    """Fetch/check a Git tip; activate updates the published tree in place."""
 
     def __init__(
         self,
@@ -638,13 +689,9 @@ class GitSourceProvider:
 
     def prepare(self) -> PreparedSource:
         sources_root = _resolve(self._sources_root)
-        staging_root = Path(self._staging_root)
-        published = Path(self._published_path)
-        if _is_reparse_point(staging_root):
-            raise SourceError("staging_root must not be a reparse/symlink")
-        staging_root = ensure_under_sources_root(staging_root, sources_root)
-        published = ensure_under_sources_root(published, sources_root)
-        _assert_disjoint(staging_root, published)
+        published = ensure_under_sources_root(
+            Path(self._published_path), sources_root
+        )
 
         repo = Path(self._config.path)
         if gitutil.is_dirty(repo):
@@ -661,85 +708,20 @@ class GitSourceProvider:
             raise SourceError("update is not a fast-forward")
 
         revision = gitutil.rev_parse(repo, f"origin/{self._config.branch}")
-        token = safe_revision_token(revision)
-        db_dir = _ensure_staging_database_dir(
-            staging_root, self._database, sources_root
-        )
-        final = ensure_path_chain_under_sources_root(db_dir / token, sources_root)
-        if final.exists() and _paths_overlap(final, published):
-            raise SourceError("staging target overlaps published source")
-
-        temp = ensure_path_chain_under_sources_root(
-            db_dir / f".tmp-{uuid.uuid4().hex}", sources_root
-        )
-        if temp.exists():
-            shutil.rmtree(temp)
-        try:
-            # Re-check immediately before write: parent must still be real/under root.
-            ensure_path_chain_under_sources_root(temp, sources_root)
-            ensure_path_chain_under_sources_root(final, sources_root)
-            try:
-                subprocess.run(
-                    ["git", "clone", "--no-hardlinks", "--quiet", str(repo), str(temp)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                subprocess.run(
-                    ["git", "checkout", "--quiet", "--detach", revision],
-                    cwd=str(temp),
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                # Keep configured upstream, not the local clone source.
-                subprocess.run(
-                    ["git", "remote", "set-url", "origin", self._config.remote],
-                    cwd=str(temp),
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-            except subprocess.CalledProcessError as exc:
-                detail = _redact((exc.stderr or "").strip())
-                raise SourceError(f"git staging failed: {detail}") from None
-            _exclude_revision_marker_from_git(temp)
-            write_revision(temp, revision)
-            head = gitutil.rev_parse(temp, "HEAD")
-            if head != revision:
-                raise SourceError(
-                    f"staged HEAD {head} does not match target {revision}"
-                )
-            if gitutil.is_dirty(temp):
-                raise SourceError("staged git checkout became dirty")
-            temp = ensure_under_sources_root(temp, sources_root)
-            final = ensure_path_chain_under_sources_root(final, sources_root)
-            _promote_dir(temp, final)
-            final = ensure_under_sources_root(final, sources_root)
-            digest = compute_staged_tree_digest(final)
-        except Exception:
-            if temp.exists():
-                shutil.rmtree(temp, ignore_errors=True)
-            raise
-
-        # Exclude marker on published checkout too (same path as config.path).
-        if published.exists() and (published / ".git").exists():
-            _exclude_revision_marker_from_git(published)
-
         return PreparedSource(
             database=self._database,
             revision=revision,
-            staged_path=final,
+            staged_path=published,
             previous_path=None,
             sources_root=sources_root,
             published_path=published,
             kind="git",
-            content_digest=digest,
+            content_digest=None,
         )
 
 
 class PackageSourceProvider:
-    """Stage package ``src/`` into a revision directory; never touch published."""
+    """Point activate at package ``src/``; mirror into published without .staging."""
 
     def __init__(
         self,
@@ -756,18 +738,14 @@ class PackageSourceProvider:
 
     def prepare(self) -> PreparedSource:
         sources_root = _resolve(self._sources_root)
-        staging_root = Path(self._staging_root)
-        published = Path(self._published_path)
-        if _is_reparse_point(staging_root):
-            raise SourceError("staging_root must not be a reparse/symlink")
-        staging_root = ensure_under_sources_root(staging_root, sources_root)
-        published = ensure_under_sources_root(published, sources_root)
-        _assert_disjoint(staging_root, published)
+        published = ensure_under_sources_root(
+            Path(self._published_path), sources_root
+        )
 
-        # Immutable ownership: re-validate on-disk package before staging.
         current = validate_package(
             self._package.path,
             frozenset({self._package.manifest.database}),
+            verify_checksum=False,
         )
         if (
             current.revision != self._package.revision
@@ -775,51 +753,19 @@ class PackageSourceProvider:
         ):
             raise SourceError("package changed after validation")
 
-        database = current.manifest.database
-        revision = current.revision
-        token = safe_revision_token(revision)
-        db_dir = _ensure_staging_database_dir(staging_root, database, sources_root)
-        final = ensure_path_chain_under_sources_root(db_dir / token, sources_root)
-        if final.exists() and _paths_overlap(final, published):
-            raise SourceError("staging target overlaps published source")
-
         src = self._package.path / "src"
         if not src.is_dir() or _is_reparse_point(src):
             raise SourceError("validated package missing real src/")
 
-        temp = ensure_path_chain_under_sources_root(
-            db_dir / f".tmp-{uuid.uuid4().hex}", sources_root
-        )
-        if temp.exists():
-            shutil.rmtree(temp)
-        try:
-            ensure_path_chain_under_sources_root(temp, sources_root)
-            ensure_path_chain_under_sources_root(final, sources_root)
-            _copy_source_tree(src, temp)
-            write_revision(temp, revision)
-            if read_revision(temp) != revision:
-                raise SourceError("failed to write staged revision marker")
-            digest = compute_staged_tree_digest(temp)
-            temp = ensure_under_sources_root(temp, sources_root)
-            final = ensure_path_chain_under_sources_root(final, sources_root)
-            _promote_dir(temp, final)
-            final = ensure_under_sources_root(final, sources_root)
-            if compute_staged_tree_digest(final) != digest:
-                raise SourceError("staged package digest changed during promote")
-        except Exception:
-            if temp.exists():
-                shutil.rmtree(temp, ignore_errors=True)
-            raise
-
         return PreparedSource(
-            database=database,
-            revision=revision,
-            staged_path=final,
+            database=current.manifest.database,
+            revision=current.revision,
+            staged_path=src,
             previous_path=None,
             sources_root=sources_root,
             published_path=published,
             kind="package",
-            content_digest=digest,
+            content_digest=None,
         )
 
 
@@ -863,9 +809,7 @@ class PublishedRecoveryProvider:
 
     def prepare(self) -> PreparedSource:
         sources_root = _resolve(self._sources_root)
-        staging_root = ensure_under_sources_root(self._staging_root, sources_root)
         published = ensure_under_sources_root(self._published_path, sources_root)
-        _assert_disjoint(staging_root, published)
         if not published.is_dir():
             raise SourceError("published source missing for recovery")
         actual = read_revision(published)
@@ -876,38 +820,15 @@ class PublishedRecoveryProvider:
                 f"recovery revision mismatch: requested {self._revision!r} "
                 f"but published marker is {actual!r}"
             )
-        revision = actual
-        token = safe_revision_token(revision)
-        db_dir = _ensure_staging_database_dir(
-            staging_root, self._database, sources_root
-        )
-        final = ensure_path_chain_under_sources_root(db_dir / token, sources_root)
-        if final.exists() and _paths_overlap(final, published):
-            raise SourceError("staging target overlaps published source")
-        temp = ensure_path_chain_under_sources_root(
-            db_dir / f".tmp-{uuid.uuid4().hex}", sources_root
-        )
-        if temp.exists():
-            shutil.rmtree(temp)
-        try:
-            _copy_source_tree(published, temp)
-            write_revision(temp, revision)
-            digest = compute_staged_tree_digest(temp)
-            _promote_dir(temp, final)
-            final = ensure_under_sources_root(final, sources_root)
-        except Exception:
-            if temp.exists():
-                shutil.rmtree(temp, ignore_errors=True)
-            raise
         return PreparedSource(
             database=self._database,
-            revision=revision,
-            staged_path=final,
+            revision=actual,
+            staged_path=published,
             previous_path=None,
             sources_root=sources_root,
             published_path=published,
             kind="package",
-            content_digest=digest,
+            content_digest=None,
         )
 
 

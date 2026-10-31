@@ -14,7 +14,6 @@ from contour.sources import (
     PreparedSource,
     SourceError,
     activate_source,
-    compute_staged_tree_digest,
     rollback_source,
     safe_revision_token,
 )
@@ -68,9 +67,12 @@ def _git_config(path: Path, remote_url: str, branch: str) -> GitSourceConfig:
 def test_git_prepare_rejects_dirty_tree(tmp_path: Path):
     remote, work, branch = _init_repo(tmp_path)
     sources_root, staging, published = _layout(tmp_path)
-    (work / "file.txt").write_text("dirty", encoding="utf-8")
+    # Published checkout is the live git work tree under sources_root.
+    published.mkdir(parents=True)
+    _git(tmp_path, "clone", str(remote), str(published))
+    (published / "file.txt").write_text("dirty", encoding="utf-8")
     provider = GitSourceProvider(
-        _git_config(work, str(remote), branch),
+        _git_config(published, str(remote), branch),
         staging_root=staging,
         published_path=published,
         sources_root=sources_root,
@@ -82,6 +84,9 @@ def test_git_prepare_rejects_dirty_tree(tmp_path: Path):
 def test_git_prepare_rejects_non_fast_forward(tmp_path: Path):
     remote, work, branch = _init_repo(tmp_path)
     sources_root, staging, published = _layout(tmp_path)
+    _git(tmp_path, "clone", str(remote), str(published))
+    _git(published, "config", "user.email", "t@example.com")
+    _git(published, "config", "user.name", "T")
 
     other = tmp_path / "other"
     _git(tmp_path, "clone", str(remote), str(other))
@@ -92,12 +97,12 @@ def test_git_prepare_rejects_non_fast_forward(tmp_path: Path):
     _git(other, "commit", "-m", "remote")
     _git(other, "push", "origin", "HEAD")
 
-    (work / "file.txt").write_text("local-only", encoding="utf-8")
-    _git(work, "add", "file.txt")
-    _git(work, "commit", "-m", "local")
+    (published / "file.txt").write_text("local-only", encoding="utf-8")
+    _git(published, "add", "file.txt")
+    _git(published, "commit", "-m", "local")
 
     provider = GitSourceProvider(
-        _git_config(work, str(remote), branch),
+        _git_config(published, str(remote), branch),
         staging_root=staging,
         published_path=published,
         sources_root=sources_root,
@@ -142,7 +147,8 @@ def test_package_prepare_does_not_write_published(tmp_path: Path):
         sources_root=sources_root,
     )
     prepared = provider.prepare()
-    assert prepared.staged_path.exists()
+    assert prepared.staged_path == pkg / "src"
+    assert prepared.content_digest is None
     assert prepared.staged_path != published
     assert (published / "keep.txt").read_text(encoding="utf-8") == before
     assert not (published / "Configuration.xml").exists()
@@ -155,26 +161,27 @@ def test_activate_mirrors_in_place_same_directory(tmp_path: Path):
     (published / "old.txt").write_text("old", encoding="utf-8")
     published_inode = published.stat().st_ino
 
-    staged = staging / "ubd" / "new"
-    staged.mkdir(parents=True)
-    (staged / ".contour-revision").write_text("new", encoding="utf-8")
-    (staged / "new.txt").write_text("new", encoding="utf-8")
+    # Accepted-style source (outside .staging) must not be deleted after mirror.
+    accepted = tmp_path / "accepted" / "ready-e1" / "src"
+    accepted.mkdir(parents=True)
+    (accepted / "new.txt").write_text("new-bytes-longer", encoding="utf-8")
+    (accepted / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
 
     prepared = PreparedSource(
         database="ubd",
         revision="new",
-        staged_path=staged,
+        staged_path=accepted,
         previous_path=None,
         sources_root=sources_root,
         published_path=published,
         kind="package",
-        content_digest=compute_staged_tree_digest(staged),
+        content_digest=None,
     )
     assert activate_source(prepared, published) is None
     assert published.stat().st_ino == published_inode
-    assert (published / "new.txt").read_text(encoding="utf-8") == "new"
+    assert (published / "new.txt").read_text(encoding="utf-8") == "new-bytes-longer"
     assert not (published / "old.txt").exists()
-    assert not staged.exists()
+    assert accepted.exists()
 
 
 def test_activate_preserves_code_index(tmp_path: Path):
@@ -186,10 +193,10 @@ def test_activate_preserves_code_index(tmp_path: Path):
     code_index.mkdir()
     (code_index / "index.db").write_bytes(b"sqlite-keep")
 
-    staged = staging / "ubd" / "new"
+    staged = tmp_path / "accepted" / "src"
     staged.mkdir(parents=True)
-    (staged / ".contour-revision").write_text("new", encoding="utf-8")
-    (staged / "new.txt").write_text("new", encoding="utf-8")
+    (staged / "new.txt").write_text("new-content", encoding="utf-8")
+    (staged / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
 
     prepared = PreparedSource(
         database="ubd",
@@ -199,11 +206,80 @@ def test_activate_preserves_code_index(tmp_path: Path):
         sources_root=sources_root,
         published_path=published,
         kind="package",
-        content_digest=compute_staged_tree_digest(staged),
+        content_digest=None,
     )
     activate_source(prepared, published)
     assert (published / ".code-index" / "index.db").read_bytes() == b"sqlite-keep"
-    assert (published / "new.txt").read_text(encoding="utf-8") == "new"
+    assert (published / "new.txt").read_text(encoding="utf-8") == "new-content"
+
+
+def test_activate_preserves_nested_code_index_under_src(tmp_path: Path):
+    """BSL index lives at workspace_subdir/.code-index, not repo root."""
+    sources_root, staging, published = _layout(tmp_path)
+    published.mkdir()
+    (published / "src").mkdir()
+    (published / "src" / "Configuration.xml").write_text("<old/>", encoding="utf-8")
+    nested = published / "src" / ".code-index"
+    nested.mkdir()
+    (nested / "index.db").write_bytes(b"nested-keep")
+
+    staged = tmp_path / "accepted" / "src-root"
+    (staged / "src").mkdir(parents=True)
+    (staged / "src" / "Configuration.xml").write_text(
+        "<new-longer-payload/>", encoding="utf-8"
+    )
+    (staged / "src" / "CommonModules").mkdir()
+    (staged / "src" / "CommonModules" / "Foo.bsl").write_text("// foo", encoding="utf-8")
+
+    prepared = PreparedSource(
+        database="ubd",
+        revision="new",
+        staged_path=staged,
+        previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
+        kind="package",
+        content_digest=None,
+    )
+    activate_source(prepared, published)
+    assert (published / "src" / ".code-index" / "index.db").read_bytes() == b"nested-keep"
+    assert (published / "src" / "Configuration.xml").read_text(
+        encoding="utf-8"
+    ) == "<new-longer-payload/>"
+    assert (published / "src" / "CommonModules" / "Foo.bsl").read_text(
+        encoding="utf-8"
+    ) == "// foo"
+
+
+def test_mirror_skips_unchanged_size_and_mtime(tmp_path: Path):
+    import os
+
+    sources_root, staging, published = _layout(tmp_path)
+    published.mkdir()
+    (published / ".contour-revision").write_text("r1", encoding="utf-8")
+    (published / "Configuration.xml").write_text("<same/>", encoding="utf-8")
+    (published / "keep.bin").write_bytes(b"payload")
+    staged = tmp_path / "accepted" / "src"
+    staged.mkdir(parents=True)
+    (staged / "Configuration.xml").write_text("<same/>", encoding="utf-8")
+    (staged / "keep.bin").write_bytes(b"payload")
+    for name in ("Configuration.xml", "keep.bin"):
+        dst = published / name
+        src = staged / name
+        os.utime(src, (dst.stat().st_atime, dst.stat().st_mtime))
+    before_ino = (published / "keep.bin").stat().st_ino
+    prepared = PreparedSource(
+        database="ubd",
+        revision="r2",
+        staged_path=staged,
+        previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
+        kind="package",
+        content_digest=None,
+    )
+    activate_source(prepared, published)
+    assert (published / "keep.bin").stat().st_ino == before_ino
 
 
 def test_activate_failure_keeps_published_directory(
@@ -214,10 +290,10 @@ def test_activate_failure_keeps_published_directory(
     (published / ".contour-revision").write_text("old", encoding="utf-8")
     (published / "old.txt").write_text("old", encoding="utf-8")
 
-    staged = staging / "ubd" / "new"
+    staged = tmp_path / "accepted" / "src"
     staged.mkdir(parents=True)
-    (staged / ".contour-revision").write_text("new", encoding="utf-8")
     (staged / "new.txt").write_text("new", encoding="utf-8")
+    (staged / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
 
     prepared = PreparedSource(
         database="ubd",
@@ -227,7 +303,7 @@ def test_activate_failure_keeps_published_directory(
         sources_root=sources_root,
         published_path=published,
         kind="package",
-        content_digest=compute_staged_tree_digest(staged),
+        content_digest=None,
     )
 
     def boom(*_args, **_kwargs):
@@ -246,11 +322,12 @@ def test_activate_same_revision_is_idempotent(tmp_path: Path):
     sources_root, staging, published = _layout(tmp_path)
     published.mkdir()
     (published / ".contour-revision").write_text("rev-a", encoding="utf-8")
+    (published / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
     (published / "file.txt").write_text("a", encoding="utf-8")
 
-    staged = staging / "ubd" / "rev-a"
+    staged = tmp_path / "accepted" / "src"
     staged.mkdir(parents=True)
-    (staged / ".contour-revision").write_text("rev-a", encoding="utf-8")
+    (staged / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
     (staged / "file.txt").write_text("a", encoding="utf-8")
 
     prepared = PreparedSource(
@@ -261,10 +338,9 @@ def test_activate_same_revision_is_idempotent(tmp_path: Path):
         sources_root=sources_root,
         published_path=published,
         kind="package",
-        content_digest=compute_staged_tree_digest(staged),
+        content_digest=None,
     )
-    prev = activate_source(prepared, published)
-    assert prev is None
+    assert activate_source(prepared, published) is None
     assert (published / "file.txt").read_text(encoding="utf-8") == "a"
     assert staged.exists()
 
@@ -281,10 +357,10 @@ def test_activate_ignores_leftover_prev_directory(tmp_path: Path):
     (stuck / ".contour-revision").write_text("rev-old", encoding="utf-8")
     (stuck / "stale.txt").write_text("stale", encoding="utf-8")
 
-    staged = staging / "ubd" / "rev-new"
+    staged = tmp_path / "accepted" / "src"
     staged.mkdir(parents=True)
-    (staged / ".contour-revision").write_text("rev-new", encoding="utf-8")
-    (staged / "new.txt").write_text("new", encoding="utf-8")
+    (staged / "new.txt").write_text("new-longer", encoding="utf-8")
+    (staged / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
 
     prepared = PreparedSource(
         database="ubd",
@@ -294,10 +370,10 @@ def test_activate_ignores_leftover_prev_directory(tmp_path: Path):
         sources_root=sources_root,
         published_path=published,
         kind="package",
-        content_digest=compute_staged_tree_digest(staged),
+        content_digest=None,
     )
     assert activate_source(prepared, published) is None
-    assert (published / "new.txt").read_text(encoding="utf-8") == "new"
+    assert (published / "new.txt").read_text(encoding="utf-8") == "new-longer"
     assert not (published / "old.txt").exists()
     assert stuck.exists()
     assert (stuck / "stale.txt").read_text(encoding="utf-8") == "stale"
@@ -322,16 +398,19 @@ def test_rollback_restores_previous(tmp_path: Path):
     assert not previous.exists()
 
 
-def test_paths_cannot_escape_sources_root(tmp_path: Path):
+def test_git_prepare_returns_published_without_staging(tmp_path: Path):
+    remote, _work, branch = _init_repo(tmp_path)
     sources_root, staging, published = _layout(tmp_path)
-    escape = tmp_path / "outside"
-    escape.mkdir()
-    remote, work, branch = _init_repo(tmp_path)
+    _git(tmp_path, "clone", str(remote), str(published))
     provider = GitSourceProvider(
-        _git_config(work, str(remote), branch),
-        staging_root=escape,
+        _git_config(published, str(remote), branch),
+        staging_root=staging,
         published_path=published,
         sources_root=sources_root,
     )
-    with pytest.raises(SourceError, match="sources"):
-        provider.prepare()
+    prepared = provider.prepare()
+    assert prepared.kind == "git"
+    assert prepared.content_digest is None
+    assert prepared.staged_path == published
+    assert prepared.published_path == published
+    assert not any(staging.rglob("*"))

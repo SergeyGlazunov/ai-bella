@@ -203,7 +203,9 @@ def _published_package_finished_at(
 
     for path in iter_ready_package_dirs(accepted_root):
         try:
-            package = validate_package(path, frozenset({database}))
+            package = validate_package(
+                path, frozenset({database}), verify_checksum=False
+            )
         except PackageError:
             continue
         if package.revision == published_revision:

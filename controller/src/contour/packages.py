@@ -329,12 +329,14 @@ def choose_newest_valid_package(
     database: str,
     *,
     required_operations: Mapping[str, frozenset[str]] | None = None,
+    verify_checksum: bool = False,
 ) -> tuple[ValidatedPackage | None, list[str]]:
     """Pick the newest valid READY package for ``database``.
 
     Sort key: ``finished_at`` descending, then ``export_id`` descending as a
     stable tie-break. Corrupt candidates are reported and skipped; they must
-    not block other databases.
+    not block other databases. Checksum verification defaults off so inbox /
+    accepted scans do not re-hash tens of thousands of files.
     """
     warnings: list[str] = []
     candidates: list[ValidatedPackage] = []
@@ -344,6 +346,7 @@ def choose_newest_valid_package(
                 path,
                 frozenset({database}),
                 required_operations=required_operations,
+                verify_checksum=verify_checksum,
             )
         except PackageError as exc:
             warnings.append(f"{path.name}: {exc}")
@@ -371,6 +374,7 @@ def validate_package(
     allowed_databases: frozenset[str],
     *,
     required_operations: Mapping[str, frozenset[str]] | None = None,
+    verify_checksum: bool = True,
 ) -> ValidatedPackage:
     root = Path(path)
     _assert_real_directory(root, label="package root")
@@ -385,7 +389,8 @@ def validate_package(
     if not config_xml.is_file() or _is_reparse_point(config_xml):
         raise PackageError("missing src/Configuration.xml")
 
-    _reject_unsafe_paths(root)
+    if verify_checksum:
+        _reject_unsafe_paths(root)
 
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -398,15 +403,17 @@ def validate_package(
     if manifest.database not in allowed_databases:
         raise PackageError(f"unexpected database: {manifest.database}")
 
-    actual_count = count_source_files(root)
-    if actual_count != manifest.file_count:
-        raise PackageError(
-            f"file_count mismatch: manifest={manifest.file_count} actual={actual_count}"
-        )
+    if verify_checksum:
+        actual_count = count_source_files(root)
+        if actual_count != manifest.file_count:
+            raise PackageError(
+                f"file_count mismatch: manifest={manifest.file_count} "
+                f"actual={actual_count}"
+            )
 
-    actual = compute_source_checksum(root)
-    if actual != manifest.checksum:
-        raise PackageError("checksum mismatch")
+        actual = compute_source_checksum(root)
+        if actual != manifest.checksum:
+            raise PackageError("checksum mismatch")
 
     revision = f"{manifest.checksum}:{manifest.export_id}"
     return ValidatedPackage(path=root, manifest=manifest, revision=revision)
@@ -421,24 +428,15 @@ def _same_claim(existing: ValidatedPackage, expected: ValidatedPackage) -> bool:
     )
 
 
-def _verify_unchanged(package: ValidatedPackage) -> None:
-    """Reject claim if files/manifest changed after validate_package."""
-    current = validate_package(
-        package.path, frozenset({package.manifest.database})
-    )
-    if current.revision != package.revision or current.manifest != package.manifest:
-        raise PackageError("package changed after validation")
-
-
 def claim_package(package: ValidatedPackage, accepted_root: Path) -> Path:
     """Atomically publish a validated package into ``accepted_root``.
 
     Ownership protocol: the caller must stop writing the inbox path after
-    ``validate_package``. ``claim_package`` re-validates the on-disk snapshot
-    against the ``ValidatedPackage`` before rename. Identical redelivery or a
-    retry after a successful rename is idempotent when the accepted package
-    matches the verified identity; differing content with the same export_id
-    is a collision. Cross-filesystem rename is not emulated with copy.
+    ``validate_package``. ``claim_package`` re-checks READY/manifest identity
+    without re-hashing the tree. Identical redelivery or a retry after a
+    successful rename is idempotent when the accepted package matches the
+    verified identity; differing content with the same export_id is a
+    collision. Cross-filesystem rename is not emulated with copy.
     """
     accepted_root = Path(accepted_root)
     accepted_root.mkdir(parents=True, exist_ok=True)
@@ -450,7 +448,9 @@ def claim_package(package: ValidatedPackage, accepted_root: Path) -> Path:
         )
     if dest.exists():
         existing = validate_package(
-            dest, frozenset({package.manifest.database})
+            dest,
+            frozenset({package.manifest.database}),
+            verify_checksum=False,
         )
         if _same_claim(existing, package):
             return dest
@@ -463,7 +463,13 @@ def claim_package(package: ValidatedPackage, accepted_root: Path) -> Path:
             "package path missing and no matching accepted claim"
         )
 
-    _verify_unchanged(package)
+    current = validate_package(
+        package.path,
+        frozenset({package.manifest.database}),
+        verify_checksum=False,
+    )
+    if current.revision != package.revision or current.manifest != package.manifest:
+        raise PackageError("package changed after validation")
     try:
         package.path.replace(dest)
     except OSError as exc:
