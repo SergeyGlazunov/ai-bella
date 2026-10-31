@@ -694,12 +694,10 @@ def test_empty_samples_warning_is_visible():
     assert any(EMPTY_LAYER_SAMPLE_WARNING in item for item in warnings)
 
 
-def test_git_already_published_skips_pipeline(tmp_path: Path, monkeypatch):
-    """UBD with matching origin tip + live storage must defer without indexing."""
+def _git_ubd_already_published_fixture(tmp_path: Path):
+    """Minimal published UBD git tip + state ready for skip-path tests."""
     import subprocess
 
-    from contour import dockerutil
-    from contour.reconcile import _default_v2_database_runner
     from contour.sources import write_revision
 
     remote = tmp_path / "remote.git"
@@ -776,6 +774,15 @@ def test_git_already_published_skips_pipeline(tmp_path: Path, monkeypatch):
             "sha256:img",
         )
     state.mark_published("ubd", tip)
+    return cfg, database, conn, state, tip
+
+
+def test_git_already_published_skips_pipeline(tmp_path: Path, monkeypatch):
+    """UBD with matching origin tip + live storage must defer without indexing."""
+    from contour import dockerutil
+    from contour.reconcile import _default_v2_database_runner
+
+    cfg, database, conn, state, _tip = _git_ubd_already_published_fixture(tmp_path)
 
     monkeypatch.setattr(
         dockerutil,
@@ -810,4 +817,48 @@ def test_git_already_published_skips_pipeline(tmp_path: Path, monkeypatch):
     ).fetchone()
     assert run["result"] == "deferred"
     assert run["message"] == "already published"
+    conn.close()
+
+
+def test_git_already_published_defers_on_storage_unknown(
+    tmp_path: Path, monkeypatch
+):
+    """Transient Docker inspect failure must not start a close/index cycle."""
+    from contour import dockerutil
+    from contour.reconcile import _default_v2_database_runner
+
+    cfg, database, conn, state, _tip = _git_ubd_already_published_fixture(tmp_path)
+
+    def _raise_volume(*_a, **_k):
+        raise RuntimeError("inspect hung")
+
+    monkeypatch.setattr(dockerutil, "volume_identity", _raise_volume)
+    monkeypatch.setattr(
+        dockerutil, "image_id", lambda *_a, **_k: "sha256:img"
+    )
+
+    pipeline_calls: list[str] = []
+
+    def _boom(*_a, **_k):
+        pipeline_calls.append("run")
+        raise AssertionError("pipeline must not run on storage unknown")
+
+    monkeypatch.setattr("contour.pipeline.run_database_pipeline", _boom)
+
+    result = _default_v2_database_runner(
+        database,
+        cfg=cfg,
+        conn=conn,
+        state=state,
+        docker=PingDocker(),
+        send=lambda *_a, **_k: None,
+        may_write=lambda: "ok",
+    )
+    assert result == "deferred"
+    assert pipeline_calls == []
+    run = conn.execute(
+        "SELECT result, message FROM runs WHERE database='ubd' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert run["result"] == "deferred"
+    assert run["message"] == "storage identity unknown"
     conn.close()

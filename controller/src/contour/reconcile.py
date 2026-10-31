@@ -643,14 +643,22 @@ def _default_v2_database_runner(
                 if (
                     published_revision == origin_tip
                     and not is_graph_full_needed(conn, database.name)
-                    and _live_storage_status(
+                ):
+                    storage = _live_storage_status(
                         database, origin_tip, conn, docker
                     )
-                    == "match"
-                ):
-                    run_id = state.start_run(database.name, origin_tip)
-                    state.finish_run(run_id, "deferred", "already published")
-                    return "deferred"
+                    if storage == "match":
+                        run_id = state.start_run(database.name, origin_tip)
+                        state.finish_run(
+                            run_id, "deferred", "already published"
+                        )
+                        return "deferred"
+                    if storage == "unknown":
+                        run_id = state.start_run(database.name, origin_tip)
+                        state.finish_run(
+                            run_id, "deferred", "storage identity unknown"
+                        )
+                        return "deferred"
 
     reload_fn = (
         watch_reload
