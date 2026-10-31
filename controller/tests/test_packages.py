@@ -123,10 +123,19 @@ def test_missing_required_entries_rejected(tmp_path: Path, kwargs, match):
         validate_package(pkg, ALLOWED)
 
 
+def test_validate_package_skips_tree_checksum_by_default(tmp_path: Path):
+    """PowerShell identity checksum is not a per-file tree digest."""
+    identity = "a" * 64
+    pkg = _make_package(tmp_path, checksum=identity)
+    validated = validate_package(pkg, ALLOWED)
+    assert validated.manifest.checksum == identity
+    assert validated.revision == f"{identity}:export-1"
+
+
 def test_checksum_mismatch_rejected(tmp_path: Path):
     pkg = _make_package(tmp_path, checksum="0" * 64)
     with pytest.raises(PackageError, match="checksum"):
-        validate_package(pkg, ALLOWED)
+        validate_package(pkg, ALLOWED, verify_checksum=True)
 
 
 def test_unsupported_schema_version_rejected(tmp_path: Path):
@@ -157,7 +166,7 @@ def test_symlink_escape_in_package_rejected(tmp_path: Path):
     except OSError:
         pytest.skip("symlinks unavailable")
     with pytest.raises(PackageError, match="path|symlink|escape"):
-        validate_package(pkg, ALLOWED)
+        validate_package(pkg, ALLOWED, verify_checksum=True)
 
 
 def test_identical_deliveries_share_artifact_identity(tmp_path: Path):

@@ -154,6 +154,37 @@ def test_package_prepare_does_not_write_published(tmp_path: Path):
     assert not (published / "Configuration.xml").exists()
 
 
+def test_git_activate_keeps_branch_not_detached(tmp_path: Path):
+    """activate_source must leave published on the configured branch tip."""
+    remote, work, branch = _init_repo(tmp_path)
+    sources_root, staging, published = _layout(tmp_path)
+    _git(tmp_path, "clone", str(remote), str(published))
+    (work / "file.txt").write_text("v2", encoding="utf-8")
+    _git(work, "add", "file.txt")
+    _git(work, "commit", "-m", "v2")
+    _git(work, "push", "origin", "HEAD")
+    _git(published, "fetch", "origin")
+    tip = _git(published, "rev-parse", f"origin/{branch}").stdout.strip()
+    # Simulate the old bug: detached HEAD before activate.
+    _git(published, "checkout", "--detach", "HEAD")
+
+    prepared = PreparedSource(
+        database="ubd",
+        revision=tip,
+        staged_path=published,
+        previous_path=None,
+        sources_root=sources_root,
+        published_path=published,
+        kind="git",
+        content_digest=None,
+        git_branch=branch,
+    )
+    assert activate_source(prepared, published) is None
+    assert _git(published, "symbolic-ref", "--short", "HEAD").stdout.strip() == branch
+    assert _git(published, "rev-parse", "HEAD").stdout.strip() == tip
+    assert (published / ".contour-revision").read_text(encoding="utf-8").strip() == tip
+
+
 def test_activate_mirrors_in_place_same_directory(tmp_path: Path):
     sources_root, staging, published = _layout(tmp_path)
     published.mkdir()

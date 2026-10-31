@@ -692,3 +692,122 @@ def test_empty_samples_warning_is_visible():
     assert graph.seen == ["a.xml"]
     assert code.seen == []
     assert any(EMPTY_LAYER_SAMPLE_WARNING in item for item in warnings)
+
+
+def test_git_already_published_skips_pipeline(tmp_path: Path, monkeypatch):
+    """UBD with matching origin tip + live storage must defer without indexing."""
+    import subprocess
+
+    from contour import dockerutil
+    from contour.reconcile import _default_v2_database_runner
+    from contour.sources import write_revision
+
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    subprocess.run(["git", "init", "--bare"], cwd=remote, check=True, capture_output=True)
+    work = tmp_path / "work"
+    subprocess.run(
+        ["git", "clone", str(remote), str(work)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "t@example.com"], cwd=work, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "T"], cwd=work, check=True)
+    (work / "file.txt").write_text("v1", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=work, check=True)
+    subprocess.run(["git", "commit", "-m", "v1"], cwd=work, check=True)
+    subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=work, check=True)
+    branch = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=work,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tip = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=work,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    root = tmp_path / "root"
+    root.mkdir()
+    sources = root / "sources"
+    sources.mkdir()
+    published = sources / "ubd"
+    subprocess.run(
+        ["git", "clone", str(remote), str(published)], check=True, capture_output=True
+    )
+    write_revision(published, tip)
+
+    raw["runtime"]["root"] = str(root)
+    raw["runtime"]["db_path"] = str(tmp_path / "state.db")
+    raw["runtime"]["lock_path"] = str(tmp_path / "sync.lock")
+    raw["runtime"]["logs_path"] = str(tmp_path / "logs")
+    raw["runtime"]["backups_path"] = str(tmp_path / "backups")
+    raw["databases"]["kb"]["enabled"] = False
+    raw["databases"]["klon_opl"]["enabled"] = False
+    raw["databases"]["ubd"]["source"]["path"] = str(published)
+    raw["databases"]["ubd"]["source"]["remote"] = str(remote)
+    raw["databases"]["ubd"]["source"]["branch"] = branch
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+    database = cfg.databases["ubd"]
+
+    conn = init_db(str(tmp_path / "state.db"))
+    state = StateStore(conn)
+    state.register_database("ubd", "git")
+    for layer in database.required_layers:
+        volume = (
+            database.storage.code_index_volume
+            if layer == "code_index"
+            else database.storage.graph_volume
+        )
+        state.mark_layer(
+            "ubd",
+            layer,
+            tip,
+            "ready",
+            f"{volume}|live",
+            "sha256:img",
+        )
+    state.mark_published("ubd", tip)
+
+    monkeypatch.setattr(
+        dockerutil,
+        "volume_identity",
+        lambda volume, *, runner=None: f"{volume}|live",
+    )
+    monkeypatch.setattr(
+        dockerutil, "image_id", lambda _container, *, runner=None: "sha256:img"
+    )
+
+    pipeline_calls: list[str] = []
+
+    def _boom(*_a, **_k):
+        pipeline_calls.append("run")
+        raise AssertionError("pipeline must not run when already published")
+
+    monkeypatch.setattr("contour.pipeline.run_database_pipeline", _boom)
+
+    result = _default_v2_database_runner(
+        database,
+        cfg=cfg,
+        conn=conn,
+        state=state,
+        docker=PingDocker(),
+        send=lambda *_a, **_k: None,
+        may_write=lambda: "ok",
+    )
+    assert result == "deferred"
+    assert pipeline_calls == []
+    run = conn.execute(
+        "SELECT result, message FROM runs WHERE database='ubd' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert run["result"] == "deferred"
+    assert run["message"] == "already published"
+    conn.close()

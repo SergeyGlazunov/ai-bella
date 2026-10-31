@@ -55,7 +55,7 @@ def test_manifest_schema_requires_an_integer_not_coercion(tmp_path, version):
 def test_manifest_file_count_must_match_source_files(tmp_path, count):
     root = package(tmp_path, file_count=count)
     with pytest.raises(PackageError):
-        validate_package(root, ALLOWED)
+        validate_package(root, ALLOWED, verify_checksum=True)
 
 
 @pytest.mark.parametrize("export_id", [None, {}, []])

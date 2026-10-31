@@ -291,7 +291,9 @@ def _intake(cfg, database: str) -> int:
     accepted_root = Path(cfg.runtime.root) / "accepted" / db.name
     try:
         claimed = claim_package(chosen, accepted_root)
-        package = validate_package(claimed, frozenset({db.name}))
+        package = validate_package(
+            claimed, frozenset({db.name}), verify_checksum=False
+        )
     except (PackageError, OSError) as exc:
         print(f"intake failed: {exc}")
         return 1

@@ -374,7 +374,7 @@ def validate_package(
     allowed_databases: frozenset[str],
     *,
     required_operations: Mapping[str, frozenset[str]] | None = None,
-    verify_checksum: bool = True,
+    verify_checksum: bool = False,
 ) -> ValidatedPackage:
     root = Path(path)
     _assert_real_directory(root, label="package root")

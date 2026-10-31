@@ -38,6 +38,8 @@ class PreparedSource:
     published_path: Path
     kind: SourceKind = "package"
     content_digest: str | None = None
+    # Git only: keep published checkout on this branch (not detached HEAD).
+    git_branch: str | None = None
 
 
 class SourceProvider(Protocol):
@@ -591,10 +593,22 @@ def activate_source(prepared: PreparedSource, published_path: Path) -> Path | No
     if prepared.kind == "git":
         if not published.is_dir() or _is_reparse_point(published):
             raise SourceError(f"published git tree missing: {published}")
+        branch = (prepared.git_branch or "").strip()
+        if not branch:
+            raise SourceError("git activate requires PreparedSource.git_branch")
         try:
-            # In-place update to the prepared tip (no staging clone).
+            # Reset/create the tracking branch at the prepared tip so HEAD is
+            # never left detached (checkout <sha> alone would detach).
             subprocess.run(
-                ["git", "checkout", "--force", "--quiet", prepared.revision],
+                [
+                    "git",
+                    "checkout",
+                    "-B",
+                    branch,
+                    "--force",
+                    "--quiet",
+                    prepared.revision,
+                ],
                 cwd=str(published),
                 check=True,
                 capture_output=True,
@@ -607,6 +621,20 @@ def activate_source(prepared: PreparedSource, published_path: Path) -> Path | No
         if head != prepared.revision:
             raise SourceError(
                 f"published HEAD {head} does not match prepared {prepared.revision}"
+            )
+        current_branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=str(published),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if (
+            current_branch.returncode != 0
+            or (current_branch.stdout or "").strip() != branch
+        ):
+            raise SourceError(
+                f"published HEAD not on branch {branch!r} after activate"
             )
         _exclude_revision_marker_from_git(published)
         write_revision(published, prepared.revision)
@@ -717,6 +745,7 @@ class GitSourceProvider:
             published_path=published,
             kind="git",
             content_digest=None,
+            git_branch=self._config.branch,
         )
 
 

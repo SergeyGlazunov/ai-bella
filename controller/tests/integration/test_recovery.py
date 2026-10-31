@@ -36,7 +36,7 @@ from .conftest import (
 def test_corrupted_package_is_refused(tmp_path: Path):
     pkg = _make_package(tmp_path, name="bad", checksum="0" * 64)
     with pytest.raises(PackageError, match="checksum"):
-        validate_package(pkg, frozenset({"kb"}))
+        validate_package(pkg, frozenset({"kb"}), verify_checksum=True)
 
 
 def test_incomplete_package_without_ready_is_ignored_by_intake(tmp_path: Path):

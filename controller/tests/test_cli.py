@@ -408,7 +408,14 @@ def test_intake_validates_without_reconcile(tmp_path: Path, monkeypatch):
     raw["databases"]["kb"]["source"]["inbox"] = str(inbox)
     raw["databases"]["kb"]["source"]["source_path"] = str(tmp_path / "sources" / "kb")
     cfg_path.write_text(yaml.dump(raw, sort_keys=False), encoding="utf-8")
-    _make_package(inbox, name="ready-kb1", database="kb", export_id="kb1")
+    # Identity-style checksum (not a tree digest): tree verify would fail.
+    _make_package(
+        inbox,
+        name="ready-kb1",
+        database="kb",
+        export_id="kb1",
+        checksum="b" * 64,
+    )
 
     called = {"reconcile": False}
     monkeypatch.setattr(

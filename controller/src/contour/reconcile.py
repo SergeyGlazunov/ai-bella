@@ -623,6 +623,34 @@ def _default_v2_database_runner(
                 provider = build_source_provider(database, cfg)
         else:
             provider = build_source_provider(database, cfg)
+            # Skip close/index when origin tip is already published and live.
+            if isinstance(database.source, GitSourceConfig):
+                from contour import gitutil
+
+                repo = Path(database.source.path)
+                try:
+                    gitutil.fetch(repo)
+                    origin_tip = gitutil.rev_parse(
+                        repo, f"origin/{database.source.branch}"
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"git fetch/rev-parse failed: {exc}"
+                    ) from exc
+                published_revision = str(
+                    state.get_database(database.name)["published_revision"] or ""
+                )
+                if (
+                    published_revision == origin_tip
+                    and not is_graph_full_needed(conn, database.name)
+                    and _live_storage_status(
+                        database, origin_tip, conn, docker
+                    )
+                    == "match"
+                ):
+                    run_id = state.start_run(database.name, origin_tip)
+                    state.finish_run(run_id, "deferred", "already published")
+                    return "deferred"
 
     reload_fn = (
         watch_reload
