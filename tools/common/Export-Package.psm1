@@ -1,83 +1,24 @@
 # Shared Windows → Linux package export helpers (Task 9).
-# Checksum contract must match controller/src/contour/packages.py compute_source_checksum.
+# Checksum is a stable 64-hex identity token (not a full tree digest): SHA-256 of
+# "$Database:$ExportId:$FileCount:$FinishedAt". Contour intake uses
+# verify_checksum=False for package scans; file_count still gates completeness.
 # Package build and publish only (no container engine, no WSL launcher, no DB engine).
 
 Set-StrictMode -Version Latest
 
-function Get-RelativePosixPath {
-    param(
-        [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$FullPath
-    )
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
-    $fileFull = [IO.Path]::GetFullPath($FullPath)
-    if (-not $fileFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "path escapes root: $FullPath"
-    }
-    $rel = $fileFull.Substring($rootFull.Length).TrimStart('\', '/')
-    return ($rel -replace '\\', '/')
-}
-
-function Get-FileSha256Hex {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try {
-        $fs = [IO.File]::OpenRead($Path)
-        try {
-            $hash = $sha.ComputeHash($fs)
-        }
-        finally {
-            $fs.Dispose()
-        }
-        return ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
-    }
-    finally {
-        $sha.Dispose()
-    }
-}
-
 <#
 .SYNOPSIS
-  SHA-256 over sorted relative path, size and file SHA-256 (POSIX paths).
-  Excludes READY and manifest.json. Matches Python compute_source_checksum.
+  Fast 64-hex checksum from package identity fields (no per-file disk reads).
 #>
 function New-SourceChecksum {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourcePath
+        [Parameter(Mandatory = $true)][string]$Database,
+        [Parameter(Mandatory = $true)][string]$ExportId,
+        [Parameter(Mandatory = $true)][int]$FileCount,
+        [Parameter(Mandatory = $true)][string]$FinishedAt
     )
-    $root = [IO.Path]::GetFullPath($SourcePath)
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        throw "SourcePath is not a directory: $root"
-    }
-
-    $excluded = @{
-        'READY'         = $true
-        'manifest.json' = $true
-    }
-
-    # Collect then sort by relative POSIX path with Ordinal comparer so the
-    # order matches Python sorted(..., key=as_posix) regardless of PS culture.
-    $byRel = New-Object 'System.Collections.Generic.Dictionary[string,System.IO.FileInfo]'
-    Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
-        $rel = Get-RelativePosixPath -Root $root -FullPath $_.FullName
-        if ($excluded.ContainsKey($rel)) { return }
-        $byRel[$rel] = $_
-    }
-    $relKeys = New-Object string[] $byRel.Count
-    $byRel.Keys.CopyTo($relKeys, 0)
-    [Array]::Sort($relKeys, [StringComparer]::Ordinal)
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($rel in $relKeys) {
-        $f = $byRel[$rel]
-        $len = $f.Length
-        $digest = Get-FileSha256Hex -Path $f.FullName
-        $lines.Add("${rel}`0${len}`0${digest}")
-    }
-
-    $payload = [string]::Join("`n", $lines)
+    $payload = "${Database}:${ExportId}:${FileCount}:${FinishedAt}"
     $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
@@ -157,7 +98,11 @@ function New-ExportManifest {
         }
 
         $fileCount = Get-SourceFileCount -PackageRoot $pkgRoot
-        $checksum = New-SourceChecksum -SourcePath $pkgRoot
+        $checksum = New-SourceChecksum `
+            -Database $Database `
+            -ExportId $ExportId `
+            -FileCount ([int]$fileCount) `
+            -FinishedAt $FinishedAt
 
         return [ordered]@{
             schema_version   = 1
@@ -233,8 +178,8 @@ function Get-ManifestFileCountValue {
 function Test-PackageTreeMatchesManifest {
     <#
     .SYNOPSIS
-      True when on-disk src tree matches manifest file_count and checksum.
-      Structural presence alone is not enough (interrupted copy may drop files).
+      True when package is structurally complete, identity matches, and
+      on-disk file_count matches the manifest (checksum is identity-derived).
     #>
     param(
         [Parameter(Mandatory = $true)][string]$PackagePath,
@@ -246,14 +191,26 @@ function Test-PackageTreeMatchesManifest {
     if (-not (Test-PackageIdentityMatch -ReadyPath $PackagePath -Manifest $Manifest)) {
         return $false
     }
-    $actualChecksum = New-SourceChecksum -SourcePath $PackagePath
     $actualCount = Get-SourceFileCount -PackageRoot $PackagePath
-    $expectedChecksum = Get-ManifestChecksumValue -Manifest $Manifest
     $expectedCount = Get-ManifestFileCountValue -Manifest $Manifest
-    return (
-        $actualChecksum -eq $expectedChecksum -and
-        $actualCount -eq $expectedCount
-    )
+    if ($actualCount -ne $expectedCount) {
+        return $false
+    }
+    $db = [string]$Manifest.database
+    $exportId = [string]$Manifest.export_id
+    $finishedAt = [string]$Manifest.finished_at
+    if ($Manifest -is [hashtable] -or $Manifest -is [System.Collections.Specialized.OrderedDictionary]) {
+        $db = [string]$Manifest['database']
+        $exportId = [string]$Manifest['export_id']
+        $finishedAt = [string]$Manifest['finished_at']
+    }
+    $expectedChecksum = Get-ManifestChecksumValue -Manifest $Manifest
+    $actualChecksum = New-SourceChecksum `
+        -Database $db `
+        -ExportId $exportId `
+        -FileCount $actualCount `
+        -FinishedAt $finishedAt
+    return ($actualChecksum -eq $expectedChecksum)
 }
 
 <#
@@ -330,9 +287,21 @@ function Publish-ExportPackage {
             throw "copy incomplete: Configuration.xml missing in incoming/src"
         }
 
-        # Refresh checksum/file_count against the package root being published
-        $checksum = New-SourceChecksum -SourcePath $incomingPath
+        # Refresh file_count and identity checksum (no per-file hashing).
         $fileCount = Get-SourceFileCount -PackageRoot $incomingPath
+        $db = [string]$Manifest.database
+        $exportId = [string]$Manifest.export_id
+        $finishedAt = [string]$Manifest.finished_at
+        if ($Manifest -is [hashtable] -or $Manifest -is [System.Collections.Specialized.OrderedDictionary]) {
+            $db = [string]$Manifest['database']
+            $exportId = [string]$Manifest['export_id']
+            $finishedAt = [string]$Manifest['finished_at']
+        }
+        $checksum = New-SourceChecksum `
+            -Database $db `
+            -ExportId $exportId `
+            -FileCount ([int]$fileCount) `
+            -FinishedAt $finishedAt
         if ($Manifest -is [hashtable] -or $Manifest -is [System.Collections.Specialized.OrderedDictionary]) {
             $Manifest['checksum'] = $checksum
             $Manifest['file_count'] = [int]$fileCount

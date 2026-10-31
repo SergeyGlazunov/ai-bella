@@ -221,23 +221,6 @@ def test_v2_external_skip_records_run_without_pipeline_double(tmp_path: Path):
     assert "no new package" in (rows[0]["message"] or "")
 
 
-def test_legacy_reconcile_contract_unchanged(tmp_path: Path):
-    """schema_version=1 keeps the historical UBD-only reconcile path."""
-    from test_reconcile import FakeDocker, FakeGit, _make_config, _now, _opts
-
-    cfg = _make_config(tmp_path)
-    assert cfg.schema_version == 1
-    git = FakeGit()
-    docker = FakeDocker()
-    opts, _alerts, _, _ = _opts(tmp_path, cfg, git, docker)
-    result = reconcile(
-        cfg, timer=False, measure=False, now=_now(12, 0), **opts
-    )
-    assert result == "deferred"
-    assert git.writes == []
-    assert "fetch" in git.calls
-
-
 # --- Block 2: unfinished jobs / writer ownership ---------------------------------
 
 

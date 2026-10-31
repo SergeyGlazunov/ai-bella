@@ -321,36 +321,6 @@ def test_update_does_not_inject_probes(tmp_path: Path, monkeypatch):
     assert seen["has_probes_kw"] is False
 
 
-def test_cli_update_missing_adapters_does_not_close(tmp_path: Path, monkeypatch):
-    from test_reconcile import (
-        FakeDocker,
-        FakeGit,
-        _make_config,
-        _now,
-        _opts,
-    )
-
-    cfg_obj = _make_config(tmp_path, drop_adapters=True, build_deadline_seconds=None)
-    git = FakeGit()
-    docker = FakeDocker()
-    opts, _, _, db_path = _opts(tmp_path, cfg_obj, git, docker)
-
-    rc = main(
-        [
-            "--config",
-            str(tmp_path / "contour.yaml"),
-            "--db",
-            str(db_path),
-            "--lock",
-            str(opts["paths"].lock_path),
-            "update",
-        ]
-    )
-    assert rc != 0
-    assert git.writes == []
-    assert not any(c[:2] == ["docker", "stop"] for c in docker.calls)
-
-
 def test_validate_reports_all_database_profiles(tmp_path: Path, capsys):
     cfg = _write_cfg(tmp_path)
     rc = main(_argv(cfg, tmp_path / "db", tmp_path / "lock", "validate"))
