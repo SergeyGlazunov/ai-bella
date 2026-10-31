@@ -8,7 +8,9 @@ services:
       MCP_HTTP_HOST: 0.0.0.0
       MCP_HTTP_PORT: "9003"
     volumes:
-      - /srv/ai2/kb/src:/repos/SRC
+      # Must match databases.kb.source.source_path in /etc/ai-contour/contour.yaml
+      # (package publish lands Configuration.xml at this root, not …/src).
+      - /srv/ai-contour/sources/kb:/repos/SRC
       - bsl-kb-home:/data/code-index-home
       - /srv/ai2/compose/bsl-indexer/deploy/docker/entrypoint.sh:/usr/local/bin/bsl-indexer-entrypoint.sh:ro
       - ./daemon.toml:/data/code-index-home/daemon.toml:ro
