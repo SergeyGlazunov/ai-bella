@@ -108,10 +108,15 @@ COPY mcp-query-builder/query_parser.py         /app/query_parser.py
 COPY mcp-query-builder/query_check.py          /app/query_check.py
 COPY mcp-query-builder/query_optimize_rules.py /app/query_optimize_rules.py
 
+# Портал документации DNS (docs.dns-shop.ru) — guest read-only
+COPY mcp-dns-docs/server.py                    /app/mcp_dns_docs.py
+COPY mcp-dns-docs/client.py                    /app/mcp_dns_docs_client.py
+COPY mcp-dns-docs/html_text.py                 /app/mcp_dns_docs_html_text.py
+
 # Watcher кодовой базы и XML-метаданных (задача 2.3)
 COPY workspace_watcher.py                /app/workspace_watcher.py
 
 # Каталоги данных
 RUN mkdir -p /data/1c-src /data/platform-help /data/templates
 
-EXPOSE 8001 8003 8009
+EXPOSE 8001 8003 8009 8015

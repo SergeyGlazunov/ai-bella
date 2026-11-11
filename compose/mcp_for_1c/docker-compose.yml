@@ -457,6 +457,34 @@ services:
       - mcp-metrics:/data/metrics
     restart: unless-stopped
 
+  # ── 6b. Портал документации DNS (docs.dns-shop.ru) ────────────────
+  # Общий слой чата: не привязан к УБД/КБ. Guest read-only, без SSO.
+  mcp-dns-docs:
+    build:
+      context: ./1c-mcp-suite
+      dockerfile: Dockerfile.python
+    container_name: mcp-dns-docs
+    command: python /app/start.py dns-docs
+    ports:
+      - "127.0.0.1:8015:8015"
+    environment:
+      - MCP_TOOL_JOURNAL=${MCP_TOOL_JOURNAL:-}
+      - MCP_SHARED_SECRET=${MCP_SHARED_SECRET:?Задайте MCP_SHARED_SECRET в .env (openssl rand -hex 32)}
+      - METRICS_DB=/data/metrics/mcp_metrics.db
+      - METRICS_DASHBOARD=false
+      - DNS_DOCS_BASE_URL=${DNS_DOCS_BASE_URL:-https://docs.dns-shop.ru}
+      - DNS_DOCS_TIMEOUT_SEC=${DNS_DOCS_TIMEOUT_SEC:-20}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8015/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    volumes:
+      - ./evals/journal:/journal
+      - mcp-metrics:/data/metrics
+    restart: unless-stopped
+
   # ══════════════════════════════════════════════════════════════════
   # v2.1: REST-прокси к живой базе 1С
   # ══════════════════════════════════════════════════════════════════

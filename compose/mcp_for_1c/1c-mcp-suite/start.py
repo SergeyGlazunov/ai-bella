@@ -17,7 +17,7 @@ import uvicorn
 
 # Серверы, которые умеет поднимать эта точка входа. Сам start.py едет в ДВА
 # образа, и каждый из них поднимает своё:
-#   Dockerfile.python     — metadata-graph и query-builder;
+#   Dockerfile.python     — metadata-graph, query-builder, dns-docs;
 #   Dockerfile.embeddings — platform-help (там же torch, qdrant-client и
 #                           модель эмбеддингов).
 # bsl-checker здесь не значится: у него свой образ (Dockerfile.bsl) и своя
@@ -28,6 +28,7 @@ SERVERS = {
     "metadata-graph":   ("mcp_metadata_graph",  8001),
     "platform-help":    ("mcp_platform_help",   8003),
     "query-builder":    ("mcp_query_builder",   8009),
+    "dns-docs":         ("mcp_dns_docs",        8015),
 }
 
 def _check_docker_environment() -> None:

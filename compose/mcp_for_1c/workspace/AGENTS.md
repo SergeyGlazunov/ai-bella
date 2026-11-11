@@ -13,6 +13,7 @@ and `integrations/skills/cursor/`. Prefer the matching skill before improvising.
 | MDD | owners / portal properties | `mdd` |
 | SDMS | tasks / sprints (read-only) | `sdms` |
 | Confluence | wiki (read-only) | `confluence` |
+| DNS Docs | инструкции docs.dns-shop.ru (read-only) | `dns-docs` |
 
 Do not invent object names — look them up in Graph. Do not invent BSL bodies —
 open via Code_index after Graph gives file + lines. Do not use MDD for structure
@@ -38,10 +39,11 @@ Uses the same Neo4j metadata layer as Graph. Table names like
 Bodies and snippets after Graph located the procedure. Do not start with a
 whole-repo grep when Graph can narrow the path.
 
-## MDD / SDMS / Confluence
+## MDD / SDMS / Confluence / DNS Docs
 
 Separate MCPs. Read-only where the skill says so. «Мои задачи» in SDMS = the
-JWT owner on the VM, not necessarily the chat user.
+JWT owner on the VM, not necessarily the chat user. DNS Docs — guest open
+articles on `docs.dns-shop.ru` (not Confluence, not platform `1c-docs`).
 
 ## answerable / degraded
 
