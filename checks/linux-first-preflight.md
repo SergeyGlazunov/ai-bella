@@ -1,4 +1,4 @@
-# Linux-first preflight (read-only inventory)
+﻿# Linux-first preflight (read-only inventory)
 
 **Purpose:** Собрать факты стенда **до** catch-up / cutover. Ничего не менять.  
 **When:** Перед Task 12 Step 1–2. После PASS kit Task 11.  
@@ -44,8 +44,8 @@ Rollback point для preflight: **не требуется** (только чт�
 uname -a | tee "$EVIDENCE/uname.txt"
 df -h /srv /var / 2>/dev/null | tee "$EVIDENCE/df.txt"
 id ai-contour 2>/dev/null | tee "$EVIDENCE/ai-contour-id.txt" || true
-systemctl is-enabled ai-sync.timer 2>/dev/null | tee "$EVIDENCE/timer-enabled.txt" || echo "timer-absent" | tee "$EVIDENCE/timer-enabled.txt"
-systemctl is-active ai-sync.timer 2>/dev/null | tee "$EVIDENCE/timer-active.txt" || true
+systemctl is-enabled ai-contour.timer 2>/dev/null | tee "$EVIDENCE/timer-enabled.txt" || echo "timer-absent" | tee "$EVIDENCE/timer-enabled.txt"
+systemctl is-active ai-contour.timer 2>/dev/null | tee "$EVIDENCE/timer-active.txt" || true
 ```
 
 **Pass:** `/srv` или целевой том имеет запас; timer **не** enabled до cutover.  
@@ -136,7 +136,7 @@ Get-ScheduledTask | Where-Object { $_.TaskName -match 'UBD|KB|klon|AI-contour' }
 
 ## Concurrent writers
 
-Запрещено: legacy indexing (PS nightly index) **и** `contour update` / `ai-sync.timer` в одном окне. Preflight только документирует текущее состояние; fence — в catch-up.
+Запрещено: legacy indexing (PS nightly index) **и** `contour update` / `ai-contour.timer` в одном окне. Preflight только документирует текущее состояние; fence — в catch-up.
 
 ---
 

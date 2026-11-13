@@ -23,13 +23,27 @@ printf '%s\n' "$out"
 printf '%s' "$out" | "$PYTHON" -c '
 import json, sys
 text = sys.stdin.read()
-start, end = text.find("{"), text.rfind("}")
-if start < 0 or end <= start:
-    sys.stderr.write("reload_bsl_watch: no JSON in output\n")
+decoder = json.JSONDecoder()
+fallback = None
+for i, ch in enumerate(text):
+    if ch != "{":
+        continue
+    try:
+        data, _ = decoder.raw_decode(text, i)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(data, dict):
+        continue
+    if "reloaded" in data:
+        if data.get("reloaded") is True:
+            sys.exit(0)
+        sys.stderr.write("reload_bsl_watch: reloaded!=true error=%r\n" % (data.get("error"),))
+        sys.exit(1)
+    if fallback is None:
+        fallback = data
+if fallback is not None:
+    sys.stderr.write("reload_bsl_watch: JSON without reloaded key: %r\n" % (fallback,))
     sys.exit(1)
-data = json.loads(text[start : end + 1])
-if data.get("reloaded") is True:
-    sys.exit(0)
-sys.stderr.write("reload_bsl_watch: reloaded!=true error=%r\n" % (data.get("error"),))
+sys.stderr.write("reload_bsl_watch: no JSON object in output\n")
 sys.exit(1)
 '

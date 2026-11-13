@@ -1,4 +1,4 @@
-# Stand gates and linux-first runbooks
+﻿# Stand gates and linux-first runbooks
 
 Контракт продукта — [../docs/superpowers/specs/2026-10-18-installable-contour-design.md](../docs/superpowers/specs/2026-10-18-installable-contour-design.md). Файлы ниже — процедуры живого стенда, не новая цель разработки.
 
@@ -21,7 +21,7 @@ Cutover без PASS gates + drill бэкапа чат-слоя + явного р
 | --- | --- | --- |
 | Preflight | [`linux-first-preflight.md`](linux-first-preflight.md) | Read-only inventory; stop if dual writers / secrets / timer already enabled |
 | Catch-up | [`linux-first-catchup.md`](linux-first-catchup.md) | One controlled `contour update`; timer stays disabled |
-| Cutover | [`linux-first-cutover.md`](linux-first-cutover.md) | Enable `ai-sync.timer`; Windows = export-only |
+| Cutover | [`linux-first-cutover.md`](linux-first-cutover.md) | Enable `ai-contour.timer`; Windows = export-only |
 
 Каждый runbook содержит: read-only inventory, mutating commands, evidence, rollback point, stop conditions, запрет concurrent legacy+contour writers.
 

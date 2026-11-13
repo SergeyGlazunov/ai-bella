@@ -1,92 +1,90 @@
 from __future__ import annotations
 
-from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from contour.watch_bsl import pause_watch, restore_watch, watch_is_paused
-
-SAMPLE_TOML = """[[paths]]
-path = "/repos/SRC"
-"""
-
-LIVE_DAEMON_TOML = r"C:\MCP\code_index\deploy\daemon.toml"
+from contour.watch_bsl import _parse_daemon_reload_json, reload_bsl_daemon
 
 
-def test_pause_watch_removes_src_path(tmp_path: Path):
-    toml_path = tmp_path / "daemon.toml"
-    toml_path.write_text(SAMPLE_TOML, encoding="utf-8")
-    assert str(toml_path) != LIVE_DAEMON_TOML
+def test_parse_reload_json_prefers_reloaded_object():
+    text = 'warn {not json}\n{"other": 1}\nlog brace }\n{"reloaded": true, "n": 2}\n'
+    assert _parse_daemon_reload_json(text) == {"reloaded": True, "n": 2}
+
+
+def test_parse_reload_json_ignores_braces_in_noise():
+    text = 'trace {frame: 1} before\n{"reloaded": false, "error": "busy"}\n'
+    data = _parse_daemon_reload_json(text)
+    assert data["reloaded"] is False
+    assert data["error"] == "busy"
+
+
+def test_parse_reload_json_missing_raises():
+    with pytest.raises(RuntimeError, match="no JSON"):
+        _parse_daemon_reload_json("no objects here")
+
+
+def test_reload_bsl_daemon_docker_fallback_parses_noisy_json(monkeypatch):
+    class Cfg:
+        class services:
+            bsl_container = "bsl-test"
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[0] == "docker"
+        return type(
+            "R",
+            (),
+            {
+                "returncode": 0,
+                "stdout": 'noise {x}\n{"reloaded": true}\n',
+                "stderr": "warn {y}\n",
+            },
+        )()
+
+    monkeypatch.setattr("contour.watch_bsl.Path.is_file", lambda self: False)
+    with patch("contour.watch_bsl.subprocess.run", side_effect=fake_run):
+        reload_bsl_daemon(Cfg())
+
+
+def test_reload_bsl_daemon_rejects_reloaded_false(monkeypatch):
+    class Cfg:
+        class services:
+            bsl_container = "bsl-test"
+
+    def fake_run(cmd, **kwargs):
+        return type(
+            "R",
+            (),
+            {
+                "returncode": 0,
+                "stdout": '{"reloaded": false, "error": "busy"}',
+                "stderr": "",
+            },
+        )()
+
+    monkeypatch.setattr("contour.watch_bsl.Path.is_file", lambda self: False)
+    with patch("contour.watch_bsl.subprocess.run", side_effect=fake_run):
+        with pytest.raises(RuntimeError, match="reloaded!=true"):
+            reload_bsl_daemon(Cfg())
+
+
+def test_reload_bsl_daemon_script_path_prefers_ai_contour(monkeypatch):
+    class Cfg:
+        class services:
+            bsl_container = "bsl-test"
 
     seen: list[str] = []
 
-    def reload() -> None:
-        seen.append(toml_path.read_text(encoding="utf-8"))
+    def fake_is_file(self):
+        return str(self).replace("\\", "/") == (
+            "/opt/ai-contour/integrations/reload_bsl_watch.sh"
+        )
 
-    pause_watch(str(toml_path), reload=reload)
+    def fake_run(cmd, **kwargs):
+        seen.append(str(cmd[0]).replace("\\", "/"))
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    assert seen, "reload must be called after write"
-    assert "/repos/SRC" not in seen[0]
-    assert "/repos/SRC" not in toml_path.read_text(encoding="utf-8")
-
-
-def test_pause_watch_strips_src_table_with_toml_array(tmp_path: Path):
-    toml_path = tmp_path / "daemon.toml"
-    toml_path.write_text(
-        'listen = "0.0.0.0:8001"\n\n'
-        "[[paths]]\n"
-        'path = "/repos/SRC"\n'
-        'ignore = ["*.ext", "tmp/**"]\n\n'
-        "[[paths]]\n"
-        'path = "/repos/OTHER"\n',
-        encoding="utf-8",
-    )
-    pause_watch(str(toml_path), reload=lambda: None)
-    text = toml_path.read_text(encoding="utf-8")
-    assert "/repos/SRC" not in text
-    assert 'ignore = ["*.ext", "tmp/**"]' not in text
-    assert "/repos/OTHER" in text
-    assert "listen" in text
-
-
-def test_pause_watch_missing_file_raises(tmp_path: Path):
-    missing = tmp_path / "nope.toml"
-    with pytest.raises(FileNotFoundError):
-        pause_watch(str(missing), reload=lambda: None)
-
-
-def test_pause_watch_strips_only_src_path_section(tmp_path: Path):
-    toml_path = tmp_path / "daemon.toml"
-    toml_path.write_text(
-        'listen = "0.0.0.0:8001"\n\n'
-        '[[paths]]\npath = "/repos/SRC"\n\n'
-        '[[paths]]\npath = "/repos/OTHER"\n',
-        encoding="utf-8",
-    )
-    pause_watch(str(toml_path), reload=lambda: None)
-    text = toml_path.read_text(encoding="utf-8")
-    assert "/repos/SRC" not in text
-    assert "/repos/OTHER" in text
-    assert "listen" in text
-
-
-def test_watch_is_paused_when_inspect_has_no_src():
-    assert watch_is_paused(lambda: "paths = []\n") is True
-    assert watch_is_paused(lambda: 'path = "/repos/SRC"\n') is False
-
-
-def test_restore_watch_copies_backup_then_reloads(tmp_path: Path):
-    toml_path = tmp_path / "daemon.toml"
-    backup = tmp_path / "daemon.toml.bak"
-    toml_path.write_text("paused\n", encoding="utf-8")
-    backup.write_text(SAMPLE_TOML, encoding="utf-8")
-    seen: list[str] = []
-
-    def reload() -> None:
-        seen.append(toml_path.read_text(encoding="utf-8"))
-
-    restore_watch(str(toml_path), str(backup), reload=reload)
-
-    assert seen, "reload must be called after restore"
-    assert "/repos/SRC" in seen[0]
-    assert toml_path.read_text(encoding="utf-8") == SAMPLE_TOML
+    monkeypatch.setattr("contour.watch_bsl.Path.is_file", fake_is_file)
+    with patch("contour.watch_bsl.subprocess.run", side_effect=fake_run):
+        reload_bsl_daemon(Cfg())
+    assert seen == ["/opt/ai-contour/integrations/reload_bsl_watch.sh"]

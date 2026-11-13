@@ -4,8 +4,8 @@
   "live_cutover": false,
   "present": [
     "controller/",
-    "systemd/ai-sync.service",
-    "systemd/ai-sync.timer",
+    "systemd/ai-contour.service",
+    "systemd/ai-contour.timer",
     "bootstrap.sh",
     "contour.example.yaml",
     "requirements.lock",

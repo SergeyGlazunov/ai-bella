@@ -1,4 +1,4 @@
-# Linux-first catch-up (controlled one-shot)
+﻿# Linux-first catch-up (controlled one-shot)
 
 **Purpose:** Один контролируемый прогон `contour` по UBD / KB / `klon_opl` **без** включения timer и без постоянного отключения legacy (только fence на окно).  
 **When:** После PASS preflight + backup/rollback drill. Task 12 Steps 3–6.  
@@ -32,7 +32,7 @@
 1. `contour backup-state` (путь из `runtime.backups_path`) — снимок для справки, не единственный откат.
 2. Список Scheduled Tasks (indexing vs export-only) и их State.
 3. `git rev-parse` / package export_id текущих published sources.
-4. `systemctl is-enabled ai-sync.timer` (= disabled).
+4. `systemctl is-enabled ai-contour.timer` (= disabled).
 5. Inventory активных writers: процессы PS/1С dump, `docker ps` indexer/job containers, SQLite `jobs` со status not in (ok,failed,removed).
 
 ### Откат: до записи vs после записи

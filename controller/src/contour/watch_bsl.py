@@ -2,14 +2,34 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
-from collections.abc import Callable
-from hashlib import sha256
 from pathlib import Path
 
-SRC_WATCH_PATH = "/repos/SRC"
-_STAMP_SUFFIX = ".contour-pause-hash"
+
+def _parse_daemon_reload_json(text: str) -> dict:
+    """Extract the daemon-reload object from mixed stdout/stderr.
+
+    Prefer an object that contains ``reloaded``; do not assume the first ``{``
+    and last ``}`` form a single JSON value (logs may contain braces).
+    """
+    decoder = json.JSONDecoder()
+    fallback: dict | None = None
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if "reloaded" in data:
+            return data
+        if fallback is None:
+            fallback = data
+    if fallback is not None:
+        return fallback
+    raise RuntimeError("daemon reload produced no JSON object")
 
 
 def reload_bsl_daemon(cfg) -> None:
@@ -24,14 +44,19 @@ def reload_bsl_daemon(cfg) -> None:
     container = cfg.services.bsl_container
     env = {**os.environ, "BSL_CONTAINER": container}
     budget = DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds
+    here = Path(__file__).resolve()
+    # Absolute install paths as plain strings so Windows Path does not rewrite
+    # leading "/opt/..." when unit tests import this module on a Windows host.
     candidates = [
-        Path("/opt/ai-sync/integrations/reload_bsl_watch.sh"),
-        Path(__file__).resolve().parents[3] / "integrations" / "reload_bsl_watch.sh",
+        "/opt/ai-contour/integrations/reload_bsl_watch.sh",
+        # Legacy install path (pre-rename); kept so old stands still hit the script.
+        "/opt/ai-sync/integrations/reload_bsl_watch.sh",
+        str(here.parents[3] / "integrations" / "reload_bsl_watch.sh"),
     ]
     for script in candidates:
-        if script.is_file():
+        if Path(script).is_file():
             subprocess.run(
-                [str(script)], check=True, env=env, timeout=budget
+                [script], check=True, env=env, timeout=budget
             )
             return
     result = subprocess.run(
@@ -52,68 +77,6 @@ def reload_bsl_daemon(cfg) -> None:
         timeout=budget,
     )
     text = (result.stdout or "") + (result.stderr or "")
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise RuntimeError("daemon reload produced no JSON")
-    data = json.loads(text[start : end + 1])
+    data = _parse_daemon_reload_json(text)
     if data.get("reloaded") is not True:
         raise RuntimeError(f"daemon reload reloaded!=true: {data.get('error')!r}")
-
-
-def _is_src_paths_table(block: str) -> bool:
-    for line in block.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("path") and "=" in stripped:
-            _, _, value = stripped.partition("=")
-            value = value.strip().strip("'\"")
-            return value == SRC_WATCH_PATH
-    return False
-
-
-def _strip_src_paths(text: str) -> str:
-    parts = re.split(r"(?=^\[\[paths\]\])", text, flags=re.MULTILINE)
-    kept: list[str] = []
-    for part in parts:
-        if part.startswith("[[paths]]") and _is_src_paths_table(part):
-            continue
-        kept.append(part)
-    stripped = "".join(kept)
-    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
-    return stripped.strip() + ("\n" if stripped.strip() else "")
-
-
-def _stamp_path(toml_path: str) -> Path:
-    return Path(toml_path + _STAMP_SUFFIX)
-
-
-def pause_watch(toml_path: str, reload: Callable) -> None:
-    path = Path(toml_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"daemon.toml not found: {toml_path}")
-    written = _strip_src_paths(path.read_text(encoding="utf-8"))
-    path.write_text(written, encoding="utf-8")
-    _stamp_path(toml_path).write_text(
-        sha256(written.encode("utf-8")).hexdigest(), encoding="utf-8"
-    )
-    reload()
-
-
-def watch_is_paused(inspect_fn) -> bool:
-    return SRC_WATCH_PATH not in inspect_fn()
-
-
-def restore_watch(toml_path: str, backup: str, reload: Callable) -> None:
-    path = Path(toml_path)
-    current = path.read_text(encoding="utf-8") if path.is_file() else ""
-    stamp = _stamp_path(toml_path)
-    if stamp.is_file():
-        expected = stamp.read_text(encoding="utf-8").strip()
-        actual = sha256(current.encode("utf-8")).hexdigest()
-        if expected and actual != expected:
-            raise RuntimeError(
-                "daemon.toml changed after pause; refusing to overwrite with backup"
-            )
-    path.write_text(Path(backup).read_text(encoding="utf-8"), encoding="utf-8")
-    if stamp.is_file():
-        stamp.unlink()
-    reload()

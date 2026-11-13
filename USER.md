@@ -1,4 +1,4 @@
-# AI-Contour — для пользователя
+﻿# AI-Contour — для пользователя
 
 Комплект оркестратора УБД / КБ / `klon_opl` (граф + code-index) и поставки на Windows 11 + WSL2.
 
@@ -65,8 +65,8 @@ contour cleanup --dry-run
 
 ### systemd
 
-- `ai-sync.service` — `contour update` (oneshot, `User=ai-contour`).
-- `ai-sync.timer` — `OnCalendar=*-*-* 01:30:00 Asia/Vladivostok`, `Persistent=true`.
+- `ai-contour.service` — `contour update` (oneshot, `User=ai-contour`).
+- `ai-contour.timer` — `OnCalendar=*-*-* 01:30:00 Asia/Vladivostok`, `Persistent=true`.
 - `bootstrap.sh` ставит unit-файлы, tmpfiles и logrotate **без** `systemctl enable --now`.
 
 ```bash
@@ -242,7 +242,7 @@ Task Scheduler: `AI-contour klon_opl nightly export` в **02:00**.
 5. Настроить KB/`klon_opl` package export → inbox; git УБД → `sources/ubd`.
 6. Подключить MCP к сети чата; health MCP; smoke tool-call.
 7. (Опц.) WebUI + карточки MCP — `deploy-ai2/ai-stack/README.md`.
-8. Nightly: package exporters + `ai-sync.timer` после proof.
+8. Nightly: package exporters + `ai-contour.timer` после proof.
 
 ### Архив комплекта
 
@@ -274,7 +274,7 @@ sha256sum ai-contour-kit.tgz
 5. Клон/копия SHA в `/srv/ai-contour/sources/ubd` (ext4); remount binds; compose up **только** remounted сервисов УБД (не `ai-stack`).
 6. После recreate `bsl-indexer` — снова убедиться, что watcher paused.
 7. Verify индексов; открыть чтение.
-8. Включить `ai-sync.timer` только после шага 7.
+8. Включить `ai-contour.timer` только после шага 7.
 
 ### Откат
 

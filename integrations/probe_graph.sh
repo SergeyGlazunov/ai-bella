@@ -18,6 +18,39 @@ ESC=$(printf '%s' "$REL" | sed "s/'/\\\\'/g")
 # Map top-level dump dirs → MetadataObject kind (english), aligned with indexer KINDS.
 # Shell `case` globs match `/`, so Catalogs/X/Forms/.../Form.xml would otherwise
 # become Catalog.X/Forms/.../Form — reject any base that still contains `/`.
+kind_for_dir() {
+  case "$1" in
+    Catalogs) printf 'Catalog' ;;
+    Documents) printf 'Document' ;;
+    CommonModules) printf 'CommonModule' ;;
+    InformationRegisters) printf 'InformationRegister' ;;
+    AccumulationRegisters) printf 'AccumulationRegister' ;;
+    AccountingRegisters) printf 'AccountingRegister' ;;
+    CalculationRegisters) printf 'CalculationRegister' ;;
+    ChartsOfAccounts) printf 'ChartOfAccounts' ;;
+    ChartsOfCharacteristicTypes) printf 'ChartOfCharacteristicTypes' ;;
+    ChartsOfCalculationTypes) printf 'ChartOfCalculationTypes' ;;
+    BusinessProcesses) printf 'BusinessProcess' ;;
+    Tasks) printf 'Task' ;;
+    Enums) printf 'Enum' ;;
+    Reports) printf 'Report' ;;
+    DataProcessors) printf 'DataProcessor' ;;
+    ExchangePlans) printf 'ExchangePlan' ;;
+    FilterCriteria) printf 'FilterCriterion' ;;
+    SettingsStorages) printf 'SettingsStorage' ;;
+    Subsystems) printf 'Subsystem' ;;
+    Roles) printf 'Role' ;;
+    CommonForms) printf 'CommonForm' ;;
+    CommonTemplates) printf 'CommonTemplate' ;;
+    CommonPictures) printf 'CommonPicture' ;;
+    Constants) printf 'Constant' ;;
+    DefinedTypes) printf 'DefinedType' ;;
+    SessionParameters) printf 'SessionParameter' ;;
+    FunctionalOptions) printf 'FunctionalOption' ;;
+    *) printf '' ;;
+  esac
+}
+
 xml_to_full_name() {
   # arg: relative xml path → stdout: full_name_eng or empty
   rel="$1"
@@ -60,15 +93,51 @@ xml_to_full_name() {
   esac
 }
 
+# Nested XML under KindDir/ObjectName/(Forms|Ext|…)/… → parent object name.
+# Nested subsystem Subsystems/Parent/Child.xml → Child (leaf stem), not Parent.
+nested_object_name() {
+  rel="$1"
+  dir=$(printf '%s' "$rel" | awk -F/ 'NF>=1 {print $1}')
+  second=$(printf '%s' "$rel" | awk -F/ 'NF>=2 {print $2}')
+  third=$(printf '%s' "$rel" | awk -F/ 'NF>=3 {print $3}')
+  [ -n "$second" ] || { printf ''; return; }
+  case "$third" in
+    Forms|Ext|Templates|Commands|Help|Predefined|Flowcharts|"")
+      printf '%s' "$second"
+      ;;
+    *.xml)
+      # Subsystems/A/B.xml (and similar depth-3 object xml)
+      stem=${third%.xml}
+      case "$stem" in
+        ""|*/*) printf '%s' "$second" ;;
+        *) printf '%s' "$stem" ;;
+      esac
+      ;;
+    *)
+      printf '%s' "$second"
+      ;;
+  esac
+  # silence unused when awk empty
+  : "$dir"
+}
+
 case "$REL" in
   *.xml)
     FULL=$(xml_to_full_name "$REL")
     if [ -z "$FULL" ]; then
-      # Nested XML (Forms/…): match parent object via path prefix of source_path modules,
-      # or MetadataObject name = second path segment.
-      PARENT=$(printf '%s' "$REL" | awk -F/ 'NF>=2 {print $2}')
-      ESC_FULL=$(printf '%s' "$PARENT" | sed "s/'/\\\\'/g")
-      CYPHER="MATCH (n:MetadataObject) WHERE n.name = '${ESC_FULL}' OR n.full_name_eng ENDS WITH '.${ESC_FULL}' RETURN count(n) AS c;"
+      DIR=$(printf '%s' "$REL" | awk -F/ 'NF>=1 {print $1}')
+      OBJ=$(nested_object_name "$REL")
+      KIND=$(kind_for_dir "$DIR")
+      PREFIX=$(printf '%s' "$REL" | awk -F/ 'NF>=2 {print $1 "/" $2}')
+      if [ -z "$OBJ" ] || [ -z "$KIND" ]; then
+        echo "probe_graph: nested xml not mappable: $REL" >&2
+        exit 2
+      fi
+      ESC_OBJ=$(printf '%s' "$OBJ" | sed "s/'/\\\\'/g")
+      ESC_FULL=$(printf '%s.%s' "$KIND" "$OBJ" | sed "s/'/\\\\'/g")
+      ESC_PREFIX=$(printf '%s' "$PREFIX" | sed "s/'/\\\\'/g")
+      # Parent/leaf MetadataObject, or any module under the object folder.
+      CYPHER="MATCH (n) WHERE (n:MetadataObject AND (n.full_name_eng = '${ESC_FULL}' OR n.id = '${ESC_FULL}' OR n.name = '${ESC_OBJ}' OR n.full_name_eng ENDS WITH '.${ESC_OBJ}')) OR (n.source_path IS NOT NULL AND n.source_path STARTS WITH '${ESC_PREFIX}/') RETURN count(n) AS c;"
     else
       ESC_FULL=$(printf '%s' "$FULL" | sed "s/'/\\\\'/g")
       CYPHER="MATCH (n:MetadataObject) WHERE n.full_name_eng = '${ESC_FULL}' OR n.id = '${ESC_FULL}' RETURN count(n) AS c;"

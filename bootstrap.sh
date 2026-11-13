@@ -214,10 +214,24 @@ if ! systemd_ready; then
   exit 1
 fi
 
-cp "$ROOT/systemd/ai-sync.service" "$ROOT/systemd/ai-sync.timer" /etc/systemd/system/
+# Install current unit names; migrate legacy ai-sync.* if present.
+cp "$ROOT/systemd/ai-contour.service" "$ROOT/systemd/ai-contour.timer" /etc/systemd/system/
+legacy_timer_enabled=0
+if systemctl list-unit-files ai-sync.timer >/dev/null 2>&1; then
+  if systemctl is-enabled ai-sync.timer >/dev/null 2>&1; then
+    legacy_timer_enabled=1
+    systemctl disable --now ai-sync.timer >/dev/null 2>&1 || true
+  fi
+  rm -f /etc/systemd/system/ai-sync.service /etc/systemd/system/ai-sync.timer
+fi
 systemctl daemon-reload
-# Do not enable the timer here. Cutover USER.md enables ai-sync.timer.
+# Do not enable the timer here. Cutover USER.md enables ai-contour.timer.
+# If a legacy ai-sync.timer was already enabled, re-enable under the new name.
+if [ "$legacy_timer_enabled" -eq 1 ]; then
+  systemctl enable --now ai-contour.timer
+  echo "migrated enabled timer: ai-sync.timer -> ai-contour.timer"
+fi
 
 echo "bootstrap complete: package=$DEST config=$ETC/contour.yaml data=$SRV"
-echo "timer installed but not enabled"
+echo "timer installed but not enabled (unless migrated from ai-sync.timer)"
 echo "service user: $SERVICE_USER (Docker access verified)"

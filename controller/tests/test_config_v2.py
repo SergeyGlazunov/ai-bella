@@ -42,14 +42,14 @@ storage:
   graph_volume: mcp_for_1c_neo4j-data
   code_index_volume: bsl-indexer_bsl-indexer-home
 adapters:
-  idle_probe: [/opt/ai-sync/integrations/idle_bsl.sh]
+  idle_probe: [/opt/ai-contour/integrations/idle_bsl.sh]
   code_index:
-    check_bsl: [/opt/ai-sync/integrations/probe_code_index.sh, present, "{path}"]
-    check_deletion: [/opt/ai-sync/integrations/probe_code_index.sh, absent, "{path}"]
+    check_bsl: [/opt/ai-contour/integrations/probe_code_index.sh, present, "{path}"]
+    check_deletion: [/opt/ai-contour/integrations/probe_code_index.sh, absent, "{path}"]
   graph:
-    check_bsl: [/opt/ai-sync/integrations/probe_graph.sh, present, "{path}"]
-    check_xml: [/opt/ai-sync/integrations/probe_graph.sh, present, "{path}"]
-    check_deletion: [/opt/ai-sync/integrations/probe_graph.sh, absent, "{path}"]
+    check_bsl: [/opt/ai-contour/integrations/probe_graph.sh, present, "{path}"]
+    check_xml: [/opt/ai-contour/integrations/probe_graph.sh, present, "{path}"]
+    check_deletion: [/opt/ai-contour/integrations/probe_graph.sh, absent, "{path}"]
 """
 
 

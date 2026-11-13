@@ -1,6 +1,6 @@
-# Linux-first scheduling cutover
+﻿# Linux-first scheduling cutover
 
-**Purpose:** Передать nightly orchestration на WSL `ai-sync.timer`; Windows остаётся export-and-transfer only.  
+**Purpose:** Передать nightly orchestration на WSL `ai-contour.timer`; Windows остаётся export-and-transfer only.  
 **When:** После PASS catch-up + user-facing verify. Task 12 Steps 7–9.  
 **STAND ONLY.** Без явного разрешения оператора — не выполнять.
 
@@ -34,7 +34,7 @@
 1. `contour backup-state` свежий (справка; не единственный откат после записи)
 2. Chat volumes backup (throwaway restore уже доказан)
 3. Список Scheduled Tasks: какие indexing останутся disabled
-4. `systemctl is-enabled ai-sync.timer` = disabled
+4. `systemctl is-enabled ai-contour.timer` = disabled
 5. Published revisions всех трёх баз
 6. Inventory writers (процессы, indexer containers, SQLite jobs)
 
@@ -43,12 +43,12 @@
 **Общее (сразу):**
 
 ```bash
-sudo systemctl disable --now ai-sync.timer
-# Останавливает timer и *текущий* oneshot ai-sync.service, если он ещё в unit.
+sudo systemctl disable --now ai-contour.timer
+# Останавливает timer и *текущий* oneshot ai-contour.service, если он ещё в unit.
 # Не убивает уже отделившиеся indexer containers — их дождаться / проверить (§ wait).
 ```
 
-Затем § «Wait for idle writers»: нет running `ai-sync.service`, нет job containers, SQLite jobs не created/running. При unknown — не включать legacy.
+Затем § «Wait for idle writers»: нет running `ai-contour.service`, нет job containers, SQLite jobs не created/running. При unknown — не включать legacy.
 
 **A. Ночь ещё не писала / activate не было:** актуальная SQLite согласована со старым source — rollback без restore старого `state.db`.
 
@@ -61,8 +61,8 @@ sudo systemctl disable --now ai-sync.timer
 ## Read-only inventory (re-check)
 
 ```bash
-systemctl is-enabled ai-sync.timer
-systemctl cat ai-sync.service ai-sync.timer
+systemctl is-enabled ai-contour.timer
+systemctl cat ai-contour.service ai-contour.timer
 sudo -u ai-contour /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml status
 ```
 
@@ -93,7 +93,7 @@ Disable запрещает **будущие** старты. Уже бегущи�
 Перед enable timer и перед любым возвратом legacy:
 
 1. Scheduled indexing tasks не Running; нет процессов из preflight inventory.
-2. `systemctl is-active ai-sync.service` → inactive (если unit есть).
+2. `systemctl is-active ai-contour.service` → inactive (если unit есть).
 3. `docker ps` — нет contour/index one-shot jobs; MCP permanent OK.
 4. SQLite jobs не в created/running/paused (или понятный post-reap idle).
 5. Unknown writer → **стоп**, timer не enable, legacy не возвращать. Kill indexer не штатный способ.
@@ -102,8 +102,8 @@ Disable запрещает **будущие** старты. Уже бегущи�
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now ai-sync.timer
-systemctl list-timers ai-sync.timer
+sudo systemctl enable --now ai-contour.timer
+systemctl list-timers ai-contour.timer
 ```
 
 Записать next trigger time в STATUS.
@@ -121,7 +121,7 @@ Timer owns the night. Manual `contour update` только по явной ко�
 ```bash
 sudo -u ai-contour /opt/ai-contour/venv/bin/contour --config /etc/ai-contour/contour.yaml status
 # sqlite3 ... database_state / layer_state / runs / jobs
-journalctl -u ai-sync.service -n 200 --no-pager
+journalctl -u ai-contour.service -n 200 --no-pager
 ls -la /srv/ai-contour/logs/runs
 ```
 
@@ -132,7 +132,7 @@ ls -la /srv/ai-contour/logs/runs
 
 ## Concurrent writers
 
-После cutover: **единственный** nightly writer — `ai-sync.timer` → `contour update`.  
+После cutover: **единственный** nightly writer — `ai-contour.timer` → `contour update`.  
 Windows: только package export / git fetch side-effects вне Linux index volumes по контракту Task 9.
 
 ---

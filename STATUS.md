@@ -1,9 +1,9 @@
-# STATUS
+﻿# STATUS
 
 **Updated:** 2026-10-18  
 **Horizon:** linux-first / `contour` on stand (Task 12 cutover)  
 **Repo:** https://github.com/SergeyGlazunov/ai-bella  
-**Priority:** first green night on `ai-sync.timer` (UBD + KB + klon)
+**Priority:** first green night on `ai-contour.timer` (UBD + KB + klon)
 
 ## Active runtime (stand ADM-SAPHX-TECH)
 
@@ -16,13 +16,13 @@
 | УБД code MCP | `:8011` (`ai2-bsl-indexer`) |
 | КБ graph / code | `:8201` / `:8211` — **published** 2026-10-18 (graph FULL + open) |
 | OPL code | `:8311` (`ai2-bsl-klon-opl`) |
-| Orchestrator | **`ai-sync.timer` enabled** — next `01:30 Asia/Vladivostok` |
+| Orchestrator | **`ai-contour.timer` enabled** — next `01:30 Asia/Vladivostok` |
 
 ## Nightly (current)
 
 | Task | When | Entry |
 |------|------|--------|
-| **contour** (`ai-sync.timer`) | 01:30 Asia/Vladivostok | `/opt/ai-contour/venv/bin/contour update` |
+| **contour** (`ai-contour.timer`) | 01:30 Asia/Vladivostok | `/opt/ai-contour/venv/bin/contour update` |
 | AI-contour KB nightly export | 01:00 | `tools/kb/Update-And-Export-Kb.ps1` (export/package only) |
 | AI-contour klon_opl nightly export | 02:00 | `tools/klon_opl/Export-KlonOpl.ps1` (export/package only) |
 
@@ -45,8 +45,8 @@ Legacy `UBD Config Sync` indexing must stay **Disabled**. Contour owns UBD index
 | Tasks 1–10 | done in kit (`c19dedd` latest graph logs_path fix) |
 | Task 11 integration | `controller/tests/integration/` — nightly cycle UBD/KB/klon_opl + recovery scenarios; fake Docker / temp SQLite |
 | Runbooks | `checks/linux-first-{preflight,catchup,cutover}.md` — rollback A/B + wait-for-idle writers (catch-up/cutover) |
-| WSL bootstrap dry-run on host | **PASS** 2026-10-16 — `/opt/ai-contour` + validate; `ai-sync.timer` disabled; `/srv/ai2` untouched |
-| Stand cutover | **PASS (core)** 2026-10-18 — UBD+klon published; `ai-sync.timer` enabled |
+| WSL bootstrap dry-run on host | **PASS** 2026-10-16 — `/opt/ai-contour` + validate; `ai-contour.timer` disabled; `/srv/ai2` untouched |
+| Stand cutover | **PASS (core)** 2026-10-18 — UBD+klon published; `ai-contour.timer` enabled |
 | Chat backup drill | **PASS** 2026-10-16 — throwaway `:3100`; evidence `/srv/ai-contour/backups/chat-drill-20261016T120306Z` |
 
 Integration acceptance covers: full publish cycle ×3 profiles; package intake; corrupted/incomplete package refusal; crash after activation (reads stay closed); reaped completed job; unknown writer refusal; Graph exit 3→FULL; failed mandatory BSL; probes before reopen.
@@ -65,5 +65,5 @@ Integration acceptance covers: full publish cycle ×3 profiles; package intake; 
 
 ## Next action
 
-1. After night: `journalctl -u ai-sync.service --since 01:00` + `contour status` (UBD+KB+klon published).
+1. After night: `journalctl -u ai-contour.service --since 01:00` + `contour status` (UBD+KB+klon published).
 2. Keep Windows `UBD Config Sync` **Disabled**; exporters package-only.

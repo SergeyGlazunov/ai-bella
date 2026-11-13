@@ -301,7 +301,7 @@ def production_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         lambda _db, base: base,
     )
     monkeypatch.setattr("contour.watch_bsl.reload_bsl_daemon", lambda _cfg: None)
-    # pause_watch / restore_watch call watch_reload which would hit real docker
+    # watcher heal/reload would hit real docker if wired; keep stub
     # via _watch_reload_for_database → reload_bsl_daemon (already stubbed).
 
     paths = RuntimePaths(

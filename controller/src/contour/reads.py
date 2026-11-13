@@ -127,9 +127,15 @@ def _try_firewall_drop(cfg, docker) -> None:
 
 
 def _try_firewall_undrop(cfg, docker) -> None:
-    """Best-effort remove DROP if present (cleanup after optional apply)."""
+    """Best-effort remove DROP if present (cleanup after optional apply).
+
+    Bounded loop: without CAP_NET_ADMIN iptables fails and is swallowed; never
+    spin forever if -C stays true while -D is a no-op.
+    """
     port = str(cfg.services.bsl_publish_port)
-    while _firewall_blocked(cfg, docker):
+    for _ in range(32):
+        if not _firewall_blocked(cfg, docker):
+            return
         try:
             docker.run(
                 ["iptables", "-D", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP"]
@@ -422,8 +428,9 @@ class DatabaseReadController:
             return
 
     def _try_firewall_undrop(self) -> None:
+        """Best-effort; optional. ai-contour has no CAP_NET_ADMIN — failures are OK."""
         port = str(self.database.services.bsl_publish_port)
-        while True:
+        for _ in range(32):
             try:
                 check = self.docker.run(
                     [
