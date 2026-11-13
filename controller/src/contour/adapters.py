@@ -12,6 +12,10 @@ class MissingAdapters(RuntimeError):
     """Configured index/idle adapters are required before closing reads."""
 
 
+class ProbeInconclusive(RuntimeError):
+    """Probe exit 2 / uncertain — do not fail the whole night for one sample."""
+
+
 def _require_cmd(section: str, name: str, command: list[str] | None) -> list[str]:
     if not command:
         raise MissingAdapters(f"adapters.{section}.{name} is required")
@@ -49,6 +53,16 @@ def _merge_env(extra: dict[str, str] | None) -> dict[str, str] | None:
     return {**os.environ, **extra}
 
 
+def _batch_command(command: list[str], paths: list[str]) -> list[str]:
+    """Turn ``[script, mode, {path}]`` into ``[script, mode, p1, p2, ...]``."""
+    if not paths:
+        return list(command)
+    if any(part == "{path}" or "{path}" in part for part in command):
+        base = [part for part in command if part != "{path}" and "{path}" not in part]
+        return base + list(paths)
+    return list(command) + list(paths)
+
+
 @dataclass
 class CommandProbe:
     status: str = "ready"
@@ -58,18 +72,25 @@ class CommandProbe:
     runner: DockerRunner | None = None
     env: dict[str, str] = field(default_factory=dict)
 
-    def _run(self, command: list[str] | None, path: str, kind: str) -> None:
-        if not command:
-            raise MissingAdapters(f"{kind} adapter command missing")
+    def _run_argv(self, argv: list[str], kind: str) -> None:
         docker = self.runner if self.runner is not None else SubprocessRunner()
         timeout = DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds
         merged = _merge_env(self.env)
         run = getattr(docker, "run")
         try:
-            run(_render(command, path), timeout=timeout, env=merged)
-        except TypeError:
-            # Fakes / older runners may not accept env=.
-            run(_render(command, path), timeout=timeout)
+            try:
+                run(argv, timeout=timeout, env=merged)
+            except TypeError:
+                run(argv, timeout=timeout)
+        except subprocess.CalledProcessError as exc:
+            if int(getattr(exc, "returncode", 1) or 1) == 2:
+                raise ProbeInconclusive(f"{kind} inconclusive rc=2") from exc
+            raise
+
+    def _run(self, command: list[str] | None, path: str, kind: str) -> None:
+        if not command:
+            raise MissingAdapters(f"{kind} adapter command missing")
+        self._run_argv(_render(command, path), kind)
 
     def check_bsl(self, path: str) -> None:
         if not self.check_bsl_cmd:
@@ -83,6 +104,20 @@ class CommandProbe:
 
     def check_deletion(self, path: str) -> None:
         self._run(self.check_deletion_cmd, path, "check_deletion")
+
+    def check_bsl_many(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        if not self.check_bsl_cmd:
+            raise MissingAdapters("check_bsl adapter command missing")
+        self._run_argv(_batch_command(self.check_bsl_cmd, paths), "check_bsl")
+
+    def check_xml_many(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        if not self.check_xml_cmd:
+            raise MissingAdapters("check_xml adapter command missing")
+        self._run_argv(_batch_command(self.check_xml_cmd, paths), "check_xml")
 
 
 @dataclass

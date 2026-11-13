@@ -119,20 +119,34 @@ def sample_paths(
     )
 
 
+def is_probeable_metadata_xml(path: str) -> bool:
+    """True for top-level ``KindDir/Name.xml`` (cheap, reliable graph probes).
+
+    Nested Forms/Ext/… XML is still indexable but often unmappable for content
+    probes — prefer object roots so a single odd path cannot fail the night.
+    """
+    parts = path.replace("\\", "/").split("/")
+    if len(parts) != 2 or not parts[1].endswith(".xml"):
+        return False
+    name = parts[1][: -len(".xml")]
+    return bool(name) and "/" not in name
+
+
 def sample_current_tree(
     repo: str | Path,
     *,
     workspace_subdir: str = "",
-    limit: int = 32,
+    limit: int = 8,
     required_layers: Sequence[str] | None = None,
     bsl_limit: int | None = None,
     xml_limit: int | None = None,
 ) -> Samples:
     """Recovery samples from working tree under workspace_subdir (capped).
 
-    Limits for BSL and XML are independent so XML-heavy trees cannot starve the
-    BSL probe required by ``code_index``. Unused layer types get a zero quota
-    (e.g. klon_opl does not spend budget on XML).
+    Default ``limit=8`` keeps content probes cheap (one batched cypher-shell /
+    one BSL exec). Limits for BSL and XML are independent so XML-heavy trees
+    cannot starve the BSL probe required by ``code_index``. Unused layer types
+    get a zero quota (e.g. klon_opl does not spend budget on XML).
     """
     layers = (
         frozenset(required_layers)
@@ -192,7 +206,11 @@ def sample_current_tree(
                         preferred_bsl.append(posix)
                 elif len(other_bsl) < max_bsl:
                     other_bsl.append(posix)
-            elif posix.endswith(".xml") and len(xml_paths) < max_xml:
+            elif (
+                posix.endswith(".xml")
+                and len(xml_paths) < max_xml
+                and is_probeable_metadata_xml(posix)
+            ):
                 xml_paths.append(posix)
             # Do not stop early on other_bsl alone — preferred roots may sort later.
             xml_done = len(xml_paths) >= max_xml
@@ -284,13 +302,31 @@ EMPTY_LAYER_SAMPLE_WARNING = (
 )
 
 
+def _probe_call(call, *, warnings: list[str], label: str) -> bool:
+    """Run a probe call. Exit-2 / ProbeInconclusive → warning, not night fail."""
+    try:
+        from contour.adapters import ProbeInconclusive
+    except ImportError:  # pragma: no cover - adapters always present in package
+        ProbeInconclusive = ()  # type: ignore[misc, assignment]
+    try:
+        call()
+        return True
+    except ProbeInconclusive as exc:
+        warnings.append(f"{label}: inconclusive ({exc})")
+        return False
+
+
 def verify_indexes(
     samples: Samples,
     probes: IndexProbes,
     *,
     required_layers: Sequence[str] | None = None,
 ) -> list[str]:
-    """Verify probes. Return human-readable warnings (never silent content skip)."""
+    """Verify probes. Return human-readable warnings (never silent content skip).
+
+    Confirmed mismatches still raise. Inconclusive samples (probe exit 2) become
+    warnings so one odd path cannot discard a multi-hour index run.
+    """
     layers = (
         frozenset(required_layers)
         if required_layers is not None
@@ -313,60 +349,145 @@ def verify_indexes(
 
     code_checked = False
     graph_checked = False
+    code_attempted = False
+    graph_attempted = False
 
-    if need_code:
-        for path in samples.bsl_paths:
-            probes.code_index.check_bsl(path)
-            code_checked = True
+    if need_code and samples.bsl_paths:
+        code_attempted = True
+        many = getattr(probes.code_index, "check_bsl_many", None)
+        if callable(many):
+            if _probe_call(
+                lambda: many(list(samples.bsl_paths)),
+                warnings=warnings,
+                label="code_index",
+            ):
+                code_checked = True
+        else:
+            for path in samples.bsl_paths:
+                if _probe_call(
+                    lambda p=path: probes.code_index.check_bsl(p),
+                    warnings=warnings,
+                    label=f"code_index:{path}",
+                ):
+                    code_checked = True
     if need_graph:
         if graph is None:
             raise RuntimeError("graph probe required for this database")
-        for path in samples.bsl_paths:
-            if getattr(graph, "check_bsl_cmd", None):
-                graph.check_bsl(path)
-                graph_checked = True
-        for path in samples.xml_paths:
-            graph.check_xml(path)
-            graph_checked = True
+        graph_bsl = [
+            path
+            for path in samples.bsl_paths
+            if getattr(graph, "check_bsl_cmd", None)
+        ]
+        if graph_bsl:
+            graph_attempted = True
+            many_bsl = getattr(graph, "check_bsl_many", None)
+            if callable(many_bsl):
+                if _probe_call(
+                    lambda: many_bsl(list(graph_bsl)),
+                    warnings=warnings,
+                    label="graph:bsl",
+                ):
+                    graph_checked = True
+            else:
+                for path in graph_bsl:
+                    if _probe_call(
+                        lambda p=path: graph.check_bsl(p),
+                        warnings=warnings,
+                        label=f"graph:bsl:{path}",
+                    ):
+                        graph_checked = True
+        xml_paths = [
+            path for path in samples.xml_paths if is_probeable_metadata_xml(path)
+        ]
+        skipped_xml = len(samples.xml_paths) - len(xml_paths)
+        if skipped_xml:
+            warnings.append(
+                f"graph: skipped {skipped_xml} nested xml sample(s) "
+                "(prefer Kind/Name.xml)"
+            )
+        if xml_paths:
+            graph_attempted = True
+            many_xml = getattr(graph, "check_xml_many", None)
+            if callable(many_xml):
+                if _probe_call(
+                    lambda: many_xml(list(xml_paths)),
+                    warnings=warnings,
+                    label="graph:xml",
+                ):
+                    graph_checked = True
+            else:
+                for path in xml_paths:
+                    if _probe_call(
+                        lambda p=path: graph.check_xml(p),
+                        warnings=warnings,
+                        label=f"graph:xml:{path}",
+                    ):
+                        graph_checked = True
     for path in samples.deletions:
         if path.endswith(".bsl"):
             if need_code:
-                probes.code_index.check_deletion(path)
-                code_checked = True
+                if _probe_call(
+                    lambda p=path: probes.code_index.check_deletion(p),
+                    warnings=warnings,
+                    label=f"code_index:del:{path}",
+                ):
+                    code_checked = True
             if need_graph and graph is not None:
-                graph.check_deletion(path)
-                graph_checked = True
+                if _probe_call(
+                    lambda p=path: graph.check_deletion(p),
+                    warnings=warnings,
+                    label=f"graph:del:{path}",
+                ):
+                    graph_checked = True
         elif path.endswith(".xml"):
             if need_graph and graph is not None:
-                graph.check_deletion(path)
-                graph_checked = True
+                if _probe_call(
+                    lambda p=path: graph.check_deletion(p),
+                    warnings=warnings,
+                    label=f"graph:del:{path}",
+                ):
+                    graph_checked = True
         else:
             if need_code:
-                probes.code_index.check_deletion(path)
-                code_checked = True
+                if _probe_call(
+                    lambda p=path: probes.code_index.check_deletion(p),
+                    warnings=warnings,
+                    label=f"code_index:del:{path}",
+                ):
+                    code_checked = True
             if need_graph and graph is not None:
-                graph.check_deletion(path)
-                graph_checked = True
+                if _probe_call(
+                    lambda p=path: graph.check_deletion(p),
+                    warnings=warnings,
+                    label=f"graph:del:{path}",
+                ):
+                    graph_checked = True
 
     # Missing suitable samples for a required layer is not silent success.
     if need_code and not code_checked:
-        if probes.code_index.status != "ready":
+        if code_attempted:
+            warnings.append("code_index: samples inconclusive (not a hard fail)")
+        elif probes.code_index.status != "ready":
             raise RuntimeError(
                 f"code_index probe not ready ({probes.code_index.status}); "
                 "no BSL samples were available to check"
             )
-        if samples.integrity_unknown:
+        elif samples.integrity_unknown:
             raise RuntimeError(f"code_index: {EMPTY_LAYER_SAMPLE_WARNING}")
-        warnings.append(f"code_index: {EMPTY_LAYER_SAMPLE_WARNING}")
+        else:
+            warnings.append(f"code_index: {EMPTY_LAYER_SAMPLE_WARNING}")
     if need_graph and not graph_checked:
         if graph is None:
             raise RuntimeError("graph probe required for this database")
-        if graph.status != "ready":
+        if graph_attempted:
+            warnings.append("graph: samples inconclusive (not a hard fail)")
+        elif graph.status != "ready":
             raise RuntimeError(
                 f"graph probe not ready ({graph.status}); "
                 "no Graph samples were available to check"
             )
-        if samples.integrity_unknown:
+        elif samples.integrity_unknown:
             raise RuntimeError(f"graph: {EMPTY_LAYER_SAMPLE_WARNING}")
-        warnings.append(f"graph: {EMPTY_LAYER_SAMPLE_WARNING}")
+        else:
+            warnings.append(f"graph: {EMPTY_LAYER_SAMPLE_WARNING}")
     return warnings

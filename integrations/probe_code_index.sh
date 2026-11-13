@@ -1,15 +1,18 @@
 #!/bin/sh
 # Content probe for BSL code-index (R02 / F02).
-# Usage: probe_code_index.sh present|absent <rel-path>
+# Usage: probe_code_index.sh present|absent <rel-path> [more paths...]
+# Multiple paths share ONE docker exec into the BSL container.
 # Exit 0 confirmed; 1 wrong presence; 2 control / uncertain (never "absent success").
 set -eu
 
 MODE="${1:?mode present|absent}"
-REL="${2:?relative path}"
+shift
+[ "$#" -ge 1 ] || {
+  echo "probe_code_index: need at least one path" >&2
+  exit 2
+}
 CONTAINER="${BSL_CONTAINER:-bsl-indexer}"
 SRC="${BSL_SRC_PATH:-/repos/SRC}"
-
-REL=$(printf '%s' "$REL" | tr '\\' '/')
 
 if command -v python3 >/dev/null 2>&1; then
   PYTHON=python3
@@ -19,19 +22,26 @@ else
   PYTHON=
 fi
 
+# One exec: dump get-file-summary for each path with a clear separator.
 set +e
 out="$(docker exec -e CODE_INDEX_HOME=/data/code-index-home "$CONTAINER" \
-  bsl-indexer get-file-summary "$REL" --path "$SRC" 2>&1)"
+  sh -c '
+SRC="$1"; shift
+for rel in "$@"; do
+  rel=$(printf "%s" "$rel" | tr "\\" "/")
+  echo "__PROBE_PATH__:$rel"
+  bsl-indexer get-file-summary "$rel" --path "$SRC" 2>&1 || echo "__PROBE_RC__:$?"
+done
+' sh "$SRC" "$@")"
 rc=$?
 set -e
 
-found=0
-not_found=0
-
-classify() {
-  # Prefer structured JSON from CLI (Option[FileSummary] → object or null).
+classify_chunk() {
+  chunk="$1"
+  found=0
+  not_found=0
   if [ -n "$PYTHON" ]; then
-    verdict=$(printf '%s' "$out" | "$PYTHON" -c '
+    verdict=$(printf '%s' "$chunk" | "$PYTHON" -c '
 import json, sys
 text = sys.stdin.read()
 stripped = text.strip()
@@ -76,65 +86,93 @@ if isinstance(obj, dict):
 else:
     print("unknown")
 ' 2>/dev/null) || verdict=unknown
-    case "$verdict" in
-      present) found=1 ;;
-      absent) not_found=1 ;;
-    esac
-    return
+  else
+    if printf '%s' "$chunk" | grep -Eq '"file"|"path"|file_path|"functions"|"classes"|"variables"|"oversize"[[:space:]]*:[[:space:]]*true'; then
+      verdict=present
+    elif printf '%s' "$chunk" | grep -Eiq 'not found|no such|File not found|не найден|^null$'; then
+      verdict=absent
+    else
+      verdict=unknown
+    fi
   fi
-  # Fallback without Python: accept empty-module summaries ("functions": []) and oversize.
-  if printf '%s' "$out" | grep -Eq '"file"|"path"|file_path|"functions"|"classes"|"variables"|"oversize"[[:space:]]*:[[:space:]]*true'; then
-    found=1
-  elif printf '%s' "$out" | grep -Eiq 'not found|no such|File not found|не найден|^null$'; then
-    not_found=1
-  fi
+  case "$verdict" in
+    present) found=1 ;;
+    absent) not_found=1 ;;
+  esac
+  printf '%s %s\n' "$found" "$not_found"
 }
 
-classify
+fail=0
+uncertain=0
+checked=0
+current_path=""
+current_chunk=""
 
-control_fail=0
-case "$rc" in
-  125|126|127) control_fail=1 ;;
-esac
-if [ "$rc" -ne 0 ] && [ "$found" -eq 0 ] && [ "$not_found" -eq 0 ]; then
-  control_fail=1
+flush() {
+  [ -n "$current_path" ] || return 0
+  checked=$((checked + 1))
+  set -- $(classify_chunk "$current_chunk")
+  found=$1
+  not_found=$2
+  case "$MODE" in
+    present)
+      if [ "$found" -eq 1 ]; then
+        :
+      elif [ "$not_found" -eq 1 ]; then
+        echo "probe_code_index: expected present: $current_path" >&2
+        fail=1
+      else
+        echo "probe_code_index: uncertain present: $current_path" >&2
+        uncertain=1
+      fi
+      ;;
+    absent)
+      if [ "$found" -eq 1 ]; then
+        echo "probe_code_index: expected absent: $current_path" >&2
+        fail=1
+      elif [ "$not_found" -eq 1 ]; then
+        :
+      else
+        echo "probe_code_index: uncertain absent: $current_path" >&2
+        uncertain=1
+      fi
+      ;;
+  esac
+}
+
+# Split docker output into per-path chunks.
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    __PROBE_PATH__:*)
+      flush
+      current_path=${line#__PROBE_PATH__:}
+      current_chunk=""
+      ;;
+    *)
+      current_chunk="${current_chunk}${line}
+"
+      ;;
+  esac
+done <<EOF
+$out
+EOF
+flush
+
+if [ "$rc" -eq 125 ] || [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+  echo "probe_code_index: control failure rc=$rc" >&2
+  echo "$out" >&2
+  exit 2
 fi
-
-case "$MODE" in
-  present)
-    if [ "$control_fail" -eq 1 ]; then
-      echo "probe_code_index: control failure rc=$rc" >&2
-      echo "$out" >&2
-      exit 2
-    fi
-    if [ "$found" -eq 1 ]; then
-      exit 0
-    fi
-    echo "probe_code_index: expected present: $REL" >&2
-    echo "$out" >&2
-    exit 1
-    ;;
-  absent)
-    if [ "$control_fail" -eq 1 ]; then
-      echo "probe_code_index: control failure (not confirmed absent) rc=$rc" >&2
-      echo "$out" >&2
-      exit 2
-    fi
-    if [ "$found" -eq 1 ]; then
-      echo "probe_code_index: expected absent: $REL" >&2
-      echo "$out" >&2
-      exit 1
-    fi
-    if [ "$not_found" -eq 1 ] || [ "$rc" -eq 0 ]; then
-      # rc=0 with null / no file markers → empty/null summary
-      exit 0
-    fi
-    echo "probe_code_index: cannot confirm absent: $REL" >&2
-    echo "$out" >&2
-    exit 2
-    ;;
-  *)
-    echo "probe_code_index: bad mode $MODE" >&2
-    exit 2
-    ;;
-esac
+if [ "$checked" -eq 0 ]; then
+  echo "probe_code_index: no paths checked" >&2
+  echo "$out" >&2
+  exit 2
+fi
+if [ "$fail" -ne 0 ]; then
+  echo "$out" >&2
+  exit 1
+fi
+if [ "$uncertain" -ne 0 ]; then
+  exit 2
+fi
+exit 0

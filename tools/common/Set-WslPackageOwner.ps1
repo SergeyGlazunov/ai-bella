@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-  After publishing via \\wsl$\..., make the package claimable by ai-contour.
+  DEPRECATED. Prefer Publish-ReadyPackageViaDocker (tools/common/Docker-Index.ps1).
 
 .DESCRIPTION
-  Contour claim_package uses Path.replace (cross-directory rename). Linux
-  requires write permission on the directory being moved (to update "..").
-  Drops created through \\wsl$ are typically root:root mode 755 — ai-contour
-  can write the inbox parent but cannot rename the package dir into accepted/.
+  Legacy helper for packages dropped via \\wsl$\... Contour claim_package needs
+  ai-contour ownership to rename into accepted/.
 
-  No-op when -WinPath is not under \\wsl$\. Refuses paths outside
-  /srv/ai-contour/inbox/ (or the Linux path derived from that UNC).
+  On this stand \\wsl$ is broken (VHD sharing) — KB / klon_opl exporters already
+  deliver via Docker API + chown inside the container. This script remains only
+  for manual/legacy paths: chown failures become warnings and do NOT fail the
+  export (a successful 1C dump must not be discarded because WSL hung).
 #>
 [CmdletBinding()]
 param(
@@ -19,26 +19,31 @@ param(
     [string]$InboxPrefix = "/srv/ai-contour/inbox/"
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $full = [IO.Path]::GetFullPath($WinPath)
 
+Write-Warning "Set-WslPackageOwner is deprecated; use Publish-ReadyPackageViaDocker for inbox delivery."
+
 if ($full -notmatch '(?i)^\\\\wsl\$\\([^\\]+)\\(.+)$') {
-    Write-Verbose "Set-WslPackageOwner: not a \\\\wsl\$ path, skip ($full)"
+    Write-Verbose "Set-WslPackageOwner: not a \\wsl`$ path, skip ($full)"
     return
 }
 
 $distro = $Matches[1]
 $linux = "/" + (($Matches[2] -replace "\\", "/").TrimStart("/"))
 if (-not $linux.StartsWith($InboxPrefix)) {
-    throw "Set-WslPackageOwner refuses path outside ${InboxPrefix}: $linux"
+    Write-Warning "Set-WslPackageOwner refuses path outside ${InboxPrefix}: $linux"
+    return
 }
 if (-not (Test-Path -LiteralPath $full)) {
-    throw "Set-WslPackageOwner: path missing: $full"
+    Write-Warning "Set-WslPackageOwner: path missing: $full"
+    return
 }
 
 # -u root: only root can chown Windows-created root:root trees.
 & wsl.exe -d $distro -u root -- chown -R $Owner -- $linux
 if ($LASTEXITCODE -ne 0) {
-    throw "chown -R $Owner failed for $linux (wsl exit $LASTEXITCODE)"
+    Write-Warning "chown -R $Owner failed for $linux (wsl exit $LASTEXITCODE); package left as-is"
+    return
 }
 Write-Host "package owner set to $Owner : $linux"

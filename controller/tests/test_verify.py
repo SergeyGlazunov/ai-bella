@@ -148,8 +148,8 @@ def test_verify_indexes_empty_diff_not_ready_raises():
 def test_verify_indexes_dispatches_samples_to_probes():
     samples = Samples(
         bsl_paths=["a.bsl"],
-        xml_paths=["b.xml"],
-        deletions=["c.xml"],
+        xml_paths=["Catalogs/Items.xml"],
+        deletions=["Catalogs/Old.xml"],
         integrity_unknown=False,
     )
     code = FakeProbe(status="ready")
@@ -159,8 +159,8 @@ def test_verify_indexes_dispatches_samples_to_probes():
     verify_indexes(samples, probes)
 
     assert code.bsl_checked == ["a.bsl"]
-    assert graph.xml_checked == ["b.xml"]
-    assert graph.deletions_checked == ["c.xml"]
+    assert graph.xml_checked == ["Catalogs/Items.xml"]
+    assert graph.deletions_checked == ["Catalogs/Old.xml"]
     assert code.deletions_checked == []
 
 
@@ -194,28 +194,66 @@ def test_sample_current_tree_empty_unknown_fails(tmp_path: Path):
 
 def test_sample_current_tree_separate_limits_keep_bsl(tmp_path: Path):
     repo = tmp_path / "mixed"
-    repo.mkdir()
+    (repo / "Catalogs").mkdir(parents=True)
     for i in range(32):
-        (repo / f"A{i:03d}.xml").write_text("<x/>", encoding="utf-8")
+        (repo / "Catalogs" / f"A{i:03d}.xml").write_text("<x/>", encoding="utf-8")
     (repo / "ZModule.bsl").write_text("// z", encoding="utf-8")
     samples = sample_current_tree(
         repo, required_layers=("code_index", "graph"), limit=32
     )
     assert "ZModule.bsl" in samples.bsl_paths
     assert len(samples.xml_paths) == 16
+    assert all(p.startswith("Catalogs/") for p in samples.xml_paths)
 
 
 def test_sample_current_tree_code_index_only_ignores_xml_quota(tmp_path: Path):
     repo = tmp_path / "opl"
-    repo.mkdir()
+    (repo / "Catalogs").mkdir(parents=True)
     for i in range(40):
-        (repo / f"A{i:03d}.xml").write_text("<x/>", encoding="utf-8")
+        (repo / "Catalogs" / f"A{i:03d}.xml").write_text("<x/>", encoding="utf-8")
     (repo / "ZModule.bsl").write_text("// z", encoding="utf-8")
     samples = sample_current_tree(
         repo, required_layers=("code_index",), limit=32
     )
     assert samples.bsl_paths == ["ZModule.bsl"]
     assert samples.xml_paths == []
+
+
+def test_sample_current_tree_skips_nested_xml(tmp_path: Path):
+    from contour.verify import is_probeable_metadata_xml
+
+    assert is_probeable_metadata_xml("Catalogs/Items.xml")
+    assert not is_probeable_metadata_xml("Catalogs/Items/Forms/Form.xml")
+    repo = tmp_path / "nest"
+    (repo / "Catalogs" / "Items" / "Forms").mkdir(parents=True)
+    (repo / "Catalogs" / "Items" / "Forms" / "Form.xml").write_text("<f/>", encoding="utf-8")
+    (repo / "Catalogs" / "Items.xml").write_text("<c/>", encoding="utf-8")
+    (repo / "CommonModules" / "Foo.bsl").parent.mkdir(parents=True, exist_ok=True)
+    (repo / "CommonModules" / "Foo.bsl").write_text("// x", encoding="utf-8")
+    samples = sample_current_tree(repo, required_layers=("code_index", "graph"), limit=8)
+    assert samples.xml_paths == ["Catalogs/Items.xml"]
+
+
+def test_verify_indexes_inconclusive_is_warning_not_raise():
+    from contour.adapters import ProbeInconclusive
+
+    samples = Samples(
+        bsl_paths=["CommonModules/Foo.bsl"],
+        xml_paths=["Catalogs/Items.xml"],
+        deletions=[],
+    )
+
+    class Flaky(FakeProbe):
+        def check_bsl(self, path: str) -> None:
+            raise ProbeInconclusive("rc=2")
+
+        def check_xml(self, path: str) -> None:
+            raise ProbeInconclusive("rc=2")
+
+    code = Flaky(status="ready")
+    graph = Flaky(status="ready")
+    warnings = verify_indexes(samples, FakeProbes(code_index=code, graph=graph))
+    assert any("inconclusive" in w for w in warnings)
 
 
 def test_sample_current_tree_prefers_typical_roots_but_keeps_other_bsl(
@@ -245,7 +283,7 @@ def test_sample_current_tree_prefers_typical_roots_but_keeps_other_bsl(
 def test_verify_indexes_xml_only_uses_empty_code_contract():
     samples = Samples(
         bsl_paths=[],
-        xml_paths=["a.xml"],
+        xml_paths=["Catalogs/Items.xml"],
         deletions=[],
         integrity_unknown=False,
     )
@@ -258,7 +296,7 @@ def test_verify_indexes_xml_only_uses_empty_code_contract():
             required_layers=("code_index", "graph"),
         )
     assert code.bsl_checked == []
-    assert graph.xml_checked == ["a.xml"]
+    assert graph.xml_checked == ["Catalogs/Items.xml"]
 
 
 def test_verify_layers_at_revision_requires_ready_layers(tmp_path: Path):
