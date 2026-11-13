@@ -6,7 +6,7 @@
 |----------|------------|
 | [AGENT.md](AGENT.md) | Контракт для агента |
 | [USER.md](USER.md) | Установка, УБД+КБ, cutover |
-| [DEVELOPMENT.md](DEVELOPMENT.md) | Журнал решений |
+| [DEVELOPMENT.md](../DEVELOPMENT.md) | Журнал решений |
 | [checks/README.md](checks/README.md) | Stand gates |
 | [deploy-ai2/README.md](deploy-ai2/README.md) | Overlays ai2: графы + query + BSL |
 

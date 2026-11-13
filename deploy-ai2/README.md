@@ -13,8 +13,6 @@
 
 Выгрузки: `/srv/ai2/ubd/src` (git), `/srv/ai2/kb/src` (`tools/kb/…`), `/srv/ai2/klon_opl/src` (`tools/klon_opl/…`).
 
-Устаревшие каталоги: `mcp_for_1c/`, `bsl-indexer/` — см. `DEPRECATED.md` внутри.
-
 ## Name map (эталон)
 
 Префикс на ai2: `ai2-`. На чистом сервере можно сменить на нейтральный, сохранив суффиксы `-ubd` / `-kb`.
