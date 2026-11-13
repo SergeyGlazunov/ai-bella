@@ -160,6 +160,20 @@ class CommandEngine:
             return self._runner.run(cmd, timeout=timeout)
 
     def idle_probe(self) -> bool:
+        # Prefer in-process Python for the kit idle script (no bash→python dance).
+        cmd0 = str(self._idle_cmd[0]) if self._idle_cmd else ""
+        if cmd0.replace("\\", "/").endswith("idle_bsl.sh"):
+            from contour.bsl_ctl import idle_bsl
+
+            container = (
+                self._env.get("BSL_CONTAINER")
+                or os.environ.get("BSL_CONTAINER")
+                or "bsl-indexer"
+            )
+            try:
+                return bool(idle_bsl(container, runner=self._runner))
+            except Exception:
+                return False
         try:
             result = self.run(
                 self._idle_cmd,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -14,13 +15,14 @@ from contour.profiles import (
     profile_from_config,
     run_required_layers,
 )
-from contour.remount_bsl import remount_after_activate
+from contour.remount_bsl import published_workspace, remount_after_activate
 from contour.sources import PreparedSource, SourceProvider, activate_source
 from contour.state import StateStore
 from contour.runtime_policy import WriteWindowClosed, WriterStillAlive
 from contour.verify import (
     Samples,
     sample_current_tree,
+    verify_index_health,
     verify_indexes,
     verify_run_layer_results,
 )
@@ -211,10 +213,14 @@ def run_database_pipeline(
         # Publish gate uses this run's results only — not stale ready rows.
         verify_run_layer_results(results, profile.required_layers, revision)
 
-        probe_samples = _resolve_samples(
-            samples, prepared, database, profile.required_layers
+        probe_warnings = _verify_after_index(
+            probes,
+            samples,
+            prepared,
+            database,
+            profile.required_layers,
+            docker_runner=docker_runner,
         )
-        probe_warnings = _run_probes(probes, probe_samples, profile.required_layers)
         note("verified")
 
         reads.open()
@@ -311,6 +317,14 @@ def _finish_failed(
             pass
 
 
+def _want_content_probes() -> bool:
+    return os.environ.get("CONTOUR_CONTENT_PROBES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def _resolve_samples(
     samples: Samples | None,
     prepared: PreparedSource,
@@ -331,6 +345,35 @@ def _resolve_samples(
         root,
         workspace_subdir=workspace,
         required_layers=required_layers,
+    )
+
+
+def _verify_after_index(
+    probes: object,
+    samples: Samples | None,
+    prepared: PreparedSource,
+    database: DatabaseConfig,
+    required_layers: Sequence[str],
+    *,
+    docker_runner: DockerRunner | None,
+) -> list[str]:
+    """Default: cheap index health. Opt-in content probes via env or test fakes."""
+    runner = getattr(probes, "run_before_open", None)
+    if callable(runner) or _want_content_probes():
+        probe_samples = _resolve_samples(
+            samples, prepared, database, required_layers
+        )
+        return _run_probes(probes, probe_samples, required_layers)
+    neo = ""
+    services = getattr(database, "services", None)
+    if services is not None:
+        neo = str(getattr(services, "neo4j_container", "") or "")
+    src = published_workspace(database, Path(prepared.published_path))
+    return verify_index_health(
+        published_src=src,
+        required_layers=required_layers,
+        neo4j_container=neo,
+        docker=docker_runner,
     )
 
 

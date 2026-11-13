@@ -11,6 +11,7 @@ from contour.verify import (
     Samples,
     sample_current_tree,
     sample_paths,
+    verify_index_health,
     verify_indexes,
     verify_layers_at_revision,
 )
@@ -322,3 +323,52 @@ def test_verify_layers_at_revision_requires_ready_layers(tmp_path: Path):
     )
     conn.commit()
     verify_layers_at_revision(conn, "ubd", "r1", ("code_index", "graph"))
+
+
+def test_verify_index_health_code_index_only(tmp_path: Path):
+    src = tmp_path / "src"
+    db = src / ".code-index"
+    db.mkdir(parents=True)
+    index = db / "index.db"
+    import sqlite3
+
+    conn = sqlite3.connect(index)
+    conn.execute("CREATE TABLE files (path TEXT)")
+    conn.execute("INSERT INTO files VALUES ('a.bsl')")
+    conn.commit()
+    conn.close()
+    assert verify_index_health(
+        published_src=src,
+        required_layers=["code_index"],
+    ) == []
+
+
+def test_verify_index_health_graph_count(tmp_path: Path):
+    class FakeDocker:
+        def run(self, cmd, *, timeout=None, env=None):
+            assert "MATCH (n:MetadataObject)" in " ".join(cmd)
+            return type("R", (), {"stdout": "c\n42\n", "stderr": "", "returncode": 0})()
+
+    assert (
+        verify_index_health(
+            published_src=tmp_path,
+            required_layers=["graph"],
+            neo4j_container="neo4j-test",
+            docker=FakeDocker(),
+        )
+        == []
+    )
+
+
+def test_verify_index_health_graph_empty_raises(tmp_path: Path):
+    class FakeDocker:
+        def run(self, cmd, *, timeout=None, env=None):
+            return type("R", (), {"stdout": "c\n0\n", "stderr": "", "returncode": 0})()
+
+    with pytest.raises(RuntimeError, match="graph empty"):
+        verify_index_health(
+            published_src=tmp_path,
+            required_layers=["graph"],
+            neo4j_container="neo4j-test",
+            docker=FakeDocker(),
+        )

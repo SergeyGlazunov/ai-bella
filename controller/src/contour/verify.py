@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+
+from contour.dockerutil import DockerRunner, SubprocessRunner
+from contour.remount_bsl import assert_code_index_nonempty
+from contour.runtime_policy import DEFAULT_RUNTIME_POLICY
 
 
 @dataclass(frozen=True)
@@ -300,6 +305,70 @@ def _verify_empty_layer_status(
 EMPTY_LAYER_SAMPLE_WARNING = (
     "Проверка содержимого слоя не выполнена: нет подходящих файлов"
 )
+
+
+def graph_metadata_object_count(
+    neo4j_container: str,
+    *,
+    runner: DockerRunner | None = None,
+    neo4j_user: str = "neo4j",
+) -> int:
+    """One aggregating Cypher count of ``MetadataObject`` nodes."""
+    if not str(neo4j_container or "").strip():
+        raise RuntimeError("neo4j_container is required for graph health check")
+    docker = runner if runner is not None else SubprocessRunner()
+    user = str(neo4j_user or "neo4j").replace("'", "")
+    cypher = "MATCH (n:MetadataObject) RETURN count(n) AS c;"
+    # Password stays in container env (same contract as probe_graph.sh).
+    inner = (
+        'PASS="${HC_NEO4J_PASSWORD:-${NEO4J_PASSWORD:-}}"; '
+        'if [ -z "$PASS" ]; then echo "graph health: no password" >&2; exit 2; fi; '
+        f"printf '%s\\n' '{cypher}' | "
+        f"cypher-shell -u '{user}' -p \"$PASS\" --format plain"
+    )
+    result = docker.run(
+        ["docker", "exec", neo4j_container, "sh", "-c", inner],
+        timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+    )
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    # plain format: header "c" then a number row; take the last integer token.
+    counts = [int(m.group(0)) for m in re.finditer(r"(?m)^\s*(\d+)\s*$", text)]
+    if not counts:
+        # Fallback: any trailing integer after noise.
+        nums = re.findall(r"\b(\d+)\b", text)
+        if not nums:
+            raise RuntimeError(f"graph health: no count in cypher output: {text!r}")
+        return int(nums[-1])
+    return int(counts[-1])
+
+
+def verify_index_health(
+    *,
+    published_src: Path,
+    required_layers: Sequence[str],
+    neo4j_container: str = "",
+    docker: DockerRunner | None = None,
+    min_index_files: int = 1,
+    min_graph_objects: int = 1,
+) -> list[str]:
+    """Cheap publish gate: SQLite files count + one Neo4j MetadataObject count.
+
+    Per-file content probes stay available via ``verify_indexes`` /
+    ``CONTOUR_CONTENT_PROBES=1``.
+    """
+    layers = frozenset(required_layers)
+    if "code_index" in layers:
+        assert_code_index_nonempty(Path(published_src), min_files=min_index_files)
+    if "graph" in layers:
+        graph_count = graph_metadata_object_count(
+            neo4j_container, runner=docker
+        )
+        if graph_count < int(min_graph_objects):
+            raise RuntimeError(
+                f"graph empty: MetadataObject count={graph_count}, "
+                f"need >= {min_graph_objects}"
+            )
+    return []
 
 
 def _probe_call(call, *, warnings: list[str], label: str) -> bool:
