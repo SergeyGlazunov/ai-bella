@@ -1,0 +1,2 @@
+collect_wsl.sh text eol=lf
+*.sh text eol=lf
