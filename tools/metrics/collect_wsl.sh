@@ -1,14 +1,21 @@
-#!/usr/bin/env bash
-# collect_wsl.sh — WSL host + Docker container metrics every 30s
-# Deploy: copy to /srv/metrics/collect_wsl.sh, chmod +x, nohup in background.
+#!/bin/sh
+# collect_wsl.sh — WSL/host + Docker container metrics every 30s
+# Deploy: /srv/metrics/collect_wsl.sh (also runs as container ai2-metrics-collector)
 
-set -euo pipefail
+set -eu
 
 OUT_DIR="${METRICS_DIR:-/srv/metrics}"
 WSL_CSV="$OUT_DIR/wsl_host.csv"
 DOCKER_CSV="$OUT_DIR/docker_stats.csv"
 
-export DOCKER_HOST="${DOCKER_HOST:-tcp://127.0.0.1:2375}"
+# Prefer explicit DOCKER_HOST; otherwise docker CLI uses local socket
+if [ -n "${DOCKER_HOST:-}" ]; then
+  export DOCKER_HOST
+elif [ -S /var/run/docker.sock ]; then
+  unset DOCKER_HOST || true
+else
+  export DOCKER_HOST=tcp://127.0.0.1:2375
+fi
 
 mkdir -p "$OUT_DIR"
 
