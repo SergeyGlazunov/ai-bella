@@ -599,11 +599,34 @@ def _default_v2_database_runner(
             state.set_lifecycle(database.name, "deferred", detail="no new package")
             return "deferred"
     else:
-        if _published_needs_recovery(database, conn, state, docker):
-            published = published_path_for(database)
-            published_revision = (
-                read_revision(published) if published.is_dir() else None
-            )
+        # Git: identity-gate recovery republishes the local tree and skips
+        # fetch. If upstream already moved ahead, prefer a normal update so a
+        # stale image/volume identity cannot freeze source for many nights
+        # (2026-10-26 class of failure). Upstream probe is best-effort: a
+        # failed fetch must not block offline recovery of the published tree.
+        prefer_upstream = False
+        published = published_path_for(database)
+        published_revision = (
+            read_revision(published) if published.is_dir() else None
+        )
+        if isinstance(database.source, GitSourceConfig) and published_revision:
+            from contour import gitutil
+
+            repo = Path(database.source.path)
+            try:
+                gitutil.fetch(repo)
+                origin_tip = gitutil.rev_parse(
+                    repo, f"origin/{database.source.branch}"
+                )
+                if origin_tip and origin_tip != published_revision:
+                    prefer_upstream = True
+            except Exception:
+                prefer_upstream = False
+
+        needs_recovery = _published_needs_recovery(
+            database, conn, state, docker
+        )
+        if needs_recovery and not prefer_upstream:
             if published_revision:
                 if (
                     send is not None
@@ -637,11 +660,11 @@ def _default_v2_database_runner(
                     raise RuntimeError(
                         f"git fetch/rev-parse failed: {exc}"
                     ) from exc
-                published_revision = str(
+                state_published = str(
                     state.get_database(database.name)["published_revision"] or ""
                 )
                 if (
-                    published_revision == origin_tip
+                    state_published == origin_tip
                     and not is_graph_full_needed(conn, database.name)
                 ):
                     storage = _live_storage_status(
@@ -659,6 +682,8 @@ def _default_v2_database_runner(
                             run_id, "deferred", "storage identity unknown"
                         )
                         return "deferred"
+                    # storage == "changed" and tip unchanged: fall through to
+                    # reindex via the normal provider (refreshes identity).
 
     reload_fn = (
         watch_reload

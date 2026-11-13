@@ -45,19 +45,9 @@ def request_close(db) -> None:
 
 
 def apply_close(cfg, docker) -> None:
+    """Close graph MCP for writes. Keep BSL on the WebUI network (WAL-safe reads)."""
     if _inspect_status(cfg, docker) == "running":
         docker.run(["docker", "stop", cfg.services.graph_mcp])
-    _try_firewall_drop(cfg, docker)
-    if cfg.services.webui_network in _network_names(cfg, docker):
-        docker.run(
-            [
-                "docker",
-                "network",
-                "disconnect",
-                cfg.services.webui_network,
-                cfg.services.bsl_container,
-            ]
-        )
 
 
 def open_reads(cfg, docker) -> None:
@@ -145,12 +135,8 @@ def _try_firewall_undrop(cfg, docker) -> None:
 
 
 def verify_closed(cfg, docker) -> bool:
-    """Closed iff graph MCP down and BSL off WebUI network. Firewall optional."""
-    if _inspect_status(cfg, docker) == "running":
-        return False
-    if cfg.services.webui_network in _network_names(cfg, docker):
-        return False
-    return True
+    """Closed iff graph MCP is down. BSL stays on WebUI network during index."""
+    return _inspect_status(cfg, docker) != "running"
 
 
 def wait_server_idle(
@@ -314,22 +300,15 @@ class DatabaseReadController:
             if status == "running":
                 self.docker.run(["docker", "stop", services.graph_mcp])
         elif layer == "code_index":
+            # Product contract: a failed/nightly DB must not kill chat MCP.
+            # BSL code-index is SQLite WAL — readers stay on webui_network while
+            # the indexer writes. Isolation is the SQLite flag + idle probe, not
+            # docker network amputation.
             if not bool(self.docker.idle_probe()):
                 raise RuntimeError(
                     f"bsl idle probe busy for {name}; refusing close/write"
                 )
             self._pause_watcher()
-            self._try_firewall_drop()
-            if services.webui_network in self._network_names():
-                self.docker.run(
-                    [
-                        "docker",
-                        "network",
-                        "disconnect",
-                        services.webui_network,
-                        services.bsl_container,
-                    ]
-                )
         else:
             raise ValueError(f"unknown layer: {layer}")
         if not self._layer_verify_closed(layer):
@@ -352,6 +331,7 @@ class DatabaseReadController:
                     f"refusing to restore watcher for {name}: active writer"
                 )
             self._assert_code_open_gates()
+            # Heal accidental disconnects; close no longer removes the network.
             if services.webui_network not in self._network_names():
                 self.docker.run(
                     [
@@ -382,11 +362,11 @@ class DatabaseReadController:
             self.open_layer(layer)
 
     def _layer_verify_closed(self, layer: str) -> bool:
-        services = self.database.services
         if layer == "graph":
             return self._graph_status() != "running"
         if layer == "code_index":
-            return services.webui_network not in self._network_names()
+            # Network stays up; "closed" is the SQLite write-window flag only.
+            return True
         return False
 
     def _graph_status(self) -> str:
