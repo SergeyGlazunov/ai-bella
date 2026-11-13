@@ -5,6 +5,7 @@
 1. `/ConfigurationRepositoryUpdateCfg -force` + `/UpdateDBCfg`
 2. `/DumpConfigToFiles` → staging
 3. Публикация пакета в `packageInbox`: `.incoming-<id>` → `ready-<id>` с `READY` **последним**
+4. Доставка в Linux inbox через Docker API (`Publish-ReadyPackageViaDocker`: volume + `docker cp` + `chown`)
 
 Индексацию графа и BSL скрипт **не** запускает — это зона Linux/`contour` после intake пакета.
 
@@ -16,11 +17,12 @@
 
 | Поле | По умолчанию | Смысл |
 |------|----------------|-------|
-| `packageInbox` | `workdir/inbox/kb` | корень inbox для `ready-*` пакетов (на стенде: `\\wsl$\Ubuntu\srv\ai-contour\inbox\kb`) |
-
-После publish в `\\wsl$\...` экспортёр вызывает `Set-WslPackageOwner.ps1` (`chown -R ai-contour`). Иначе contour (`ai-contour`) получит Permission denied на claim: Linux требует write на сам каталог пакета при cross-dir rename.
+| `packageInbox` | `workdir/inbox/kb` | Windows-корень для локального `ready-*` перед Docker-доставкой |
+| `packageInboxLinux` | `/srv/ai-contour/inbox/kb` | Linux inbox на Docker-хосте |
 | `exportStaging` | `workdir/kb-export` | временная выгрузка DumpConfigToFiles |
 | `platformVersion` | из `exePath` | поле `platform_version` в `manifest.json` |
+
+Путь `\\wsl$\...` / `Set-WslPackageOwner.ps1` на этом стенде **не** используются (VHD sharing; скрипт deprecated и не валит экспорт при сбое WSL).
 
 На стороне 1С у учётки хранилища (`storeUser`) — минимальные права (получение изменений).
 
