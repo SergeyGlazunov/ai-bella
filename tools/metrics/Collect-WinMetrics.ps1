@@ -1,5 +1,5 @@
 ﻿# Collect-WinMetrics.ps1 — Windows host metrics for night 1C exports (every 5 min via Task Scheduler)
-# Default output: C:\Scripts\win_host.csv (override with -OutFile or METRICS_WIN_CSV env)
+# Avoids hanging Get-Counter calls; uses CIM + short-timeout counters.
 
 param(
     [string]$OutFile = $(if ($env:METRICS_WIN_CSV) { $env:METRICS_WIN_CSV } else { "C:\Scripts\win_host.csv" })
@@ -16,12 +16,30 @@ if (-not (Test-Path $OutFile)) {
         Out-File $OutFile -Encoding utf8
 }
 
+function Get-CounterSafe {
+    param([string]$Path, [int]$TimeoutSec = 8)
+    $job = Start-Job -ScriptBlock {
+        param($p)
+        (Get-Counter $p -ErrorAction Stop).CounterSamples.CookedValue
+    } -ArgumentList $Path
+    if (Wait-Job $job -Timeout $TimeoutSec) {
+        try { return [math]::Round((Receive-Job $job), 2) } catch { return 0 }
+    }
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    return 0
+}
+
 $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-$cpuSample = Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction SilentlyContinue
-$cpu = if ($cpuSample) {
-    [math]::Round($cpuSample.CounterSamples.CookedValue, 1)
-} else { 0 }
+# Prefer CIM LoadPercentage (instant); fallback to timed Get-Counter
+$cpuCim = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue |
+    Measure-Object -Property LoadPercentage -Average
+$cpu = if ($null -ne $cpuCim.Average) {
+    [math]::Round($cpuCim.Average, 1)
+} else {
+    Get-CounterSafe '\Processor(_Total)\% Processor Time' 8
+}
 
 $os = Get-CimInstance Win32_OperatingSystem
 $freeMb = [math]::Round($os.FreePhysicalMemory / 1024, 0)
@@ -31,9 +49,6 @@ $vmmem = Get-Process -Name "vmmem*" -ErrorAction SilentlyContinue |
     Measure-Object -Property WorkingSet64 -Sum
 $vmmemMb = if ($vmmem.Sum) { [math]::Round($vmmem.Sum / 1MB, 0) } else { 0 }
 
-$diskSample = Get-Counter '\PhysicalDisk(_Total)\Current Disk Queue Length' -ErrorAction SilentlyContinue
-$diskQ = if ($diskSample) {
-    [math]::Round($diskSample.CounterSamples.CookedValue, 2)
-} else { 0 }
+$diskQ = Get-CounterSafe '\PhysicalDisk(_Total)\Current Disk Queue Length' 8
 
 "$ts,$cpu,$freeMb,$totalMb,$vmmemMb,$diskQ" | Out-File $OutFile -Append -Encoding utf8
