@@ -18,7 +18,7 @@
 - Container `bsl-indexer` is **running**.
 - Graph MCP and Open WebUI may stay up; this gate is about the BSL watcher only.
 - Note current time; avoid running during active `UBD Config Sync` if possible (or accept that an in-flight nightly index may need to finish first).
-- Paths (adjust only if your stand differs — record actual paths in `DEVELOPMENT.md` after the run):
+- Paths (adjust only if your stand differs — record actual paths in `STATUS.md` after the run):
 
 | Item | Expected path |
 | --- | --- |
@@ -65,7 +65,7 @@ After edit that block must be **absent**. Do not remove unrelated paths.
 
 ## 3. Reload daemon config
 
-Trigger reload after saving the file. **Record the exact command that works** in `DEVELOPMENT.md` (stand section).
+Trigger reload after saving the file. **Record the exact command that works** in `STATUS.md` (stand section).
 
 ```bash
 # Primary (needs CODE_INDEX_HOME; from Git Bash set MSYS_NO_PATHCONV=1):
@@ -187,7 +187,7 @@ cp /mnt/c/MCP/code_index/deploy/daemon.toml.bak.stand12 \
 
 Confirm `/repos/SRC` is back in active config (repeat step 4a inspect).
 
-Keep `daemon.toml.bak.stand12` until results are recorded in `DEVELOPMENT.md`; delete only after operator sign-off.
+Keep `daemon.toml.bak.stand12` until results are recorded in `STATUS.md`; delete only after operator sign-off.
 
 ---
 
@@ -198,13 +198,13 @@ Keep `daemon.toml.bak.stand12` until results are recorded in `DEVELOPMENT.md`; d
 | **PASS** | Backup ok → SRC path removed → reload confirmed → in-flight index/lock gone → container `running` + `serve` alive after reload → touch poll window shows **no** new index cmdline/PID → container + `serve` still alive → restore ok |
 | **FAIL (blocker)** | Reload does not drop SRC from active config; touch triggers index; in-flight index/lock not cleared; container not `running` or `serve` dead after reload/touch; cannot restore; used `daemon stop` or stopped `bsl-indexer` container |
 
-On **FAIL:** do **not** proceed to cutover (Task 13). Record failure and commands tried in `DEVELOPMENT.md` (stand section). Leave watch restored if possible.
+On **FAIL:** do **not** proceed to cutover (Task 13). Record failure and commands tried in `STATUS.md` (stand section). Leave watch restored if possible.
 
 ---
 
 ## Record results
 
-After a live run, operator updates `DEVELOPMENT.md`:
+After a live run, operator updates `STATUS.md`:
 
 - **Stand → BSL watch pause:** PASS or FAIL
 - Exact reload command

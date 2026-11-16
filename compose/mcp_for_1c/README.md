@@ -853,4 +853,4 @@ BSL LS молча игнорирует и берёт текущий катало
 | Уже исправленные ошибки | `docs/ОШИБКИ-РАЗВЁРТЫВАНИЯ.md` |
 | Роль в контуре ai2 | `ARCHITECTURE.md` |
 | Skills / маршрутизация агента | `integrations/skills/`, `workspace/AGENTS.md` |
-| Журнал комплекта AI-Contour | корневой `DEVELOPMENT.md` |
+| Журнал комплекта AI-Contour | корневой `STATUS.md` |

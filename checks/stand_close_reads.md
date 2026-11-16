@@ -38,7 +38,7 @@ docker inspect -f '{{.State.Status}}' bsl-indexer
 docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' bsl-indexer
 ```
 
-Save output for the stand log in `DEVELOPMENT.md`.
+Save output for the stand log in `STATUS.md`.
 
 ---
 
@@ -69,7 +69,7 @@ Graph stop **cancels** in-flight graph handlers (process gone). This is the prim
 
 ### 2a. Firewall on host port 8011 — **optional**
 
-Skip on ADM-SAPHX-TECH unless you deliberately harden host publish. If skipping, record `firewall=skipped` in `DEVELOPMENT.md`.
+Skip on ADM-SAPHX-TECH unless you deliberately harden host publish. If skipping, record `firewall=skipped` in `STATUS.md`.
 
 ```bash
 # Optional — Linux/WSL only; not required for package verify_closed
@@ -142,7 +142,7 @@ Sleep-N is **not** drain.
 
 ## 5. Optional: in-flight cancellation spot-check
 
-If graph had active work before step 1, confirm handlers did not survive stop. Record in `DEVELOPMENT.md`. Not a substitute for step 4.
+If graph had active work before step 1, confirm handlers did not survive stop. Record in `STATUS.md`. Not a substitute for step 4.
 
 ---
 
@@ -176,13 +176,13 @@ If restore fails, treat as **incident** — do not proceed to cutover until MCP 
 | **PASS** | Package `verify_closed` (graph not running + network disconnect); stand-only: container `running` + `serve` alive; IdleProbe idle; restore successful. Firewall optional. |
 | **FAIL (blocker)** | Graph won't stop; still on `ai-stack_default`; idle not provable; only ESTABLISHED=0 used as proof; container/`serve` dead; restore incomplete |
 
-On **FAIL:** do **not** cut over. Record commands tried and failure mode in `DEVELOPMENT.md` (stand section).
+On **FAIL:** do **not** cut over. Record commands tried and failure mode in `STATUS.md` (stand section).
 
 ---
 
 ## Record results
 
-After a live run, operator updates `DEVELOPMENT.md`:
+After a live run, operator updates `STATUS.md`:
 
 - **Stand → Close reads:** PASS or FAIL
 - Exact **IdleProbe** command

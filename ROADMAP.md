@@ -4,8 +4,7 @@
 
 ## Horizon A — PS/ai2 stable (current)
 
-Spec: `docs/superpowers/specs/2026-10-12-ai2-nightly-consistency-design.md`  
-Ops list: `For Cursor/to-do.md`
+Spec: `docs/superpowers/specs/2026-10-12-ai2-nightly-consistency-design.md`
 
 | Stage | Status | Notes |
 |-------|--------|--------|
@@ -18,8 +17,7 @@ Ops list: `For Cursor/to-do.md`
 
 ## Horizon B — Linux-first / Python orchestrator
 
-Spec: `For Cursor/LINUX-FIRST-DESIGN.md`  
-Plan: `For Cursor/LINUX-FIRST-IMPLEMENTATION-PLAN.md`
+Spec / plan: subsumed by `docs/superpowers/specs/2026-10-18-installable-contour-design.md`
 
 | Stage | Tasks | Status |
 |-------|-------|--------|

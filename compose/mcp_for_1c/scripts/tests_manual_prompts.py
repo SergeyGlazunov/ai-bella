@@ -194,7 +194,7 @@ class TestResultGoesSomewhere(unittest.TestCase):
 
     def test_status_is_the_destination(self):
         self.assertTrue(
-            ("DEVELOPMENT.md" in self.text) or ("журнала" in self.text.lower()),
+            ("STATUS.md" in self.text) or ("журнала" in self.text.lower()),
             "не сказано, куда девать результат прогона",
         )
     def test_result_is_not_a_percentage(self):
