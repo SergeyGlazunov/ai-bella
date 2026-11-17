@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
+import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from contour import dockerutil
+from contour.bsl_ctl import idle_bsl
 from contour.db import get_meta, set_meta
 from contour.dockerutil import (
     DockerRunner,
@@ -13,6 +18,8 @@ from contour.dockerutil import (
     start_exec,
     wait_exec,
 )
+from contour.index_graph import _log_directory, _logs_dir_from_cfg
+from contour.runtime_policy import DEFAULT_RUNTIME_POLICY, WriteWindowClosed, WriterStillAlive
 
 CODE_INDEX_HOME = "/data/code-index-home"
 SRC_PATH = "/repos/SRC"
@@ -153,19 +160,84 @@ def _mark_exec_running(conn: sqlite3.Connection, job_id: int) -> None:
 
 
 def _finish_exec_job(
-    conn: sqlite3.Connection, job_id: int, exit_code: int
+    conn: sqlite3.Connection,
+    job_id: int,
+    exit_code: int,
+    *,
+    log_path: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     status = "ok" if exit_code == 0 else "failed"
     conn.execute(
         """
         UPDATE jobs
-        SET exit_code = ?, status = ?, finished_at = ?
+        SET exit_code = ?, status = ?, finished_at = ?, log_path = ?
         WHERE id = ?
         """,
-        (exit_code, status, now, job_id),
+        (exit_code, status, now, log_path, job_id),
     )
     conn.commit()
+
+
+def _logged_bsl_cmd(args: list[str], container_log: str) -> list[str]:
+    """Wrap bsl-indexer so stdout/stderr land in a container file for docker cp."""
+    body = " ".join(shlex.quote(part) for part in ["bsl-indexer", *args])
+    logq = shlex.quote(container_log)
+    return ["sh", "-c", f"{body} >{logq} 2>&1; exit $?"]
+
+
+def _copy_bsl_exec_log(
+    docker: DockerRunner,
+    container: str,
+    container_log: str,
+    *,
+    cfg,
+) -> str | None:
+    """Copy tee'd exec log from the BSL container onto the host logs path."""
+    host_dir = _log_directory(_logs_dir_from_cfg(cfg))
+    host_path = host_dir / Path(container_log).name
+    try:
+        docker.run(
+            ["docker", "cp", f"{container}:{container_log}", str(host_path)],
+            timeout=DEFAULT_RUNTIME_POLICY.docker_command_timeout_seconds,
+        )
+    except Exception:
+        return None
+    try:
+        if host_path.is_file() and host_path.stat().st_size >= 0:
+            return str(host_path)
+    except OSError:
+        return None
+    return None
+
+
+def wait_bsl_idle_for_write(
+    container: str,
+    docker: DockerRunner,
+    *,
+    may_write=None,
+    poll_seconds: float = 2.0,
+    timeout: float | None = None,
+) -> None:
+    """Block until daemon workers are idle (no concurrent index.lock writer)."""
+    budget = (
+        float(timeout)
+        if timeout is not None
+        else float(DEFAULT_RUNTIME_POLICY.writer_max_observe_seconds)
+    )
+    deadline = time.monotonic() + budget
+    while True:
+        if idle_bsl(container, runner=docker):
+            return
+        if may_write is not None:
+            decision = may_write()
+            if decision != "ok":
+                raise WriteWindowClosed(str(decision))
+        if time.monotonic() >= deadline:
+            raise WriterStillAlive(
+                f"bsl not idle before index on {container} ({budget:.0f}s)"
+            )
+        time.sleep(max(0.0, float(poll_seconds)))
 
 
 def _run_exec(
@@ -182,7 +254,8 @@ def _run_exec(
     """Create exec → INSERT job → start → wait (R04: no race on ExecIDs)."""
     container = cfg.services.bsl_container
     env = [f"CODE_INDEX_HOME={CODE_INDEX_HOME}"]
-    cmd = ["bsl-indexer", *args]
+    container_log = f"{CODE_INDEX_HOME}/contour-{stage}-{uuid.uuid4().hex[:12]}.log"
+    cmd = _logged_bsl_cmd(args, container_log)
     exec_id = create_exec(container, cmd, env=env, runner=docker)
     database = _database_for_run(cfg, conn, run_id)
     job_id = _insert_exec_job(
@@ -197,7 +270,10 @@ def _run_exec(
         observe_cap=observe_cap,
         on_observe=on_observe,
     )
-    _finish_exec_job(conn, job_id, exit_code)
+    log_path = _copy_bsl_exec_log(
+        docker, container, container_log, cfg=cfg
+    )
+    _finish_exec_job(conn, job_id, exit_code, log_path=log_path)
     if exit_code != 0:
         raise RuntimeError(f"{stage} failed with exit {exit_code}")
 
@@ -304,6 +380,7 @@ def index_bsl(
     resume: bool | None = None,
     observe_cap: float | None = None,
     on_observe=None,
+    idle_poll_seconds: float = 2.0,
 ) -> None:
     docker = _runner(runner)
     database = _database_for_run(cfg, conn, run_id)
@@ -330,6 +407,14 @@ def index_bsl(
 
     run_index = not stage_ok("bsl_index")
     if run_index:
+        # Avoid racing the daemon watcher (index.lock) after activate/remount.
+        wait_bsl_idle_for_write(
+            cfg.services.bsl_container,
+            docker,
+            may_write=may_write,
+            poll_seconds=idle_poll_seconds,
+            timeout=observe_cap,
+        )
         # Record attempt identity before the writer when revision is known
         # (v2). Legacy callers without target_revision still run index once.
         if revision is not None:

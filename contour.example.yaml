@@ -40,59 +40,6 @@ alert:
 # N database profiles. Set enabled: false to keep a profile in the file
 # without scheduling it. Names are free-form; this example ships three.
 databases:
-  ubd:
-    enabled: true
-    required_layers: [graph, code_index]
-    source:
-      type: git
-      path: /srv/ai-contour/sources/ubd
-      remote: "https://example.invalid/ubd.git"
-      branch: main
-      workspace_subdir: src
-    services:
-      graph_compose_dir: /srv/ai-contour/compose/graph-ubd
-      graph_project: ai2-mcp-ubd
-      graph_service: metadata-indexer
-      graph_mcp: mcp-metadata-graph
-      # Neo4j container for probe_graph.sh (NEO4J_CONTAINER). Required per DB when
-      # graph probes run; not derived from storage.graph_volume. Set the real
-      # compose service/container name on the stand (do not guess from the volume).
-      neo4j_container: ""
-      bsl_compose_dir: /srv/ai-contour/compose/bsl-ubd
-      bsl_project: ai2-bsl-ubd
-      bsl_container: bsl-indexer
-      bsl_publish_port: 8011
-      bsl_daemon_toml: /srv/ai-contour/compose/bsl-ubd/daemon.toml
-      webui_network: ai-stack_default
-    storage:
-      graph_volume: ai2-neo4j-ubd-data
-      code_index_volume: ai2-bsl-ubd-home
-    adapters:
-      idle_probe:
-        - /opt/ai-contour/integrations/idle_bsl.sh
-      code_index:
-        check_bsl:
-          - /opt/ai-contour/integrations/probe_code_index.sh
-          - present
-          - "{path}"
-        check_deletion:
-          - /opt/ai-contour/integrations/probe_code_index.sh
-          - absent
-          - "{path}"
-      graph:
-        check_bsl:
-          - /opt/ai-contour/integrations/probe_graph.sh
-          - present
-          - "{path}"
-        check_xml:
-          - /opt/ai-contour/integrations/probe_graph.sh
-          - present
-          - "{path}"
-        check_deletion:
-          - /opt/ai-contour/integrations/probe_graph.sh
-          - absent
-          - "{path}"
-
   kb:
     enabled: true
     required_layers: [graph, code_index]
@@ -181,3 +128,56 @@ databases:
           - /opt/ai-contour/integrations/probe_graph.sh
           - present
           - "{path}"
+  ubd:
+    enabled: true
+    required_layers: [graph, code_index]
+    source:
+      type: git
+      path: /srv/ai-contour/sources/ubd
+      remote: "https://example.invalid/ubd.git"
+      branch: main
+      workspace_subdir: src
+    services:
+      graph_compose_dir: /srv/ai-contour/compose/graph-ubd
+      graph_project: ai2-mcp-ubd
+      graph_service: metadata-indexer
+      graph_mcp: mcp-metadata-graph
+      # Neo4j container for probe_graph.sh (NEO4J_CONTAINER). Required per DB when
+      # graph probes run; not derived from storage.graph_volume. Set the real
+      # compose service/container name on the stand (do not guess from the volume).
+      neo4j_container: ""
+      bsl_compose_dir: /srv/ai-contour/compose/bsl-ubd
+      bsl_project: ai2-bsl-ubd
+      bsl_container: bsl-indexer
+      bsl_publish_port: 8011
+      bsl_daemon_toml: /srv/ai-contour/compose/bsl-ubd/daemon.toml
+      webui_network: ai-stack_default
+    storage:
+      graph_volume: ai2-neo4j-ubd-data
+      code_index_volume: ai2-bsl-ubd-home
+    adapters:
+      idle_probe:
+        - /opt/ai-contour/integrations/idle_bsl.sh
+      code_index:
+        check_bsl:
+          - /opt/ai-contour/integrations/probe_code_index.sh
+          - present
+          - "{path}"
+        check_deletion:
+          - /opt/ai-contour/integrations/probe_code_index.sh
+          - absent
+          - "{path}"
+      graph:
+        check_bsl:
+          - /opt/ai-contour/integrations/probe_graph.sh
+          - present
+          - "{path}"
+        check_xml:
+          - /opt/ai-contour/integrations/probe_graph.sh
+          - present
+          - "{path}"
+        check_deletion:
+          - /opt/ai-contour/integrations/probe_graph.sh
+          - absent
+          - "{path}"
+

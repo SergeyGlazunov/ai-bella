@@ -73,7 +73,27 @@ class FakeDockerRunner:
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(cmd))
         if cmd[:2] == ["docker", "exec"]:
-            raise AssertionError("R04: must not use docker exec -d; use create_exec/start_exec")
+            if "-d" in cmd:
+                raise AssertionError(
+                    "R04: must not use docker exec -d; use create_exec/start_exec"
+                )
+            # idle_bsl / status probes (not writers)
+            if "daemon" in cmd and "status" in cmd:
+                payload = (
+                    '{"status":"running","paths":[{"path":"/repos/SRC","status":"ready"}]}'
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout=payload, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "cp"]:
+            # Host path is last arg; plant a tiny log so callers can read it.
+            host = Path(cmd[-1])
+            try:
+                host.parent.mkdir(parents=True, exist_ok=True)
+                if not host.exists():
+                    host.write_text(self.log_text or "bsl-log\n", encoding="utf-8")
+            except OSError:
+                pass
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if len(cmd) >= 4 and cmd[:2] == ["docker", "compose"] and "create" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[:2] == ["docker", "compose"] and "ps" in cmd:
@@ -207,8 +227,10 @@ def test_index_bsl_exec_index_then_clean_without_force(tmp_path: Path):
         starts = [c for c in runner.calls if c and c[0] == "start_exec"]
         assert len(creates) == 2
         assert len(starts) == 2
-        assert creates[0][-3:] == ["index", "--path", "/repos/SRC"]
-        assert creates[1][-3:] == ["clean", "--path", "/repos/SRC"]
+        # Logged via sh -c tee; payload still contains index/clean + path.
+        assert any("index" in part for part in creates[0])
+        assert "/repos/SRC" in " ".join(creates[0])
+        assert any("clean" in part for part in creates[1])
         assert BSL_ENV in creates[0]
         assert creates[0][1] == "bsl-indexer"
         assert runner.created_execs == ["exec-1", "exec-2"]
@@ -219,14 +241,86 @@ def test_index_bsl_exec_index_then_clean_without_force(tmp_path: Path):
             assert "--force" not in cmd
             assert "--rm" not in cmd
         jobs = conn.execute(
-            "SELECT stage, status, exec_id, exit_code FROM jobs ORDER BY id"
+            "SELECT stage, status, exec_id, exit_code, log_path FROM jobs ORDER BY id"
         ).fetchall()
         assert [row["stage"] for row in jobs] == ["bsl_index", "bsl_clean"]
         assert [row["status"] for row in jobs] == ["ok", "ok"]
         assert all(row["exec_id"] for row in jobs)
         assert [row["exit_code"] for row in jobs] == [0, 0]
+        assert all(row["log_path"] for row in jobs)
         waits = [c for c in runner.calls if c[:2] == ["docker", "wait"]]
         assert waits == []
+        # Idle gate before the writer index stage.
+        status_calls = [
+            c
+            for c in runner.calls
+            if c[:2] == ["docker", "exec"] and "status" in c
+        ]
+        assert status_calls
+        first_create = next(
+            i for i, c in enumerate(runner.calls) if c and c[0] == "create_exec"
+        )
+        first_status = next(
+            i
+            for i, c in enumerate(runner.calls)
+            if c[:2] == ["docker", "exec"] and "status" in c
+        )
+        assert first_status < first_create
+    finally:
+        conn.close()
+
+
+def test_index_bsl_waits_until_idle_before_index(tmp_path: Path, monkeypatch):
+    cfg = _make_config(tmp_path)
+    conn, run_id = _init_run(tmp_path)
+    runner = FakeDockerRunner(conn=conn)
+    states = iter(
+        [
+            '{"status":"running","paths":[{"path":"/repos/SRC","status":"indexing"}]}',
+            '{"status":"running","paths":[{"path":"/repos/SRC","status":"ready"}]}',
+        ]
+    )
+
+    def run(cmd, *, timeout=None):
+        runner.calls.append(list(cmd))
+        if cmd[:2] == ["docker", "exec"] and "status" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=next(states), stderr=""
+            )
+        if cmd[:2] == ["docker", "cp"]:
+            host = Path(cmd[-1])
+            host.parent.mkdir(parents=True, exist_ok=True)
+            host.write_text("ok\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            fmt = cmd[cmd.index("-f") + 1] if "-f" in cmd else ""
+            if "{{.Image}}" in fmt:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="sha256:test-image\n", stderr=""
+                )
+            if "ExecIDs" in fmt:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=json.dumps(runner.exec_ids) + "\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"cid-{cmd[-1]}\n", stderr=""
+            )
+        if cmd[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{cmd[-1]}|created-test\n", stderr=""
+            )
+        raise AssertionError(cmd)
+
+    runner.run = run  # type: ignore[method-assign]
+    monkeypatch.setattr("contour.index_bsl.time.sleep", lambda _s: None)
+    try:
+        index_bsl(cfg, conn, run_id, runner=runner, idle_poll_seconds=0)
+        status_calls = [
+            c
+            for c in runner.calls
+            if c[:2] == ["docker", "exec"] and "status" in c
+        ]
+        assert len(status_calls) >= 2
     finally:
         conn.close()
 
