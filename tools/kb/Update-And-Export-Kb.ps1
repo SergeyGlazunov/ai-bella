@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-  КБ: store+dump → immutable package in Linux inbox (no Docker / index).
+  КБ: store+dump → Windows ready-* → Linux Contour inbox via Docker.
 
 .DESCRIPTION
-  Запуск: Windows PowerShell. Только операции 1С (UpdateCfg+UpdateDBCfg, DumpConfigToFiles)
-  и публикация пакета ready-<export-id> с READY последним.
+  Запуск: Windows PowerShell. Операции 1С (UpdateCfg+UpdateDBCfg, DumpConfigToFiles),
+  публикация ready-<export-id> с READY последним, доставка в /srv/ai-contour/inbox/kb
+  через Publish-ReadyPackageViaDocker (не \\wsl$).
   Индексация (graph / BSL) — на стороне Linux orchestrator (contour).
 
 .EXAMPLE
@@ -184,7 +185,13 @@ $manifest = New-ExportManifest `
     -FinishedAt $finishedAt
 
 $readyPath = Publish-ExportPackage -SourcePath $staging -DestinationRoot $packageInbox -Manifest $manifest
-# \\wsl$ drops are root:root 755; contour claim rename needs write on the package dir.
-& (Join-Path $scriptDir "..\common\Set-WslPackageOwner.ps1") -WinPath $readyPath
+
+$packageInboxLinux = if ($cfg.packageInboxLinux) {
+    [string]$cfg.packageInboxLinux
+} else {
+    "/srv/ai-contour/inbox/kb"
+}
+. (Join-Path $scriptDir "..\common\Docker-Index.ps1")
+Publish-ReadyPackageViaDocker -ReadyPathWin $readyPath -LinuxInbox $packageInboxLinux
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="

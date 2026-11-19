@@ -151,7 +151,13 @@ $manifest = New-ExportManifest `
     -FinishedAt $finishedAt
 
 $readyPath = Publish-ExportPackage -SourcePath $staging -DestinationRoot $packageInbox -Manifest $manifest
-# \\wsl$ drops are root:root 755; contour claim rename needs write on the package dir.
-& (Join-Path $scriptDir "..\common\Set-WslPackageOwner.ps1") -WinPath $readyPath
+
+$packageInboxLinux = if ($cfg.packageInboxLinux) {
+    [string]$cfg.packageInboxLinux
+} else {
+    "/srv/ai-contour/inbox/klon_opl"
+}
+. (Join-Path $scriptDir "..\common\Docker-Index.ps1")
+Publish-ReadyPackageViaDocker -ReadyPathWin $readyPath -LinuxInbox $packageInboxLinux
 
 Write-Host "=== ALL DONE $(Get-Date -Format o) ==="

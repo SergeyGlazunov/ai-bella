@@ -1,4 +1,4 @@
-# Shared docker helpers for nightly graph/code index (ai2).
+﻿# Shared docker helpers for nightly graph/code index (ai2).
 # Dot-source from tools/kb, tools/klon_opl, tools/ubd wrappers.
 
 function Invoke-DockerNative {
@@ -64,6 +64,132 @@ function Copy-WinTreeToLinuxPath {
     }
     finally {
         $null = Invoke-DockerNative -DockerArgs @("volume", "rm", $vol)
+    }
+}
+
+function Publish-ReadyPackageViaDocker {
+    <#
+    .SYNOPSIS
+      Copy a Windows ready-<id> package into the Linux Contour inbox via Docker API.
+
+    .DESCRIPTION
+      Avoids \\wsl$ (broken on this stand). Creates a temp volume, docker cp the
+      package tree, then alpine copies into LinuxInbox as .incoming-* → ready-*
+      with chown for ai-contour claim_package.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ReadyPathWin,
+        [Parameter(Mandatory = $true)][string]$LinuxInbox,
+        [string]$Owner = "999:988",
+        [string]$InboxPrefix = "/srv/ai-contour/inbox/",
+        # Test seam: ({ string[] DockerArgs }) -> @{ ExitCode = int; StdOut = string }
+        [scriptblock]$DockerCall = $null
+    )
+
+    $ready = [IO.Path]::GetFullPath($ReadyPathWin)
+    $pkgName = Split-Path -Leaf $ready
+    if ($pkgName -notmatch '^ready-') {
+        throw "ReadyPathWin must be a ready-* directory: $ready"
+    }
+    $readyMarker = Join-Path $ready 'READY'
+    if (-not (Test-Path -LiteralPath $readyMarker -PathType Leaf)) {
+        throw "READY missing: $ready"
+    }
+    $cfgXml = Join-Path $ready 'src\Configuration.xml'
+    if (-not (Test-Path -LiteralPath $cfgXml -PathType Leaf)) {
+        throw "src/Configuration.xml missing: $ready"
+    }
+
+    $inbox = $LinuxInbox.TrimEnd('/')
+    $prefix = $InboxPrefix.TrimEnd('/')
+    if (-not ($inbox.StartsWith($prefix + '/') -or $inbox -eq $prefix)) {
+        throw "LinuxInbox must be under ${prefix}/ : $LinuxInbox"
+    }
+    # Mount parent inbox; package lands as /inbox/<ready-*>
+    $inboxParent = $inbox
+
+    function Invoke-PublishDocker {
+        param([Parameter(Mandatory = $true)][string[]]$DockerArgs)
+        if ($null -ne $DockerCall) {
+            $res = & $DockerCall $DockerArgs
+            if ($res -is [hashtable] -or $res -is [System.Collections.Specialized.OrderedDictionary]) {
+                return [pscustomobject]@{
+                    ExitCode = [int]$res['ExitCode']
+                    StdOut   = [string]$res['StdOut']
+                }
+            }
+            throw "DockerCall must return @{ ExitCode; StdOut }"
+        }
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $output = & docker @DockerArgs 2>&1
+            $code = [int]$LASTEXITCODE
+            $text = ($output | ForEach-Object { "$_" }) -join "`n"
+            return [pscustomobject]@{ ExitCode = $code; StdOut = $text }
+        }
+        finally {
+            $ErrorActionPreference = $prev
+        }
+    }
+
+    Write-Host "=== docker-publish $pkgName -> $inboxParent ==="
+    $vol = "contour-pkg-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $created = Invoke-PublishDocker -DockerArgs @("volume", "create", $vol)
+    if ($created.ExitCode -ne 0) {
+        throw "docker volume create failed: $($created.StdOut)"
+    }
+
+    try {
+        $cidRes = Invoke-PublishDocker -DockerArgs @("create", "-v", "${vol}:/data", "alpine")
+        if ($cidRes.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($cidRes.StdOut)) {
+            throw "docker create failed: $($cidRes.StdOut)"
+        }
+        $cid = ($cidRes.StdOut -split "[\r\n]+" | Where-Object { $_ -match '^[a-f0-9]{12,}$' } | Select-Object -First 1)
+        if (-not $cid) {
+            $cid = ($cidRes.StdOut.Trim() -split "\s+")[-1]
+        }
+        try {
+            $cp = Invoke-PublishDocker -DockerArgs @("cp", "$ready/.", "${cid}:/data/")
+            if ($cp.ExitCode -ne 0) {
+                throw "docker cp into volume failed: $($cp.StdOut)"
+            }
+        }
+        finally {
+            $null = Invoke-PublishDocker -DockerArgs @("rm", $cid)
+        }
+
+        # Bind-mount the Contour inbox directory; stage as .incoming then rename.
+        $script = @(
+            'set -e'
+            "NAME=$pkgName"
+            "OWNER=$Owner"
+            'rm -rf "/inbox/.incoming-$NAME" "/inbox/$NAME"'
+            'mkdir -p "/inbox/.incoming-$NAME"'
+            'cp -a /src/. "/inbox/.incoming-$NAME/"'
+            'test -f "/inbox/.incoming-$NAME/READY"'
+            'test -f "/inbox/.incoming-$NAME/src/Configuration.xml"'
+            'test -f "/inbox/.incoming-$NAME/manifest.json"'
+            "chown -R $Owner `"/inbox/.incoming-`$NAME`""
+            'mv "/inbox/.incoming-$NAME" "/inbox/$NAME"'
+            'echo DELIVER_OK'
+            'find "/inbox/$NAME" -type f | wc -l'
+        ) -join "`n"
+
+        $run = Invoke-PublishDocker -DockerArgs @(
+            "run", "--rm",
+            "-v", "${vol}:/src:ro",
+            "-v", "${inboxParent}:/inbox",
+            "alpine", "sh", "-c", $script
+        )
+        if ($run.ExitCode -ne 0 -or ($run.StdOut -notmatch 'DELIVER_OK')) {
+            throw "docker deliver to $inboxParent failed exit=$($run.ExitCode): $($run.StdOut)"
+        }
+        Write-Host $run.StdOut.Trim()
+        Write-Host "published to Linux inbox: $inboxParent/$pkgName"
+    }
+    finally {
+        $null = Invoke-PublishDocker -DockerArgs @("volume", "rm", $vol)
     }
 }
 

@@ -7,5 +7,6 @@
   "logDir": "C:\\AI-contour\\logs\\klon_opl",
   "exportStaging": "C:\\AI-contour\\workdir\\klon_opl-export",
   "packageInbox": "C:\\AI-contour\\workdir\\inbox\\klon_opl",
+  "packageInboxLinux": "/srv/ai-contour/inbox/klon_opl",
   "platformVersion": "8.3.23.1865"
 }
