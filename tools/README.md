@@ -6,7 +6,7 @@
 | `klon_opl/Export-KlonOpl.ps1` | Ночной/ручной dump клона оплат → `/srv/ai2/klon_opl/src` (без store) |
 | `kb/kb-connection.json` | Параметры ИБ/хранилища (рядом со скриптом) |
 | `copy-kit-artifacts.py` | Вспомогательная упаковка комплекта |
-| `mcp-graph-proxy/` | Отдельный токен-прокси к MCP графа УБД. Compose стенда не входит |
+| `mcp-graph-proxy/` | Прокси к MCP графа УБД для офисной подсети. Compose стенда не входит |
 
 После переноса скрипта обновите Task Scheduler на:
 
