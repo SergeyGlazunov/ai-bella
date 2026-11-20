@@ -30,6 +30,7 @@ MCP/Tool ходит в SDMS DNS Shop. На этой ВМ **запись отре
 2. Трудозатраты — `sdms_get_timesheet`. Суммируй `duration`. Фильтр по людям — подстрока в `performer` (транслит фамилии).
 3. Комментарии — `sdms_comment_counts`, при необходимости `sdms_list_comments`. Не зови `sdms_mark_read` — его нет и не должно быть.
 4. Вложения — `sdms_get_task_files` / `sdms_get_devrequest_files` / `sdms_get_internaltask_files` (под капотом `GET /files?objectType=&objectID=`). В ответе `downloadUrl` (часто Minio `url`); байты по Bearer не обещай.
+5. Скриншоты, когда нужно содержание заявки или задачи (разбор, письмо, критерии, «что на скриншоте») — `sdms_describe_images` с тем же номером. Для задачи З передай `object_type=task` (по умолчанию заявка). Статус, часы и спринт этот tool не зови. Он возвращает текст по картинкам из HTML и по вложениям png/jpeg/webp/gif. Если `images` пустой или у картинки есть `error` — так и скажи. Содержимое скриншота не выдумывай.
 
 ### Внутреннее задание (ВЗ) — сценарий 104
 
@@ -46,7 +47,7 @@ MCP/Tool ходит в SDMS DNS Shop. На этой ВМ **запись отре
 
 - `sdms_list_tasks` — нужен `performer` (email) или `team` (GUID филиала). Без обоих API ответит ошибкой. Фильтра по статусу/спринту на сервере нет — отбери на своей стороне.
 - Спринты филиала — `sdms_branch_sprints`, состав — `sdms_sprint_objects` (план `planDev` / `planTest` / `planAnalytics` / `planTotal`).
-- Заявка ЗР — `sdms_get_devrequest`, задачи заявки — `sdms_get_devrequest_tasks`.
+- Заявка ЗР — `sdms_get_devrequest`, задачи заявки — `sdms_get_devrequest_tasks`. Содержание и скриншоты — ещё `sdms_describe_images`.
 - Канбан — `sdms_kanban_lists` / `sdms_kanban_data`.
 - Версия MCP — `sdms_version` (проверка связи).
 
