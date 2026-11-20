@@ -1,7 +1,7 @@
 {
   "name": "ai-contour-kit",
   "date": "2026-10-13",
-  "live_cutover": false,
+  "live_cutover": true,
   "present": [
     "controller/",
     "systemd/ai-contour.service",
@@ -14,8 +14,7 @@
     "USER.md",
     "AGENT.md",
     "STATUS.md",
-    "ROADMAP.md",
-    "VENDOR.md",
+    "NIGHTLY.md",
     "compose/ai-stack/docker-compose.yml",
     "compose/ai-stack/.env.example",
     "compose/mcp_for_1c/",
@@ -44,7 +43,7 @@
     },
     {
       "id": "vendor_upstream_pins",
-      "why": "compose/bsl-indexer and compose/mcp_for_1c lack verified upstream commit SHAs; see VENDOR.md"
+      "why": "compose/bsl-indexer and compose/mcp_for_1c lack verified upstream commit SHAs; see README.md § Vendor"
     },
     {
       "id": "open_webui_skill_json_exports",

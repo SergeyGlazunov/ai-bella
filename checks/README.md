@@ -1,13 +1,12 @@
-﻿# Stand gates and linux-first runbooks
+﻿# Stand procedures and migration runbooks
 
-Контракт продукта — [../docs/superpowers/specs/2026-10-18-installable-contour-design.md](../docs/superpowers/specs/2026-10-18-installable-contour-design.md). Файлы ниже — процедуры живого стенда, не новая цель разработки.
+Контракт продукта — [../docs/superpowers/specs/2026-10-18-installable-contour-design.md](../docs/superpowers/specs/2026-10-18-installable-contour-design.md). Файлы ниже — процедуры на **живом** стенде и runbooks миграции, не новая цель разработки.
 
-Процедуры на **живом** стенде перед переключением на `contour`.
-Cutover без PASS gates + drill бэкапа чат-слоя + явного разрешения — нельзя.
+Стенд уже на `ai-contour.timer`. Миграцию с legacy, аварийный порядок и mutating gates — только после явного разрешения.
 
-## Legacy stand gates (до cutover оркестратора)
+## Штатные ops
 
-| Gate | Файл | Суть |
+| Процедура | Файл | Суть |
 | --- | --- | --- |
 | Reboot bring-up | [`stand_reboot_bringup.md`](stand_reboot_bringup.md) | Ручной запуск после перезагрузки: `DockerWSL\start.ps1`, `docker start` ai2, smoke `:3000`/MCP |
 | BSL watch pause | [`stand_watch_pause.md`](stand_watch_pause.md) | Убрать `/repos/SRC` из `daemon.toml`, reload; touch не запускает index; `serve` жив; restore |
@@ -15,7 +14,9 @@ Cutover без PASS gates + drill бэкапа чат-слоя + явного р
 
 **Имена контейнеров/сетей в процедурах — боевой контур** (`mcp-metadata-graph`, `bsl-indexer`, `ai-stack_default`, порт `8011`). Для ai2 / нового сервера подставляй имена из [deploy-ai2/README.md](../deploy-ai2/README.md) (например `ai2-mcp-graph-ubd`, `ai2-bsl-ubd`, `ai2-stack`).
 
-## Linux-first (Task 11–12)
+## Миграция / повторная постановка
+
+Не ежедневная работа. Нужны при переносе с legacy или повторной установке оркестратора на стенд.
 
 | Stage | Файл | Суть |
 | --- | --- | --- |
@@ -27,6 +28,6 @@ Cutover без PASS gates + drill бэкапа чат-слоя + явного р
 
 Kit executable proof (не stand): `python -m pytest tests/integration -q` в `controller/`.
 
-Статус последнего proof — [STATUS.md](../STATUS.md). Cutover ops — [USER.md](../USER.md) §«Переключение стенда».
+Факты стенда — [STATUS.md](../STATUS.md). Эксплуатация — [USER.md](../USER.md). Команды ночи — [NIGHTLY.md](../NIGHTLY.md).
 
-Не gates: unit-тесты `controller/` сами по себе cutover не делают; `bootstrap.sh` ставит units **без** `enable` timer.
+Не gates: unit-тесты `controller/` сами по себе миграцию не делают; `bootstrap.sh` ставит units **без** `enable` timer.

@@ -4,7 +4,7 @@
 **When:** После PASS catch-up + user-facing verify. Task 12 Steps 7–9.  
 **STAND ONLY.** Без явного разрешения оператора — не выполнять.
 
-См. также [USER.md](../USER.md) §«Переключение стенда» и gates [`stand_watch_pause.md`](stand_watch_pause.md), [`stand_close_reads.md`](stand_close_reads.md).
+См. также оглавление процедур [`README.md`](README.md) и gates [`stand_watch_pause.md`](stand_watch_pause.md), [`stand_close_reads.md`](stand_close_reads.md). Эксплуатация после миграции — [USER.md](../USER.md).
 
 ---
 

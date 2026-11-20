@@ -2,7 +2,7 @@
 
 Комплект оркестратора УБД / КБ / `klon_opl` (граф + code-index) и поставки на Windows 11 + WSL2.
 
-**Оркестратор в комплекте есть; на живой стенд ADM-SAPHX-TECH не переключён**, пока не сделаны drill бэкапа чат-слоя и явное разрешение. Ночной sync на стенде пока PowerShell + задача `UBD Config Sync`.
+Ночной прогон стенда ADM-SAPHX-TECH — `ai-contour.timer` и команды из [NIGHTLY.md](NIGHTLY.md). Задачи Windows `UBD Config Sync` и `UBD Config Git Sync` остаются выключенными.
 
 Контракт продукта: [docs/superpowers/specs/2026-10-18-installable-contour-design.md](docs/superpowers/specs/2026-10-18-installable-contour-design.md). Для агента разработки: [AGENT.md](AGENT.md). Факты стенда: [STATUS.md](STATUS.md). Манифест состава: [release-manifest.json](release-manifest.json).
 
@@ -46,6 +46,8 @@
 
 ### Команды
 
+Ночь, дневной догон и флаги — [NIGHTLY.md](NIGHTLY.md). Ниже короткий список без окна и без порядка баз.
+
 ```bash
 contour --config /etc/ai-contour/contour.yaml validate
 contour status
@@ -86,7 +88,7 @@ sudo ./bootstrap.sh   # внутри WSL Ubuntu
 | **Новая машина** | Compose из `compose/`, клон УБД на ext4, bootstrap, свои `.env` |
 | **Живой стенд** | Не трогать тома `ai-stack_*`. Не `compose up` чат-слоя. Оркестратор + timer только после stand proof и разрешения |
 
-Живой стенд этим разделом **не** переключать.
+Живой стенд этим разделом **не** трогать.
 
 ### Что есть / чего нет
 
@@ -186,8 +188,7 @@ Timer включайте после первого успешного `contour u
 1. Не `docker compose pull` Open WebUI / OmniRoute.
 2. Не создавать project `ai-contour`.
 3. В `contour.yaml` — live-пути, если ходите в уже поднятый стенд.
-4. Stand proof: [checks/README.md](checks/README.md).
-5. Cutover — раздел ниже, только после явного разрешения.
+4. Stand proof / миграция: [checks/README.md](checks/README.md).
 
 ### Skills
 
@@ -253,33 +254,6 @@ sha256sum ai-contour-kit.tgz
 
 ---
 
-## Переключение стенда (cutover)
+## Миграция с legacy / аварийный порядок
 
-**Не выполнять** без PASS stand gates, drill бэкапа чат-слоя и явного разрешения. Процедуры: [checks/stand_watch_pause.md](checks/stand_watch_pause.md), [checks/stand_close_reads.md](checks/stand_close_reads.md).
-
-### Gate чат-слоя
-
-1. Остановить вместе `open-webui` и `omniroute` (`C:\ai-stack`).
-2. Скопировать тома `ai-stack_open-webui-data`, `ai-stack_omniroute-data`, `.env`, compose.
-3. Поднять снова с теми же именами томов.
-
-**Drill:** восстановить в **throwaway** тома/контейнеры с **другими** именами; вход существующим пользователем; роли; рабочие модель и MCP. Строк в БД users недостаточно.
-
-### Порядок cutover (УБД и индексы)
-
-1. Отключить `UBD Config Sync`; дождаться writers.
-2. Закрыть чтение: graph stop + BSL network disconnect (+ optional host firewall) + IdleProbe. См. close-reads check.
-3. Pause BSL watcher (`daemon.toml` без `/repos/SRC` + reload).
-4. Зафиксировать SHA HEAD УБД.
-5. Клон/копия SHA в `/srv/ai-contour/sources/ubd` (ext4); remount binds; compose up **только** remounted сервисов УБД (не `ai-stack`).
-6. После recreate `bsl-indexer` — снова убедиться, что watcher paused.
-7. Verify индексов; открыть чтение.
-8. Включить `ai-contour.timer` только после шага 7.
-
-### Откат
-
-1. Отключить timer; закрыть чтение.
-2. Вернуть bind недостаточно, если индексы уже писались под другим SHA — согласовать source и оба индекса на одном SHA + probes, затем open.
-3. Чат-слой: восстановить тома `ai-stack_*`; проверить вход и подключения.
-
-Cutover rollback не доказан, пока не отработан drill.
+Живой стенд уже на `ai-contour.timer`. Повторную миграцию с legacy, аварийный откат и stand gates **не** описывать здесь: только [checks/README.md](checks/README.md) и runbooks в `checks/`. Не выполнять без явного разрешения.

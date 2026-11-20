@@ -19,7 +19,7 @@
 ## Prerequisites
 
 - PASS [`linux-first-preflight.md`](linux-first-preflight.md).
-- Drill бэкапа SQLite (`contour backup-state`) и chat-layer (см. USER.md) записан в STATUS.
+- Drill бэкапа SQLite (`contour backup-state`) и chat-layer записан в STATUS (процедуры — [README.md](README.md) / stand gates).
 - Bootstrap уже ставил пакет (`/opt/ai-contour`), конфиг `/etc/ai-contour/contour.yaml`, user `ai-contour`; timer **не** enabled.
 - Имена из конфига: `databases.*.services.*`, `runtime.*`.
 
